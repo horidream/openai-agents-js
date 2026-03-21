@@ -173,7 +173,7 @@ export class OpenAIChatCompletionsModel implements Model {
             output.push({
               id: response.id,
               type: 'function_call',
-              arguments: args,
+              arguments: args || '{}',
               name: name,
               callId: callId,
               status: 'completed',

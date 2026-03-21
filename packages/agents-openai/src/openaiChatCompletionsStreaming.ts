@@ -158,6 +158,12 @@ export async function* convertChatCompletionsStreamToResponses(
     if (function_call.arguments.startsWith('{}{')) {
       function_call.arguments = function_call.arguments.slice(2);
     }
+    // Some proxy endpoints (e.g. Anthropic-backed proxies) convert
+    // tool_use input:{} to arguments:"" instead of "{}".
+    // Ensure arguments is always valid JSON so downstream JSON.parse won't throw.
+    if (!function_call.arguments) {
+      function_call.arguments = '{}';
+    }
     outputs.push(function_call);
   }
 

@@ -931,6 +931,14 @@ export interface MCPServerStreamableHttpOptions {
   reconnectionOptions?: any;
   sessionId?: string;
   // ----------------------------------------------------
+
+  /**
+   * Skip the SSE GET request for server-initiated messages.
+   * Some servers (like GitHub Copilot MCP) don't support SSE streaming and return 405.
+   * Setting this to true avoids the unnecessary GET request.
+   * Default: false
+   */
+  skipBrowserSseListener?: boolean;
 }
 
 export interface MCPServerSSEOptions {

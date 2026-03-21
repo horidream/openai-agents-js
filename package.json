@@ -60,6 +60,7 @@
     "bump-version": "changeset version && pnpm -F @openai/* prebuild",
     "prepare": "husky",
     "clear:deps": "rm -rf node_modules && pnpm -r exec rm -rf node_modules",
+    "link": "cd packages/agents-core && npm link && cd ../agents-openai && npm link && cd ../agents-realtime && npm link && cd ../agents-extensions && npm link && cd ../agents && npm link",
     "local-npm:reset": "rm -rf .cache/verdaccio/storage",
     "local-npm:start": "verdaccio --config verdaccio-config.yml",
     "local-npm:publish": "pnpm -r publish --registry http://localhost:4873 --force --no-git-checks"
