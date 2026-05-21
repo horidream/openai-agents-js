@@ -1,6 +1,10 @@
 import type { InputGuardrail, OutputGuardrail } from './guardrail';
 import { AgentHooks } from './lifecycle';
-import { getAllMcpTools, type MCPServer } from './mcp';
+import {
+  getAllMcpTools,
+  type MCPServer,
+  type MCPToolErrorFunction,
+} from './mcp';
 import type { Model, ModelSettings, Prompt } from './model';
 import {
   getDefaultModelSettings,
@@ -321,7 +325,7 @@ export interface AgentConfiguration<
    * The model implementation to use when invoking the LLM.
    *
    * By default, if not set, the agent will use the default model returned by
-   * getDefaultModel (currently "gpt-4.1").
+   * getDefaultModel (currently "gpt-5.4-mini").
    */
   model: string | Model;
 
@@ -346,6 +350,27 @@ export interface AgentConfiguration<
    * the same place.
    */
   mcpServers: MCPServer[];
+
+  /**
+   * Configuration for MCP servers used by this agent.
+   */
+  mcpConfig: {
+    /**
+     * Try to convert MCP tool schemas to strict JSON schema.
+     */
+    convertSchemasToStrict?: boolean;
+    /**
+     * Optional function to convert MCP tool failures into model-visible messages.
+     * Set to null to rethrow errors instead of converting them.
+     * Server-level errorFunction values take precedence.
+     */
+    errorFunction?: MCPToolErrorFunction | null;
+    /**
+     * Prefix local MCP tool names with their server name before exposing them to the model.
+     * The SDK still invokes the original MCP tool name on the original server.
+     */
+    includeServerInToolNames?: boolean;
+  };
 
   /**
    * A list of checks that run in parallel to the agent by default; set `runInParallel` to false to
@@ -397,6 +422,18 @@ export type AgentOptions<
   Pick<AgentConfiguration<TContext, TOutput>, 'name'> &
     Partial<AgentConfiguration<TContext, TOutput>>
 >;
+
+function getInitialModelSettingsForAgentModel(
+  model: string | Model | undefined,
+): ModelSettings {
+  if (model === undefined || model === Agent.DEFAULT_MODEL_PLACEHOLDER) {
+    return getDefaultModelSettings();
+  }
+  if (typeof model === 'string' && model !== Agent.DEFAULT_MODEL_PLACEHOLDER) {
+    return getDefaultModelSettings(model);
+  }
+  return {};
+}
 
 /**
  * An agent is an AI model configured with instructions, tools, guardrails, handoffs and more.
@@ -488,12 +525,14 @@ export class Agent<
   modelSettings: ModelSettings;
   tools: Tool<TContext>[];
   mcpServers: MCPServer[];
+  mcpConfig: AgentConfiguration<TContext, TOutput>['mcpConfig'];
   inputGuardrails: InputGuardrail[];
   outputGuardrails: OutputGuardrail<AgentOutputType, TContext>[];
   outputType: TOutput = 'text' as TOutput;
   toolUseBehavior: ToolUseBehavior;
   resetToolChoice: boolean;
   private readonly _toolsExplicitlyConfigured: boolean;
+  private readonly _modelSettingsExplicitlyConfigured: boolean;
 
   constructor(config: AgentOptions<TContext, TOutput>) {
     super();
@@ -506,10 +545,15 @@ export class Agent<
     this.handoffDescription = config.handoffDescription ?? '';
     this.handoffs = config.handoffs ?? [];
     this.model = config.model ?? '';
-    this.modelSettings = config.modelSettings ?? getDefaultModelSettings();
+    this._modelSettingsExplicitlyConfigured =
+      config.modelSettings !== undefined;
+    this.modelSettings =
+      config.modelSettings ??
+      getInitialModelSettingsForAgentModel(config.model);
     this.tools = config.tools ?? [];
     this._toolsExplicitlyConfigured = config.tools !== undefined;
     this.mcpServers = config.mcpServers ?? [];
+    this.mcpConfig = config.mcpConfig ?? {};
     this.inputGuardrails = config.inputGuardrails ?? [];
     this.outputGuardrails = config.outputGuardrails ?? [];
     if (config.outputType) {
@@ -521,6 +565,7 @@ export class Agent<
     if (
       // The user sets a non-default model
       config.model !== undefined &&
+      config.model !== Agent.DEFAULT_MODEL_PLACEHOLDER &&
       // The default model is gpt-5
       isGpt5Default() &&
       // However, the specified model is not a gpt-5 model
@@ -558,6 +603,11 @@ export class Agent<
     }
   }
 
+  /** @internal */
+  hasExplicitModelSettings(): boolean {
+    return this._modelSettingsExplicitlyConfigured;
+  }
+
   /**
    * Output schema name.
    */
@@ -586,9 +636,17 @@ export class Agent<
   clone(
     config: Partial<AgentConfiguration<TContext, TOutput>>,
   ): Agent<TContext, TOutput> {
+    const modelSettings =
+      'modelSettings' in config
+        ? config.modelSettings
+        : this.hasExplicitModelSettings()
+          ? this.modelSettings
+          : undefined;
+
     return new Agent({
       ...this,
       ...config,
+      modelSettings,
     });
   }
 
@@ -935,15 +993,41 @@ export class Agent<
     runContext: RunContext<TContext>,
   ): Promise<Tool<TContext>[]> {
     if (this.mcpServers.length > 0) {
+      const includeServerInToolNames =
+        this.mcpConfig.includeServerInToolNames === true;
       return getAllMcpTools({
         mcpServers: this.mcpServers,
         runContext,
         agent: this,
-        convertSchemasToStrict: false,
+        convertSchemasToStrict: this.mcpConfig.convertSchemasToStrict === true,
+        errorFunction: this.mcpConfig.errorFunction,
+        includeServerInToolNames,
+        reservedToolNames: includeServerInToolNames
+          ? await this.getMcpToolReservedNames(runContext)
+          : undefined,
       });
     }
 
     return [];
+  }
+
+  private async getMcpToolReservedNames(
+    runContext: RunContext<TContext>,
+  ): Promise<Set<string>> {
+    const reservedToolNames = new Set(
+      this.tools
+        .filter(
+          (tool): tool is FunctionTool<TContext> => tool.type === 'function',
+        )
+        .map((tool) => tool.name),
+    );
+
+    const enabledHandoffs = await this.getEnabledHandoffs(runContext);
+    for (const handoff of enabledHandoffs) {
+      reservedToolNames.add(handoff.toolName);
+    }
+
+    return reservedToolNames;
   }
 
   /**

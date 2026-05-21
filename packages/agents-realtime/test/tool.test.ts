@@ -91,4 +91,52 @@ describe('realtime tool helpers', () => {
       toRealtimeToolDefinition({ ...functionTool, type: 'computer' } as any),
     ).toThrowError(/Invalid tool type/);
   });
+
+  it('rejects invalid hosted MCP approval policies for realtime tools', () => {
+    expect(() =>
+      toRealtimeToolDefinition({
+        ...hostedMcpTool,
+        providerData: {
+          ...hostedMcpTool.providerData,
+          require_approval: { delete: 'alwyas' },
+        },
+      } as any),
+    ).toThrowError(/Invalid hosted MCP requireApproval/);
+  });
+
+  it('omits hosted MCP approval policy when provider data leaves it undefined', () => {
+    const mcpDef = toRealtimeToolDefinition({
+      ...hostedMcpTool,
+      providerData: {
+        ...hostedMcpTool.providerData,
+        require_approval: undefined,
+      },
+    } as any);
+
+    if (mcpDef.type !== 'mcp') {
+      throw new Error('Expected mcp definition');
+    }
+    expect(mcpDef).not.toHaveProperty('require_approval');
+  });
+
+  it('preserves read-only hosted MCP approval filters for realtime tools', () => {
+    const mcpDef = toRealtimeToolDefinition({
+      ...hostedMcpTool,
+      providerData: {
+        ...hostedMcpTool.providerData,
+        require_approval: {
+          always: { read_only: false },
+          never: { tool_names: ['search'], read_only: true },
+        },
+      },
+    } as any);
+
+    if (mcpDef.type !== 'mcp') {
+      throw new Error('Expected mcp definition');
+    }
+    expect(mcpDef.require_approval).toEqual({
+      always: { read_only: false },
+      never: { tool_names: ['search'], read_only: true },
+    });
+  });
 });

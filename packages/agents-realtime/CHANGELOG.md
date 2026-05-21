@@ -1,5 +1,103 @@
 # @openai/agents-realtime
 
+## 0.11.4
+
+### Patch Changes
+
+- 3dc9b90: fix: avoid auto responses for unknown realtime tools
+- Updated dependencies [087ce4b]
+- Updated dependencies [2c993cf]
+- Updated dependencies [f36e7b2]
+  - @openai/agents-core@0.11.4
+
+## 0.11.3
+
+### Patch Changes
+
+- Updated dependencies [2d39801]
+  - @openai/agents-core@0.11.3
+
+## 0.11.2
+
+### Patch Changes
+
+- 454f0b7: fix: preserve realtime output audio content from output item events
+- a3d28b1: fix: treat null realtime audio channels as unset
+- Updated dependencies [3f855d4]
+- Updated dependencies [077876e]
+- Updated dependencies [9e6d1e3]
+- Updated dependencies [2b5c8d2]
+- Updated dependencies [398b21f]
+- Updated dependencies [8e59259]
+- Updated dependencies [c5731d1]
+- Updated dependencies [81508e8]
+- Updated dependencies [8d2f707]
+- Updated dependencies [6883833]
+- Updated dependencies [b0d2a68]
+  - @openai/agents-core@0.11.2
+
+## 0.11.1
+
+### Patch Changes
+
+- Updated dependencies [e4a7557]
+- Updated dependencies [1a61a5c]
+  - @openai/agents-core@0.11.1
+
+## 0.11.0
+
+### Minor Changes
+
+- 295229c: fix: upgrade realtime defaults and model support for gpt-realtime-2
+
+### Patch Changes
+
+- Updated dependencies [eb81397]
+- Updated dependencies [295229c]
+  - @openai/agents-core@0.11.0
+
+## 0.10.1
+
+### Patch Changes
+
+- 0cd060f: fix: validate hosted MCP approval policies
+- Updated dependencies [0cd060f]
+  - @openai/agents-core@0.10.1
+
+## 0.10.0
+
+### Patch Changes
+
+- Updated dependencies [3546add]
+- Updated dependencies [0e7cbf0]
+- Updated dependencies [2e7e48a]
+- Updated dependencies [d31526b]
+- Updated dependencies [0630108]
+  - @openai/agents-core@0.10.0
+
+## 0.9.1
+
+### Patch Changes
+
+- Updated dependencies [06f425a]
+- Updated dependencies [dde1037]
+- Updated dependencies [a081190]
+  - @openai/agents-core@0.9.1
+
+## 0.9.0
+
+### Patch Changes
+
+- Updated dependencies [00b4032]
+- Updated dependencies [2e1d626]
+- Updated dependencies [16c26e7]
+- Updated dependencies [2d2501a]
+- Updated dependencies [6e50eca]
+- Updated dependencies [a34f506]
+- Updated dependencies [30681be]
+- Updated dependencies [4a879bb]
+  - @openai/agents-core@0.9.0
+
 ## 0.8.5
 
 ### Patch Changes

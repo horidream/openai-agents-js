@@ -1,4 +1,4 @@
-export { OpenAIProvider } from './openaiProvider';
+export { OpenAIProvider, type OpenAIProviderOptions } from './openaiProvider';
 export {
   withResponsesWebSocketSession,
   type ResponsesWebSocketSession,
@@ -7,8 +7,12 @@ export {
 export {
   OpenAIResponsesModel,
   OpenAIResponsesWSModel,
+  type OpenAIResponsesWebSocketOptions,
 } from './openaiResponsesModel';
-export { OpenAIChatCompletionsModel } from './openaiChatCompletionsModel';
+export {
+  OpenAIChatCompletionsModel,
+  type OpenAIChatCompletionsModelOptions,
+} from './openaiChatCompletionsModel';
 export {
   isOpenAIResponsesRawModelStreamEvent,
   isOpenAIChatCompletionsRawModelStreamEvent,

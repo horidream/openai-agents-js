@@ -17,7 +17,7 @@ jobs:
     steps:
       - name: Determine whether CI should run
         id: filter
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
         with:
           script: |
             const IGNORED_PREFIXES = [
@@ -95,7 +95,7 @@ jobs:
       matrix:
         # https://nodejs.org/en/about/previous-releases
         # Using 24.3.x due to https://github.com/pnpm/pnpm/issues/9743
-        node-version: ['20', '22', '24.3.x']
+        node-version: ['22', '24.3.x']
     steps:
       - name: Skip CI for docs/meta-only changes
         if: ${{ needs.changes.outputs.run_ci != 'true' }}
@@ -107,12 +107,12 @@ jobs:
           persist-credentials: false
       - name: Install pnpm
         if: ${{ needs.changes.outputs.run_ci == 'true' }}
-        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
+        uses: pnpm/action-setup@91ab88e2619ed1f46221f0ba42d1492c02baf788
         with:
           run_install: false
       - name: Setup Node.js
         if: ${{ needs.changes.outputs.run_ci == 'true' }}
-        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'pnpm'
@@ -138,6 +138,47 @@ jobs:
         if: ${{ needs.changes.outputs.run_ci == 'true' }}
         run: pnpm test
 
+  windows-sandbox-paths:
+    needs: changes
+    runs-on: windows-latest
+    env:
+      CI: "1"
+      NODE_ENV: test
+    steps:
+      - name: Skip CI for docs/meta-only changes
+        if: ${{ needs.changes.outputs.run_ci != 'true' }}
+        run: echo "Only docs/meta files changed. Marking Windows sandbox path checks as successful without running CI."
+      - name: Checkout repository
+        if: ${{ needs.changes.outputs.run_ci == 'true' }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install pnpm
+        if: ${{ needs.changes.outputs.run_ci == 'true' }}
+        uses: pnpm/action-setup@91ab88e2619ed1f46221f0ba42d1492c02baf788
+        with:
+          run_install: false
+      - name: Setup Node.js
+        if: ${{ needs.changes.outputs.run_ci == 'true' }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 22
+          cache: 'pnpm'
+      - name: Install dependencies
+        if: ${{ needs.changes.outputs.run_ci == 'true' }}
+        run: pnpm install
+      - name: Build packages
+        if: ${{ needs.changes.outputs.run_ci == 'true' }}
+        run: pnpm build
+      - name: Run Windows sandbox path tests
+        if: ${{ needs.changes.outputs.run_ci == 'true' }}
+        shell: bash
+        run: pnpm exec vitest --run --project "@openai/agents-core" packages/agents-core/test/sandboxWorkspacePaths.test.ts packages/agents-core/test/sandboxManifest.test.ts
+      - name: Run Windows remote path tests
+        if: ${{ needs.changes.outputs.run_ci == 'true' }}
+        shell: bash
+        run: pnpm exec vitest --run --project "@openai/agents-extensions" packages/agents-extensions/test/sandbox/remotePaths.test.ts
+
   coverage:
     needs: changes
     runs-on: ubuntu-latest
@@ -154,12 +195,12 @@ jobs:
           persist-credentials: false
       - name: Install pnpm
         if: ${{ needs.changes.outputs.run_ci == 'true' }}
-        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
+        uses: pnpm/action-setup@91ab88e2619ed1f46221f0ba42d1492c02baf788
         with:
           run_install: false
       - name: Setup Node.js
         if: ${{ needs.changes.outputs.run_ci == 'true' }}
-        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: 22
           cache: 'pnpm'

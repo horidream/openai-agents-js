@@ -21,6 +21,7 @@ import logger from './logger';
 import { getCurrentSpan } from './tracing';
 import { RunToolApprovalItem, RunToolCallOutputItem } from './items';
 import { toSmartString } from './utils/smartString';
+import { normalizeHostedMcpRequireApproval } from './utils/mcpApproval';
 import * as ProviderData from './types/providerData';
 import * as protocol from './types/protocol';
 import type { ZodInfer, ZodObjectLike } from './utils/zodCompat';
@@ -365,10 +366,33 @@ export type ComputerConfig<
 function isComputerProvider<Context, TComputer extends Computer>(
   candidate: unknown,
 ): candidate is ComputerProvider<Context, TComputer> {
+  if (isComputerInstance(candidate)) {
+    return false;
+  }
+
   return (
     !!candidate &&
     typeof candidate === 'object' &&
     typeof (candidate as { create?: unknown }).create === 'function'
+  );
+}
+
+function isComputerInstance(candidate: unknown): candidate is Computer {
+  if (!candidate || typeof candidate !== 'object') {
+    return false;
+  }
+
+  const maybeComputer = candidate as Partial<Record<keyof Computer, unknown>>;
+  return (
+    typeof maybeComputer.screenshot === 'function' &&
+    typeof maybeComputer.click === 'function' &&
+    typeof maybeComputer.doubleClick === 'function' &&
+    typeof maybeComputer.drag === 'function' &&
+    typeof maybeComputer.keypress === 'function' &&
+    typeof maybeComputer.move === 'function' &&
+    typeof maybeComputer.scroll === 'function' &&
+    typeof maybeComputer.type === 'function' &&
+    typeof maybeComputer.wait === 'function'
   );
 }
 
@@ -919,8 +943,8 @@ export function hostedMcpTool<Context = UnknownContext>(
           requireApproval:
             | 'always'
             | {
-                never?: { toolNames: string[] };
-                always?: { toolNames: string[] };
+                never?: { toolNames?: string[]; readOnly?: boolean };
+                always?: { toolNames?: string[]; readOnly?: boolean };
               };
           onApproval?: HostedMCPApprovalFunction<Context>;
         }
@@ -950,10 +974,7 @@ export function hostedMcpTool<Context = UnknownContext>(
             allowed_tools: toMcpAllowedToolsFilter(options.allowedTools),
             defer_loading: options.deferLoading,
             headers: options.headers,
-            require_approval:
-              typeof options.requireApproval === 'string'
-                ? 'always'
-                : buildRequireApproval(options.requireApproval),
+            require_approval: buildRequireApproval(options.requireApproval),
             on_approval: options.onApproval,
             server_description: options.serverDescription,
           };
@@ -986,10 +1007,7 @@ export function hostedMcpTool<Context = UnknownContext>(
             allowed_tools: toMcpAllowedToolsFilter(options.allowedTools),
             defer_loading: options.deferLoading,
             headers: options.headers,
-            require_approval:
-              typeof options.requireApproval === 'string'
-                ? 'always'
-                : buildRequireApproval(options.requireApproval),
+            require_approval: buildRequireApproval(options.requireApproval),
             on_approval: options.onApproval,
             server_description: options.serverDescription,
           };
@@ -1016,10 +1034,7 @@ export function hostedMcpTool<Context = UnknownContext>(
             server_label: options.serverLabel,
             allowed_tools: toMcpAllowedToolsFilter(options.allowedTools),
             defer_loading: options.deferLoading,
-            require_approval:
-              typeof options.requireApproval === 'string'
-                ? 'always'
-                : buildRequireApproval(options.requireApproval),
+            require_approval: buildRequireApproval(options.requireApproval),
             on_approval: options.onApproval,
             server_description: options.serverDescription,
           };
@@ -1770,7 +1785,6 @@ export function tool<
       'Tool name cannot be empty. Either name your function or provide a name in the options.',
     );
   }
-
   const strictMode = options.strict ?? true;
   if (!strictMode && isZodObject(options.parameters)) {
     throw new UserError('Strict mode is required for Zod parameters');
@@ -1786,6 +1800,7 @@ export function tool<
   const { parser, schema: parameters } = getSchemaAndParserFromInputType(
     options.parameters,
     name,
+    { strict: strictMode },
   );
 
   async function _invoke(
@@ -1985,21 +2000,24 @@ export function toolNamespace<TTools extends readonly AnyFunctionTool[]>(
   ) as unknown as TTools;
 }
 
-function buildRequireApproval(requireApproval: {
-  never?: { toolNames: string[] };
-  always?: { toolNames: string[] };
-}): { never?: { tool_names: string[] }; always?: { tool_names: string[] } } {
-  const result: {
-    never?: { tool_names: string[] };
-    always?: { tool_names: string[] };
-  } = {};
-  if (requireApproval.always) {
-    result.always = { tool_names: requireApproval.always.toolNames };
+function buildRequireApproval(
+  requireApproval:
+    | 'always'
+    | {
+        never?: { toolNames?: string[]; readOnly?: boolean };
+        always?: { toolNames?: string[]; readOnly?: boolean };
+      },
+): Exclude<
+  ProviderData.HostedMCPTool['require_approval'],
+  'never' | undefined
+> {
+  const normalized = normalizeHostedMcpRequireApproval(requireApproval);
+  if (normalized === 'never') {
+    throw new UserError(
+      'Invalid hosted MCP requireApproval: approval-required branch cannot normalize to "never".',
+    );
   }
-  if (requireApproval.never) {
-    result.never = { tool_names: requireApproval.never.toolNames };
-  }
-  return result;
+  return normalized;
 }
 
 function toMcpAllowedToolsFilter(

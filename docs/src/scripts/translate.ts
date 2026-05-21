@@ -16,12 +16,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
-import {
-  Agent,
-  getDefaultModelSettings,
-  Runner,
-  setDefaultOpenAIKey,
-} from '@openai/agents';
+import { Agent, Runner, setDefaultOpenAIKey } from '@openai/agents';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -140,7 +135,7 @@ const languages: Record<string, string> = {
   zh: 'Chinese',
   // Add more languages here
 };
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5.4';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5.5';
 setDefaultOpenAIKey(process.env.OPENAI_API_KEY || '');
 const ENABLE_CODE_SNIPPET_EXCLUSION = true;
 
@@ -296,6 +291,53 @@ const engToNonEngInstructions: Record<string, string[]> = {
 
 async function ensureDir(dir: string) {
   await fs.mkdir(dir, { recursive: true });
+}
+
+function adjustLocalizedMdxImports(content: string): string {
+  const lines = content.split('\n');
+  let inImportPreamble = true;
+
+  return lines
+    .map((line) => {
+      if (!inImportPreamble) {
+        return line;
+      }
+      if (line.trim() === '') {
+        return line;
+      }
+
+      const fromImport =
+        /^(\s*import\s+.+?\s+from\s+['"])(\.\.\/[^'"]+)(['"];?\s*)$/;
+      const sideEffectImport = /^(\s*import\s+['"])(\.\.\/[^'"]+)(['"];?\s*)$/;
+      if (fromImport.test(line)) {
+        return line.replace(fromImport, '$1../$2$3');
+      }
+      if (sideEffectImport.test(line)) {
+        return line.replace(sideEffectImport, '$1../$2$3');
+      }
+      if (/^\s*import\b/.test(line)) {
+        return line;
+      }
+
+      inImportPreamble = false;
+      return line;
+    })
+    .join('\n');
+}
+
+function localizeSiteLinks(content: string, langCode: string): string {
+  return content.replace(
+    /\/openai-agents-js\/(guides|extensions)(?=[/#)])/g,
+    `/openai-agents-js/${langCode}/$1`,
+  );
+}
+
+function normalizeTypography(content: string): string {
+  return content
+    .replaceAll('\u2026', '...')
+    .replace(/[\u201c\u201d]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replaceAll('\\/>', '/>');
 }
 
 function buildInstructionsForTitle(
@@ -565,12 +607,14 @@ async function callAgent(
   instructions: string,
   model: string = OPENAI_MODEL,
 ): Promise<string> {
-  const modelSettings = getDefaultModelSettings(model);
   const agent = new Agent({
     name: 'translator',
     instructions,
     model,
-    modelSettings,
+    modelSettings: {
+      reasoning: { effort: 'high' },
+      text: { verbosity: 'medium' },
+    },
   });
   const result = await runner.run(agent, content);
   const output = result.finalOutput;
@@ -671,7 +715,7 @@ async function translateFile(
         langCode,
       );
       translatedTitle = sanitizeTitle(
-        await callAgent(titleValue, instructions, 'gpt-4.1'),
+        await callAgent(titleValue, instructions, 'gpt-5.4-mini'),
       );
     }
     // Remove markdown heading if present as the first non-empty line after frontmatter
@@ -694,16 +738,7 @@ async function translateFile(
     ].join('\n');
     mainContent = contentLines.join('\n');
 
-    // ### last modification ###
-    // Adjust the relative code snippet reference path
-    mainContent = mainContent.replaceAll(
-      '../../../../examples',
-      '../../../../../examples',
-    );
-    mainContent = mainContent.replaceAll(
-      '../../components',
-      '../../../components',
-    );
+    mainContent = adjustLocalizedMdxImports(mainContent);
   } else {
     // If not matching, keep original English content
     await ensureDir(path.dirname(targetPath));
@@ -733,6 +768,8 @@ async function translateFile(
   // Remove any duplicate or stray description: lines outside of the frontmatter
   translatedText = translatedText.replace(/^description:.*$/gm, '');
   translatedText = frontmatter + '\n' + translatedText.trimStart();
+  translatedText = localizeSiteLinks(translatedText, langCode);
+  translatedText = normalizeTypography(translatedText);
   await ensureDir(path.dirname(targetPath));
   await fs.writeFile(targetPath, translatedText, 'utf8');
 }
@@ -805,6 +842,24 @@ function shouldSkipFile(filePath: string): boolean {
     return true;
   }
   return false;
+}
+
+async function addMarkdownFilesFromDir(
+  dir: string,
+  filePaths: string[],
+): Promise<void> {
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const entryPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await addMarkdownFilesFromDir(entryPath, filePaths);
+    } else if (
+      entry.isFile() &&
+      (entry.name.endsWith('.md') || entry.name.endsWith('.mdx'))
+    ) {
+      filePaths.push(entryPath);
+    }
+  }
 }
 
 async function translateSingleSourceFile(
@@ -922,22 +977,7 @@ async function main() {
         continue;
       }
       if (stat.isDirectory()) {
-        // Recursively add markdown files in directory.
-        async function addFilesFromDir(dir: string) {
-          const entries = await fs.readdir(dir, { withFileTypes: true });
-          for (const entry of entries) {
-            const entryPath = path.join(dir, entry.name);
-            if (entry.isDirectory()) {
-              await addFilesFromDir(entryPath);
-            } else if (
-              entry.isFile() &&
-              (entry.name.endsWith('.md') || entry.name.endsWith('.mdx'))
-            ) {
-              filePaths.push(entryPath);
-            }
-          }
-        }
-        await addFilesFromDir(fullPath);
+        await addMarkdownFilesFromDir(fullPath, filePaths);
       } else if (stat.isFile()) {
         filePaths.push(fullPath);
       }
@@ -948,20 +988,11 @@ async function main() {
     }
   } else {
     filePaths.push(path.join(sourceDir, 'index.mdx'));
-    // Translate all guides/*.md files.
+    // Translate authored docs recursively while keeping generated API reference
+    // pages under docs/src/content/docs/openai English-only.
     async function collectFiles() {
-      // Add all guides/*.md.
-      for (const dir of ['guides', 'guides/voice-agents', 'extensions']) {
-        const guidesDir = path.join(sourceDir, dir);
-        const entries = await fs.readdir(guidesDir, { withFileTypes: true });
-        for (const entry of entries) {
-          if (
-            entry.isFile() &&
-            (entry.name.endsWith('.md') || entry.name.endsWith('.mdx'))
-          ) {
-            filePaths.push(path.join(guidesDir, entry.name));
-          }
-        }
+      for (const dir of ['guides', 'extensions']) {
+        await addMarkdownFilesFromDir(path.join(sourceDir, dir), filePaths);
       }
     }
     await collectFiles();

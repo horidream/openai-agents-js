@@ -4,6 +4,7 @@ import {
   Tool,
   UserError,
 } from '@openai/agents-core';
+import { normalizeHostedMcpRequireApproval } from '@openai/agents-core/utils';
 import { RealtimeToolDefinition } from './clientMessages';
 
 export const BACKGROUND_RESULT_SYMBOL = Symbol('backgroundResult');
@@ -50,13 +51,19 @@ export function toRealtimeToolDefinition(
       tool.providerData.server_url && tool.providerData.server_url.length > 0
         ? tool.providerData.server_url
         : undefined;
+    const requireApproval =
+      typeof tool.providerData.require_approval === 'undefined'
+        ? undefined
+        : normalizeHostedMcpRequireApproval(tool.providerData.require_approval);
     return {
       type: 'mcp',
       server_label: tool.providerData.server_label,
       server_url: serverUrl,
       headers: tool.providerData.headers,
       allowed_tools: tool.providerData.allowed_tools,
-      require_approval: tool.providerData.require_approval,
+      ...(typeof requireApproval === 'undefined'
+        ? {}
+        : { require_approval: requireApproval }),
     };
   }
 

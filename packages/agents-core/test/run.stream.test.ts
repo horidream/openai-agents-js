@@ -4,6 +4,7 @@ import {
   Agent,
   AgentInputItem,
   MaxTurnsExceededError,
+  ModelRefusalError,
   run,
   Runner,
   setDefaultModelProvider,
@@ -28,7 +29,13 @@ import {
   RunState,
   shellTool,
 } from '../src';
-import { FakeModel, FakeModelProvider, fakeModelMessage } from './stubs';
+import {
+  FakeModel,
+  FakeModelProvider,
+  TEST_MODEL_FUNCTION_CALL,
+  fakeModelMessage,
+  fakeModelRefusal,
+} from './stubs';
 import * as protocol from '../src/types/protocol';
 import * as sessionPersistence from '../src/runner/sessionPersistence';
 import type { GuardrailFunctionOutput } from '../src/guardrail';
@@ -52,6 +59,53 @@ function getFirstTextContent(item: AgentInputItem): string | undefined {
 
 function getRequestInputItems(request: ModelRequest): AgentInputItem[] {
   return Array.isArray(request.input) ? request.input : [];
+}
+
+class AbortAfterStreamedFunctionCallModel implements Model {
+  public requests: ModelRequest[] = [];
+
+  constructor(private readonly responseId: string) {}
+
+  async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(request);
+    return {
+      output: [fakeModelMessage('reconciled')],
+      usage: new Usage(),
+      responseId: 'resp-reconciled',
+    };
+  }
+
+  async *getStreamedResponse(
+    request: ModelRequest,
+  ): AsyncIterable<StreamEvent> {
+    this.requests.push(request);
+    yield {
+      type: 'model',
+      event: {
+        type: 'response.created',
+        response: {
+          id: this.responseId,
+        },
+      },
+    };
+    yield {
+      type: 'model',
+      event: {
+        type: 'response.output_item.done',
+        item: {
+          type: 'function_call',
+          id: 'fc_abort',
+          call_id: 'call_abort',
+          name: 'slow_tool',
+          arguments: '{}',
+          status: 'completed',
+        },
+      },
+    };
+    const error = new Error('aborted');
+    error.name = 'AbortError';
+    throw error;
+  }
 }
 
 // Test for unhandled rejection when stream loop throws
@@ -183,6 +237,87 @@ describe('Runner.run (streaming)', () => {
     expect(result.finalOutput).toBe('The package arrives tomorrow.');
   });
 
+  it('streams through missing function tool errors when opted in', async () => {
+    class RecordingStreamingModel implements Model {
+      readonly requests: ModelRequest[] = [];
+
+      constructor(private readonly responses: ModelResponse[]) {}
+
+      async getResponse(request: ModelRequest): Promise<ModelResponse> {
+        this.requests.push(request);
+        const response = this.responses.shift();
+        if (!response) {
+          throw new Error('No response found');
+        }
+        return response;
+      }
+
+      async *getStreamedResponse(
+        request: ModelRequest,
+      ): AsyncIterable<StreamEvent> {
+        const response = await this.getResponse(request);
+        yield {
+          type: 'response_done',
+          response: {
+            id: response.responseId ?? 'resp-stream-missing-tool',
+            usage: {
+              requests: response.usage.requests,
+              inputTokens: response.usage.inputTokens,
+              outputTokens: response.usage.outputTokens,
+              totalTokens: response.usage.totalTokens,
+            },
+            output: response.output.map((item) =>
+              protocol.OutputModelItem.parse(item),
+            ),
+          },
+        } satisfies StreamEvent;
+      }
+    }
+
+    const model = new RecordingStreamingModel([
+      {
+        output: [
+          {
+            ...TEST_MODEL_FUNCTION_CALL,
+            name: 'missing_tool',
+            callId: 'call_missing',
+            arguments: '{}',
+          },
+        ],
+        usage: new Usage(),
+      },
+      {
+        output: [fakeModelMessage('stream recovered')],
+        usage: new Usage(),
+      },
+    ]);
+    const agent = new Agent({
+      name: 'StreamingMissingToolAgent',
+      model,
+      toolUseBehavior: 'run_llm_again',
+    });
+
+    const result = await run(agent, 'start', {
+      stream: true,
+      toolNotFoundBehavior: 'return_error_to_model',
+    });
+
+    await result.completed;
+    expect(result.finalOutput).toBe('stream recovered');
+    expect(model.requests).toHaveLength(2);
+    const secondInput = model.requests[1].input as AgentInputItem[];
+    expect(secondInput).toContainEqual({
+      type: 'function_call_result',
+      name: 'missing_tool',
+      callId: 'call_missing',
+      status: 'completed',
+      output: {
+        type: 'text',
+        text: "Tool 'missing_tool' not found.",
+      },
+    });
+  });
+
   it('detaches abort listeners after streaming completion when signal is retained', async () => {
     const agent = new Agent({
       name: 'AbortDetach',
@@ -204,6 +339,52 @@ describe('Runner.run (streaming)', () => {
     await result.completed;
 
     expect(getEventListeners(retainedSignals[0], 'abort').length).toBe(0);
+  });
+
+  it('reconciles streamed function calls on abort with conversationId', async () => {
+    const model = new AbortAfterStreamedFunctionCallModel('resp-aborted');
+    const agent = new Agent({ name: 'AbortReconcile', model });
+
+    const result = await run(agent, 'hi', {
+      stream: true,
+      conversationId: 'conv-abort',
+    });
+
+    await result.completed;
+
+    expect(model.requests).toHaveLength(2);
+    expect(model.requests[1].conversationId).toBe('conv-abort');
+    expect(model.requests[1].signal).toBeUndefined();
+    expect(getRequestInputItems(model.requests[1])).toEqual([
+      expect.objectContaining({
+        type: 'function_call_result',
+        callId: 'call_abort',
+        name: 'slow_tool',
+        status: 'incomplete',
+        output: { type: 'text', text: 'aborted' },
+      }),
+    ]);
+  });
+
+  it('uses the streamed response id when reconciling previousResponseId-only aborts', async () => {
+    const model = new AbortAfterStreamedFunctionCallModel('resp-aborted');
+    const agent = new Agent({ name: 'AbortPreviousResponse', model });
+
+    const result = await run(agent, 'hi', {
+      stream: true,
+      previousResponseId: 'resp-before-abort',
+    });
+
+    await result.completed;
+
+    expect(model.requests).toHaveLength(2);
+    expect(model.requests[1].conversationId).toBeUndefined();
+    expect(model.requests[1].previousResponseId).toBe('resp-aborted');
+    expect(getRequestInputItems(model.requests[1])[0]).toMatchObject({
+      type: 'function_call_result',
+      callId: 'call_abort',
+      status: 'incomplete',
+    });
   });
 
   it('emits agent_updated_stream_event with new agent on handoff', async () => {
@@ -1123,6 +1304,83 @@ describe('Runner.run (streaming)', () => {
     );
   });
 
+  it('does not enforce maxTurns for streamed runs when maxTurns is null', async () => {
+    const testTool = tool({
+      name: 'test_tool',
+      description: 'A test tool',
+      parameters: z.object({}),
+      execute: async () => 'result',
+    });
+    const responses: ModelResponse[] = [
+      ...Array.from({ length: 12 }, (_, index) => ({
+        output: [
+          {
+            type: 'function_call' as const,
+            id: `fc_${index}`,
+            callId: `call_${index}`,
+            name: 'test_tool',
+            status: 'completed' as const,
+            arguments: '{}',
+            providerData: {},
+          } as protocol.FunctionCallItem,
+        ],
+        usage: new Usage(),
+      })),
+      {
+        output: [fakeModelMessage('done')],
+        usage: new Usage(),
+      },
+    ];
+
+    class LongStreamingModel implements Model {
+      #callCount = 0;
+
+      async getResponse(_req: ModelRequest): Promise<ModelResponse> {
+        const response = responses[this.#callCount++];
+        if (!response) {
+          throw new Error('No response found');
+        }
+        return response;
+      }
+
+      async *getStreamedResponse(
+        req: ModelRequest,
+      ): AsyncIterable<StreamEvent> {
+        const response = await this.getResponse(req);
+        yield {
+          type: 'response_done',
+          response: {
+            id: `r_${this.#callCount}`,
+            usage: {
+              requests: 1,
+              inputTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+            },
+            output: response.output,
+          },
+        } as any;
+      }
+    }
+
+    const agent = new Agent({
+      name: 'NoMaxTurnsStream',
+      model: new LongStreamingModel(),
+      tools: [testTool],
+      toolUseBehavior: 'run_llm_again',
+    });
+
+    const result = await run(agent, 'hi', { stream: true, maxTurns: null });
+    for await (const _event of result.toStream()) {
+      // Consume stream.
+    }
+    await result.completed;
+
+    expect(result.finalOutput).toBe('done');
+    expect(result.maxTurns).toBeNull();
+    expect(result.state._currentTurn).toBe(13);
+  });
+
   it('handles maxTurns errors with an error handler', async () => {
     const agent = new Agent({
       name: 'MaxTurnsHandlerStream',
@@ -1154,6 +1412,66 @@ describe('Runner.run (streaming)', () => {
     expect(runItemEvents[0].item).toBeInstanceOf(RunMessageOutputItem);
     if (runItemEvents[0].item instanceof RunMessageOutputItem) {
       expect(runItemEvents[0].item.content).toBe('summary');
+    }
+  });
+
+  it('handles model refusal errors with an error handler', async () => {
+    class RefusalStreamingModel implements Model {
+      async getResponse(_req: ModelRequest): Promise<ModelResponse> {
+        return {
+          output: [fakeModelRefusal('I cannot help with that request.')],
+          usage: new Usage(),
+        };
+      }
+
+      async *getStreamedResponse(
+        req: ModelRequest,
+      ): AsyncIterable<StreamEvent> {
+        const response = await this.getResponse(req);
+        yield {
+          type: 'response_done',
+          response: {
+            id: 'r_refusal',
+            usage: {
+              requests: 1,
+              inputTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+            },
+            output: response.output,
+          },
+        } as any;
+      }
+    }
+
+    const agent = new Agent({
+      name: 'RefusalHandlerStream',
+      model: new RefusalStreamingModel(),
+    });
+    const result = await run(agent, 'x', {
+      stream: true,
+      errorHandlers: {
+        modelRefusal: ({ error }) => {
+          expect(error).toBeInstanceOf(ModelRefusalError);
+          return { finalOutput: 'safe fallback' };
+        },
+      },
+    });
+    const events: RunStreamEvent[] = [];
+    for await (const event of result.toStream()) {
+      events.push(event);
+    }
+    await result.completed;
+    expect(result.finalOutput).toBe('safe fallback');
+    const runItemEvents = events.filter(
+      (event): event is RunItemStreamEvent =>
+        event.type === 'run_item_stream_event',
+    );
+    expect(runItemEvents).toHaveLength(2);
+    expect(runItemEvents[1].name).toBe('message_output_created');
+    expect(runItemEvents[1].item).toBeInstanceOf(RunMessageOutputItem);
+    if (runItemEvents[1].item instanceof RunMessageOutputItem) {
+      expect(runItemEvents[1].item.content).toBe('safe fallback');
     }
   });
 

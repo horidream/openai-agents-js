@@ -28,6 +28,7 @@ export {
   InputGuardrailTripwireTriggered,
   MaxTurnsExceededError,
   ModelBehaviorError,
+  ModelRefusalError,
   OutputGuardrailTripwireTriggered,
   ToolInputGuardrailTripwireTriggered,
   ToolOutputGuardrailTripwireTriggered,
@@ -120,6 +121,7 @@ export {
   MCPTextResourceContent,
   GetAllMcpToolsOptions,
   MCPToolCacheKeyGenerator,
+  MCPToolErrorFunction,
 } from './mcp';
 export {
   MCPServers,
@@ -146,6 +148,7 @@ export {
   ModelRequest,
   ModelResponse,
   ModelSettings,
+  ModelSettingsContextManagement,
   ModelSettingsToolChoice,
   RetryDecision,
   RetryPolicy,
@@ -178,6 +181,9 @@ export type {
   CallModelInputFilterArgs,
   ToolErrorFormatter,
   ToolErrorFormatterArgs,
+  ToolExecutionConfig,
+  ToolNotFoundBehavior,
+  ToolErrorKind,
   ReasoningItemIdPolicy,
   RunErrorData,
   RunErrorHandler,
@@ -290,11 +296,18 @@ export { RequestUsage, Usage } from './usage';
 export type {
   Session,
   SessionInputCallback,
+  SessionHistoryMutation,
+  SessionHistoryRewriteArgs,
+  SessionHistoryRewriteAwareSession,
   OpenAIResponsesCompactionArgs,
   OpenAIResponsesCompactionAwareSession,
   OpenAIResponsesCompactionResult,
 } from './memory/session';
-export { isOpenAIResponsesCompactionAwareSession } from './memory/session';
+export {
+  isOpenAIResponsesCompactionAwareSession,
+  isSessionHistoryRewriteAwareSession,
+} from './memory/session';
+export { applySessionHistoryMutations } from './memory/historyMutations';
 export { MemorySession } from './memory/memorySession';
 
 /**

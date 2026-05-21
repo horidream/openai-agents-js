@@ -174,15 +174,29 @@ export class OpenAIConversationsSession
     return orderedItems;
   }
 
+  prepareHistoryItemForModelInput(item: AgentInputItem): AgentInputItem {
+    return stripAssistantReplayMetadata(item);
+  }
+
+  preserveReasoningItemIdsForPersistence(): boolean {
+    return true;
+  }
+
   async addItems(items: AgentInputItem[]): Promise<void> {
     if (!items.length) {
       return;
     }
 
     const conversationId = await this.getSessionId();
-    const sanitizedItems = stripIdsAndProviderData(items);
+    const normalizedItems = stripProviderModelForConversationPersistence(items);
+    const sanitizedItems = stripConversationPersistenceMetadata(
+      getInputItems(normalizedItems),
+    );
+    if (!sanitizedItems.length) {
+      return;
+    }
     await this.#client.conversations.items.create(conversationId, {
-      items: getInputItems(sanitizedItems),
+      items: sanitizedItems,
     });
   }
 
@@ -217,13 +231,14 @@ export class OpenAIConversationsSession
 //  Internals
 // --------------------------------------------------------------
 
-function stripIdsAndProviderData(items: AgentInputItem[]): AgentInputItem[] {
+function stripProviderModelForConversationPersistence(
+  items: AgentInputItem[],
+): AgentInputItem[] {
   return items.map((item) => {
     if (Array.isArray(item) || item === null || typeof item !== 'object') {
       return item;
     }
     // Conversations API rejects unknown top-level fields (e.g., model merged from providerData).
-    // Only strip providerData.model from message-like items; keep IDs intact for tool linkage.
     const rest = { ...(item as Record<string, unknown>) };
     const providerData = (item as { providerData?: unknown }).providerData;
 
@@ -239,6 +254,56 @@ function stripIdsAndProviderData(items: AgentInputItem[]): AgentInputItem[] {
     }
     return rest as AgentInputItem;
   });
+}
+
+function stripConversationPersistenceMetadata(
+  items: OpenAI.Responses.ResponseInputItem[],
+): OpenAI.Responses.ResponseInputItem[] {
+  return items.flatMap((item) => {
+    if (Array.isArray(item) || item === null || typeof item !== 'object') {
+      return [item];
+    }
+    const record = item as unknown as Record<string, unknown>;
+    if (isUnpersistableReasoningItem(record)) {
+      return [];
+    }
+    const {
+      providerData: _providerData,
+      provider_data: _provider_data,
+      ...rest
+    } = record;
+    if (rest.type !== 'reasoning') {
+      delete rest.id;
+    }
+    return [rest as unknown as OpenAI.Responses.ResponseInputItem];
+  });
+}
+
+function isUnpersistableReasoningItem(item: Record<string, unknown>): boolean {
+  return (
+    item.type === 'reasoning' &&
+    typeof item.id !== 'string' &&
+    typeof item.encrypted_content !== 'string'
+  );
+}
+
+function stripAssistantReplayMetadata(item: AgentInputItem): AgentInputItem {
+  if (Array.isArray(item) || item === null || typeof item !== 'object') {
+    return item;
+  }
+
+  const record = item as Record<string, unknown>;
+  if (record.type !== 'message' || record.role !== 'assistant') {
+    return item;
+  }
+
+  const {
+    id: _id,
+    providerData: _providerData,
+    provider_data: _provider_data,
+    ...rest
+  } = record;
+  return rest as AgentInputItem;
 }
 
 const INPUT_CONTENT_TYPES = new Set([

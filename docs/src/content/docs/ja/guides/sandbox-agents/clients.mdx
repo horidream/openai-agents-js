@@ -1,0 +1,202 @@
+---
+title: サンドボックスクライアント
+description: Choose where sandbox work should run and how sessions, snapshots, mounts, and ports behave.
+---
+
+import { Aside, Code } from '@astrojs/starlight/components';
+import developerOwnedSessionExample from '../../../../../../../examples/docs/sandbox-agents/developer-owned-session.ts?raw';
+import dockerClientExample from '../../../../../../../examples/docs/sandbox-agents/docker-client.ts?raw';
+import exposedPortsExample from '../../../../../../../examples/docs/sandbox-agents/exposed-ports.ts?raw';
+import manifestConcurrencyExample from '../../../../../../../examples/docs/sandbox-agents/manifest-concurrency.ts?raw';
+import resumeSessionStateExample from '../../../../../../../examples/docs/sandbox-agents/resume-session-state.ts?raw';
+import selectLocalClientExample from '../../../../../../../examples/docs/sandbox-agents/select-local-client.ts?raw';
+
+このページは、サンドボックス作業をどこで実行するかを選ぶために使用します。ほとんどの場合、`SandboxAgent` の定義は同じままで、`sandbox` 実行オプション内のサンドボックスクライアントとクライアント固有のオプションだけが変わります。
+
+<Aside type="caution" title="ベータ機能">
+  サンドボックスエージェントはベータ版です。API
+  の詳細、デフォルト、サポートされる機能は
+  一般提供前に変更される可能性があり、より高度な機能も 今後追加される予定です。
+</Aside>
+
+## 判断ガイド
+
+| 目的 | はじめに使うもの | 理由 |
+| --- | --- | --- |
+| macOS または Linux で最速のローカルイテレーション | `UnixLocalSandboxClient` | 追加のサービス依存がなく、シンプルなローカルファイルシステムのワークフロー。 |
+| 基本的なコンテナ分離 | `DockerSandboxClient` | 特定のイメージを使って Docker 内で作業を実行します。 |
+| ホスト型実行または本番環境に近い分離 | ホスト型サンドボックスクライアント | ワークスペースの境界をプロバイダー管理環境へ移します。 |
+
+## ローカルクライアント
+
+ほとんどのユーザーは、まず次の 2 つのサンドボックスクライアントのいずれかから始めてください。
+
+| クライアント | インストール | 選ぶ場面 |
+| --- | --- | --- |
+| `UnixLocalSandboxClient` | なし | macOS または Linux で最速のローカルイテレーション。ローカル開発の良いデフォルトです。 |
+| `DockerSandboxClient` | Docker CLI がローカルで利用可能 | コンテナ分離、またはローカルでの同等性のために特定のイメージが必要な場合。 |
+
+Unix-local は、ローカルファイルシステムを対象に開発を始める最も簡単な方法です。より強力な環境分離や本番環境に近い同等性が必要になったら、Docker またはホスト型プロバイダーへ移行してください。
+
+Unix-local から Docker に切り替えるには、エージェント定義を同じままにして、クライアントだけを変更します。
+
+<Code lang="typescript" code={dockerClientExample} title="Docker の使用" />
+
+同じエージェントは通常、どちらのローカルクライアントでも実行できます。
+
+<Code
+  lang="typescript"
+  code={selectLocalClientExample}
+  title="ローカルクライアント間の切り替え"
+/>
+
+### セッションの所有権
+
+ライフサイクルには 2 つのスタイルがあります。
+
+| スタイル | 渡すもの | セッションを閉じる人 | 使用する場面 |
+| --- | --- | --- | --- |
+| SDK 管理 | `sandbox: { client }` | ランナー | サンドボックスが 1 回の実行中だけ存在すればよい場合 |
+| 開発者管理 | `sandbox: { session }` | 自分のコード | 後でファイルを調査する、同じライブセッションを再利用する、または複数の実行を調整する必要がある場合 |
+
+自分でセッションを作成した場合は、自分で閉じてください。
+
+<Code
+  lang="typescript"
+  code={developerOwnedSessionExample}
+  title="サンドボックスセッションライフサイクルの所有"
+/>
+
+### 再開とスナップショット
+
+サンドボックス状態と会話状態は別々です。
+
+- SDK の会話状態は、`result.history`、SDK の `Session`、`conversationId`、または `previousResponseId` に存在します。
+- サンドボックス状態は、ライブなサンドボックスセッション、シリアライズされた `sessionState`、`RunState` のサンドボックスペイロード、またはスナップショットに存在します。
+
+`sessionState` は、サンドボックスクライアントを通じて同じバックエンドセッションへ再接続したい場合に使用します。保存されたワークスペース内容をシードにした新しいセッションが必要な場合は、スナップショットを使用します。
+
+<Code
+  lang="typescript"
+  code={resumeSessionStateExample}
+  title="サンドボックス状態のシリアライズと再開"
+/>
+
+`RunState` は、大きなワークフローを一時停止または再開する際に、ランナー管理のサンドボックス状態も保持できます。サンドボックスのライフサイクルがシリアライズされた実行の外部で管理される場合は、明示的な `sessionState` を使用してください。
+
+### マニフェストの実体化
+
+マニフェストエントリは、エージェントの実行前に準備されます。実体化の並列数は、実行ごと、またはクライアント作成呼び出しごとに調整できます。
+
+<Code
+  lang="typescript"
+  code={manifestConcurrencyExample}
+  title="マニフェスト実体化の並列数の調整"
+/>
+
+`manifestEntries` は、トップレベルエントリでの並列作業を制限します。`localDirFiles` は、`localDir()` エントリ内のファイルコピーの並列数を制限します。
+
+## マウントとリモートストレージ
+
+マウントエントリは公開するストレージを記述し、マウント戦略はサンドボックスバックエンドがそのストレージを接続する方法を記述します。組み込みのマウントエントリと汎用戦略は `@openai/agents/sandbox` からインポートします。
+
+一般的なマウントオプション:
+
+- `mountPath`: サンドボックス内でストレージが表示される場所。相対パスはマニフェストルート配下で解決され、絶対パスはそのまま使用されます。
+- `readOnly`: サンドボックスがマウントされたストレージへ書き戻すべきでない場合に設定します。
+- `mountStrategy`: マウントエントリとサンドボックスバックエンドの両方に一致する戦略を使用します。
+
+マウントは一時的なワークスペースエントリとして扱われます。スナップショットと永続化のフローでは、マウントされたリモートストレージを保存済みワークスペースにコピーするのではなく、マウント済みパスを切り離すかスキップします。
+
+汎用のローカル / コンテナ戦略:
+
+| 戦略またはパターン | 使用する場面 | 備考 |
+| --- | --- | --- |
+| `inContainerMountStrategy(...)` | サンドボックスイメージが `rclone`、`mount-s3`、`blobfuse2` などのマウントコマンドを実行できる場合。 | 汎用戦略として利用可能です。サポートはバックエンドによって異なります。 |
+| `dockerVolumeMountStrategy(...)` | Docker がコンテナ起動前にボリュームドライバー由来のマウントを接続する必要がある場合。 | Docker のみ。 |
+| `localBindMountStrategy()` | ローカルバックエンドが絶対ローカルパスをワークスペースにバインドする必要がある場合。 | 許可されている場合、ローカルワークスペースの実体化でサポートされます。 |
+
+バックエンドのサポートは意図的に明示的です。
+
+| バックエンド | マウントに関するメモ |
+| --- | --- |
+| `UnixLocalSandboxClient` | ローカルワークスペースモデルを通じて、ローカルバインド形式のマウントをサポートします。 |
+| `DockerSandboxClient` | Docker がストレージを接続できる場合、ローカルバインドマウントと Docker ボリューム形式の戦略をサポートします。 |
+| ホスト型プロバイダー | プロバイダー固有の戦略は各プロバイダー実装に含まれます。サポートされるマウントと必要なセットアップについては、そのプロバイダーのドキュメントを確認してください。 |
+
+マウントエントリがすべてのバックエンドで動作すると仮定しないでください。クライアントがマニフェストメタデータ、識別情報、またはマウント動作を強制できない場合、そのクライアントはマニフェストの該当部分を黙って無視するのではなく、早期に失敗するべきです。
+
+## サポートされるホスト型プラットフォーム
+
+ホスト型環境が必要な場合、通常、同じ `SandboxAgent` 定義を引き継ぎ、`sandbox` 実行オプション内のサンドボックスクライアントだけを変更できます。
+
+ホスト型プロバイダー実装は、`@openai/agents-extensions` のプロバイダーサブパスから利用できます。正確な環境変数、実行可能な例、ポート動作、PTY サポート、スナップショット動作、クリーンアップ動作については、プロバイダーのドキュメントを確認してください。
+
+`@openai/agents-extensions` をインストールし、そのパッケージレベルの peer 依存関係を満たしてください。各プロバイダーでは、プロバイダー SDK パッケージまたはバックエンドセットアップも必要になる場合があります。
+
+| クライアント | インポートパス | プロバイダー要件 |
+| --- | --- | --- |
+| `BlaxelSandboxClient` | `@openai/agents-extensions/sandbox/blaxel` | npm peer: `@blaxel/core` |
+| `CloudflareSandboxClient` | `@openai/agents-extensions/sandbox/cloudflare` | Cloudflare Sandbox ブリッジ Worker の URL と Worker 認証 |
+| `DaytonaSandboxClient` | `@openai/agents-extensions/sandbox/daytona` | npm peer: `@daytonaio/sdk` |
+| `E2BSandboxClient` | `@openai/agents-extensions/sandbox/e2b` | npm peer: `e2b` または `@e2b/code-interpreter` |
+| `ModalSandboxClient` | `@openai/agents-extensions/sandbox/modal` | npm peer: `modal` |
+| `RunloopSandboxClient` | `@openai/agents-extensions/sandbox/runloop` | npm peer: `@runloop/api-client` |
+| `VercelSandboxClient` | `@openai/agents-extensions/sandbox/vercel` | npm peer: `@vercel/sandbox` |
+
+`CloudflareSandboxClient` は Cloudflare npm SDK をインポートしません。代わりに、デプロイ済みの Cloudflare Sandbox ブリッジ Worker と HTTP 経由で通信します。
+
+ホスト型サンドボックスクライアントは、プロバイダー固有のマウント戦略を公開します。ストレージプロバイダーに最も適したバックエンドとマウント戦略を選択してください。
+
+| バックエンド | マウントに関するメモ |
+| --- | --- |
+| Docker | `s3Mount()`、`gcsMount()`、`r2Mount()`、`azureBlobMount()`、`boxMount()`、`s3FilesMount()` を、`inContainerMountStrategy()` や `dockerVolumeMountStrategy()` などのローカル戦略とともにサポートします。 |
+| `ModalSandboxClient` | S3、R2、および HMAC 認証された GCS マウントエントリで、`ModalCloudBucketMountStrategy` によるクラウドバケットマウントをサポートします。 |
+| `CloudflareSandboxClient` | S3、R2、および HMAC 認証された GCS マウントエントリで、`CloudflareBucketMountStrategy` による Cloudflare バケットマウントをサポートします。 |
+| `BlaxelSandboxClient` | S3、R2、および GCS マウントエントリで、`BlaxelCloudBucketMountStrategy` によるクラウドバケットマウントをサポートします。また、`BlaxelDriveMount` と `BlaxelDriveMountStrategy` による永続的な Blaxel Drives もサポートします。 |
+| `DaytonaSandboxClient` | S3、GCS、R2、Azure Blob、Box のマウントエントリで、`DaytonaCloudBucketMountStrategy` による rclone ベースのマウントをサポートします。 |
+| `E2BSandboxClient` | S3、GCS、R2、Azure Blob、Box のマウントエントリで、`E2BCloudBucketMountStrategy` による rclone ベースのマウントをサポートします。 |
+| `RunloopSandboxClient` | S3、GCS、R2、Azure Blob、Box のマウントエントリで、`RunloopCloudBucketMountStrategy` による rclone ベースのマウントをサポートします。 |
+| `VercelSandboxClient` | 現在、ホスト型固有のマウント戦略は公開されていません。代わりに、マニフェストファイル、リポジトリ、スナップショット、またはその他のワークスペース入力を使用してください。 |
+
+次の表は、各バックエンドが直接マウントできるリモートストレージエントリをまとめたものです。
+
+| バックエンド | AWS S3 | Cloudflare R2 | GCS | Azure Blob Storage | Box | S3 Files |
+| --- | --- | --- | --- | --- | --- | --- |
+| Docker | はい | はい | はい | はい | はい | はい |
+| `ModalSandboxClient` | はい | はい | はい | いいえ | いいえ | いいえ |
+| `CloudflareSandboxClient` | はい | はい | はい | いいえ | いいえ | いいえ |
+| `BlaxelSandboxClient` | はい | はい | はい | いいえ | いいえ | いいえ |
+| `DaytonaSandboxClient` | はい | はい | はい | はい | はい | いいえ |
+| `E2BSandboxClient` | はい | はい | はい | はい | はい | いいえ |
+| `RunloopSandboxClient` | はい | はい | はい | はい | はい | いいえ |
+| `VercelSandboxClient` | いいえ | いいえ | いいえ | いいえ | いいえ | いいえ |
+
+### 公開ポート
+
+バックエンドがサポートしている場合、サンドボックスクライアントは `resolveExposedPort(port)` を通じてエンドポイントを公開できます。
+
+| クライアント | 動作 |
+| --- | --- |
+| `UnixLocalSandboxClient` | 設定されたポートを `127.0.0.1` に解決します。 |
+| `DockerSandboxClient` | 設定されたコンテナポートを公開し、そのホストエンドポイントを解決します。 |
+
+バックエンドに許可リストを強制させる必要がある場合は、クライアントオプションでポートを宣言します。
+
+<Code lang="typescript" code={exposedPortsExample} title="ポートの公開" />
+
+### 機能サポートマトリックス
+
+| 機能 | Unix-local | Docker |
+| --- | --- | --- |
+| `exec_command` | サポートあり | サポートあり |
+| PTY `write_stdin` | サポートあり | サポートあり |
+| `apply_patch` | サポートあり | ワークスペースファイル API 経由でサポート |
+| `view_image` | サポートあり | ワークスペースファイル API 経由でサポート |
+| コマンドの `runAs` | ホストがユーザーを解決して切り替えられる場合にサポート | コンテナ / ユーザー設定により制限 |
+| ローカルスナップショット | サポートあり | サポートあり |
+| ローカル / Docker マウント | ローカルバインド形式のサポート | バインドおよび Docker ボリューム形式のサポート |
+
+ローカルの PTY サポートは、SDK プロセス内の小さな Python 3 ブリッジを使用します。このブリッジは `tty: true` セッションでのみ使用されます。Node.js には組み込みの PTY API がなく、SDK が対話的な stdin、シグナル処理、終了ステータス報告のために標準的な POSIX PTY 動作を必要とするためです。SDK コードを実行する環境に `python3` をインストールするか、`OPENAI_AGENTS_PYTHON` を Python 3 実行ファイルに設定してください。これは、Docker サンドボックスイメージ内にインストールされている Python バージョンがある場合でも、それとは別のものです。
+
+ホスト型プロバイダーのサポートはプロバイダーによって異なります。正確なオプション、環境変数、ポート動作、PTY サポート、スナップショット動作、クリーンアップ動作については、プロバイダー固有のドキュメントを確認してください。

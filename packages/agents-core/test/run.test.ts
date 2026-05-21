@@ -14,6 +14,7 @@ import {
   Agent,
   InputGuardrailTripwireTriggered,
   MaxTurnsExceededError,
+  ModelRefusalError,
   ModelResponse,
   OutputGuardrailTripwireTriggered,
   Session,
@@ -30,6 +31,8 @@ import {
   BatchTraceProcessor,
   user,
   assistant,
+  type ToolExecutionConfig,
+  type ToolNotFoundBehavior,
 } from '../src';
 import { RunStreamEvent } from '../src/events';
 import { ServerConversationTracker } from '../src/runner/conversation';
@@ -59,6 +62,8 @@ import logger from '../src/logger';
 import { getGlobalTraceProvider } from '../src/tracing/provider';
 import {
   FakeModel,
+  fakeModelRefusal,
+  fakeModelMessageWithRefusal,
   fakeModelMessage,
   FakeModelProvider,
   FakeTracingExporter,
@@ -100,6 +105,165 @@ describe('Runner.run', () => {
   });
 
   describe('basic', () => {
+    it('accepts public tool execution config', () => {
+      const toolExecution = {
+        maxFunctionToolConcurrency: 2,
+      } satisfies ToolExecutionConfig;
+
+      const runner = new Runner({
+        tracingDisabled: true,
+        toolExecution,
+      });
+
+      expect(runner.config.toolExecution).toBe(toolExecution);
+    });
+
+    it('accepts public tool not found behavior config', () => {
+      const toolNotFoundBehavior =
+        'return_error_to_model' satisfies ToolNotFoundBehavior;
+
+      const runner = new Runner({
+        tracingDisabled: true,
+        toolNotFoundBehavior,
+      });
+
+      expect(runner.config.toolNotFoundBehavior).toBe('return_error_to_model');
+    });
+
+    it('rejects invalid function tool concurrency config', () => {
+      expect(
+        () =>
+          new Runner({
+            tracingDisabled: true,
+            toolExecution: { maxFunctionToolConcurrency: 0 },
+          }),
+      ).toThrow(UserError);
+      expect(
+        () =>
+          new Runner({
+            tracingDisabled: true,
+            toolExecution: { maxFunctionToolConcurrency: 1.5 },
+          }),
+      ).toThrow(
+        'toolExecution.maxFunctionToolConcurrency must be an integer greater than or equal to 1.',
+      );
+    });
+
+    it('returns missing function tool errors to the model when opted in', async () => {
+      class RecordingModel extends FakeModel {
+        readonly requests: ModelRequest[] = [];
+
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          this.requests.push(request);
+          return super.getResponse(request);
+        }
+      }
+
+      const model = new RecordingModel([
+        {
+          output: [
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              name: 'missing_tool',
+              callId: 'call_missing',
+              arguments: '{}',
+            },
+          ],
+          usage: new Usage(),
+        },
+        {
+          output: [fakeModelMessage('recovered')],
+          usage: new Usage(),
+        },
+      ]);
+      const agent = new Agent({
+        name: 'MissingToolAgent',
+        model,
+        modelSettings: { toolChoice: 'required' },
+        toolUseBehavior: 'run_llm_again',
+      });
+
+      const result = await run(agent, 'start', {
+        toolNotFoundBehavior: 'return_error_to_model',
+      });
+
+      expect(result.finalOutput).toBe('recovered');
+      expect(model.requests).toHaveLength(2);
+      expect(model.requests[0].modelSettings.toolChoice).toBe('required');
+      expect(model.requests[1].modelSettings.toolChoice).toBeUndefined();
+      const secondInput = model.requests[1].input as AgentInputItem[];
+      expect(secondInput).toContainEqual({
+        type: 'function_call_result',
+        name: 'missing_tool',
+        callId: 'call_missing',
+        status: 'completed',
+        output: {
+          type: 'text',
+          text: "Tool 'missing_tool' not found.",
+        },
+      });
+    });
+
+    it('uses toolErrorFormatter for missing function tool errors', async () => {
+      class RecordingModel extends FakeModel {
+        readonly requests: ModelRequest[] = [];
+
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          this.requests.push(request);
+          return super.getResponse(request);
+        }
+      }
+
+      const model = new RecordingModel([
+        {
+          output: [
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              name: 'missing_tool',
+              callId: 'call_missing',
+              arguments: '{}',
+            },
+          ],
+          usage: new Usage(),
+        },
+        {
+          output: [fakeModelMessage('formatter recovered')],
+          usage: new Usage(),
+        },
+      ]);
+      const seenKinds: string[] = [];
+      const agent = new Agent({
+        name: 'MissingToolFormatterAgent',
+        model,
+        toolUseBehavior: 'run_llm_again',
+      });
+
+      const result = await run(agent, 'start', {
+        toolNotFoundBehavior: 'return_error_to_model',
+        toolErrorFormatter: (args) => {
+          seenKinds.push(args.kind);
+          if (args.kind !== 'tool_not_found') {
+            return undefined;
+          }
+          return `${args.toolName} unavailable for ${args.callId}`;
+        },
+      });
+
+      expect(result.finalOutput).toBe('formatter recovered');
+      expect(seenKinds).toEqual(['tool_not_found']);
+      const secondInput = model.requests[1].input as AgentInputItem[];
+      expect(secondInput).toContainEqual({
+        type: 'function_call_result',
+        name: 'missing_tool',
+        callId: 'call_missing',
+        status: 'completed',
+        output: {
+          type: 'text',
+          text: 'missing_tool unavailable for call_missing',
+        },
+      });
+    });
+
     it('does not persist nested agent-tool metadata when resuming a RunState', async () => {
       const agent = new Agent({
         name: 'ReusedNestedStateAgent',
@@ -1493,6 +1657,42 @@ describe('Runner.run', () => {
       );
     });
 
+    it('keeps the current agent span attached when an input guardrail trips', async () => {
+      setTracingDisabled(false);
+      const fakeModel = new FakeModel([
+        {
+          output: [fakeModelMessage('plain text')],
+          usage: new Usage(),
+        },
+      ]);
+      const agent = new Agent({
+        name: 'GuardrailSpan',
+        model: fakeModel,
+        inputGuardrails: [
+          {
+            name: 'tripwire',
+            runInParallel: false,
+            execute: async () => ({
+              tripwireTriggered: true,
+              outputInfo: { reason: 'blocked' },
+            }),
+          },
+        ],
+      });
+
+      try {
+        await run(agent, 'test');
+        throw new Error('Expected the input guardrail to trip.');
+      } catch (error) {
+        expect(error).toBeInstanceOf(InputGuardrailTripwireTriggered);
+        const tripwireError = error as InputGuardrailTripwireTriggered;
+        expect(tripwireError.state?._currentAgentSpan).toBeTruthy();
+        expect(tripwireError.state?._currentAgentSpan?.error).not.toBeNull();
+      } finally {
+        setTracingDisabled(true);
+      }
+    });
+
     it('output guardrail success', async () => {
       const guardrailFn = vi.fn(async () => ({
         tripwireTriggered: false,
@@ -1883,6 +2083,80 @@ describe('Runner.run', () => {
       );
     });
 
+    it('does not enforce maxTurns when maxTurns is null', async () => {
+      const toolResponses = Array.from({ length: 12 }, (_, index) => ({
+        output: [
+          {
+            ...TEST_MODEL_FUNCTION_CALL,
+            id: `fc_${index}`,
+            callId: `call_${index}`,
+            arguments: JSON.stringify({ test: 'input' }),
+          },
+        ],
+        usage: new Usage(),
+      }));
+      const agent = new Agent({
+        name: 'NoMaxTurns',
+        model: new FakeModel([
+          ...toolResponses,
+          { output: [fakeModelMessage('done')], usage: new Usage() },
+        ]),
+        tools: [TEST_TOOL],
+      });
+
+      const result = await run(agent, 'x', { maxTurns: null });
+
+      expect(result.finalOutput).toBe('done');
+      expect(result.state._maxTurns).toBeNull();
+      expect(result.state._currentTurn).toBe(13);
+    });
+
+    it('allows resumed states to disable maxTurns with null', async () => {
+      const responses = [
+        {
+          output: [
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              id: 'fc_1',
+              callId: 'call_1',
+              arguments: JSON.stringify({ test: 'first' }),
+            },
+          ],
+          usage: new Usage(),
+        },
+        {
+          output: [
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              id: 'fc_2',
+              callId: 'call_2',
+              arguments: JSON.stringify({ test: 'second' }),
+            },
+          ],
+          usage: new Usage(),
+        },
+        { output: [fakeModelMessage('done')], usage: new Usage() },
+      ];
+      const agent = new Agent({
+        name: 'NoMaxTurnsResume',
+        model: new FakeModel(responses),
+        tools: [TEST_TOOL],
+      });
+      const error = await run(agent, 'x', { maxTurns: 1 }).catch((err) => err);
+      expect(error).toBeInstanceOf(MaxTurnsExceededError);
+      const state = (error as MaxTurnsExceededError).state as RunState<
+        unknown,
+        typeof agent
+      >;
+
+      const result = await run(agent, state, {
+        maxTurns: null,
+      });
+
+      expect(result.finalOutput).toBe('done');
+      expect(result.state._maxTurns).toBeNull();
+    });
+
     it('max turn handler returns final output', async () => {
       const agent = new Agent({
         name: 'MaxSummary',
@@ -1920,6 +2194,147 @@ describe('Runner.run', () => {
       });
       expect(result.finalOutput).toBe('summary');
       expect(result.newItems).toHaveLength(0);
+    });
+
+    it('throws model refusal errors instead of retrying refusal-only messages', async () => {
+      const agent = new Agent({
+        name: 'Refusal',
+        model: new FakeModel([
+          {
+            output: [fakeModelRefusal('I cannot help with that request.')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      await expect(run(agent, 'x', { maxTurns: 3 })).rejects.toMatchObject({
+        name: 'ModelRefusalError',
+        refusal: 'I cannot help with that request.',
+      });
+    });
+
+    it('throws model refusal errors before structured output parsing', async () => {
+      const agent = new Agent({
+        name: 'StructuredRefusalError',
+        outputType: z.object({ summary: z.string() }),
+        model: new FakeModel([
+          {
+            output: [fakeModelRefusal('I cannot help with that request.')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      await expect(run(agent, 'x')).rejects.toBeInstanceOf(ModelRefusalError);
+    });
+
+    it('uses assistant text when a message also contains refusal content', async () => {
+      const agent = new Agent({
+        name: 'MixedTextRefusal',
+        model: new FakeModel([
+          {
+            output: [
+              fakeModelMessageWithRefusal(
+                'valid answer',
+                'I cannot help with a different part.',
+              ),
+            ],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      const result = await run(agent, 'x');
+      expect(result.finalOutput).toBe('valid answer');
+    });
+
+    it('parses structured assistant text when refusal content is also present', async () => {
+      const agent = new Agent({
+        name: 'MixedStructuredRefusal',
+        outputType: z.object({ summary: z.string() }),
+        model: new FakeModel([
+          {
+            output: [
+              fakeModelMessageWithRefusal(
+                '{"summary":"valid answer"}',
+                'I cannot help with a different part.',
+              ),
+            ],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      const result = await run(agent, 'x');
+      expect(result.finalOutput).toEqual({ summary: 'valid answer' });
+    });
+
+    it('model refusal handler returns structured final output', async () => {
+      const agent = new Agent({
+        name: 'StructuredRefusal',
+        outputType: z.object({ summary: z.string() }),
+        model: new FakeModel([
+          {
+            output: [fakeModelRefusal('I cannot help with that request.')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      const result = await run(agent, 'x', {
+        errorHandlers: {
+          modelRefusal: ({ error, runData }) => {
+            expect(error).toBeInstanceOf(ModelRefusalError);
+            expect((error as ModelRefusalError).refusal).toBe(
+              'I cannot help with that request.',
+            );
+            expect(runData.rawResponses).toHaveLength(1);
+            return { finalOutput: { summary: 'safe fallback' } };
+          },
+        },
+      });
+      expect(result.finalOutput).toEqual({ summary: 'safe fallback' });
+      expect(extractAllTextOutput(result.newItems)).toBe(
+        '{"summary":"safe fallback"}',
+      );
+    });
+
+    it('model refusal handler can skip history updates', async () => {
+      const agent = new Agent({
+        name: 'RefusalNoHistory',
+        model: new FakeModel([
+          {
+            output: [fakeModelRefusal('I cannot help with that request.')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      const result = await run(agent, 'x', {
+        errorHandlers: {
+          modelRefusal: () => ({
+            finalOutput: 'safe fallback',
+            includeInHistory: false,
+          }),
+        },
+      });
+      expect(result.finalOutput).toBe('safe fallback');
+      expect(extractAllTextOutput(result.newItems)).toBe('');
+    });
+
+    it('default error handler can handle model refusals', async () => {
+      const agent = new Agent({
+        name: 'DefaultRefusal',
+        model: new FakeModel([
+          {
+            output: [fakeModelRefusal('I cannot help with that request.')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      const result = await run(agent, 'x', {
+        errorHandlers: {
+          default: ({ error }) => {
+            expect(error).toBeInstanceOf(ModelRefusalError);
+            return { finalOutput: 'safe fallback' };
+          },
+        },
+      });
+      expect(result.finalOutput).toBe('safe fallback');
     });
 
     it('enforces maxTurns across multiple model calls', async () => {
@@ -2511,6 +2926,41 @@ describe('Runner.run', () => {
           ? (savedAssistant.content[0] as { providerData?: unknown })
           : undefined;
         expect(firstPart?.providerData).toEqual({ annotations: [] });
+      });
+
+      it('applies runner-level reasoningItemIdPolicy to replayed session history', async () => {
+        class ReasoningPreservingSession extends MemorySession {
+          preserveReasoningItemIdsForPersistence(): boolean {
+            return true;
+          }
+        }
+
+        const model = new RecordingModel([
+          {
+            ...TEST_MODEL_RESPONSE_BASIC,
+            output: [fakeModelMessage('response')],
+          },
+        ]);
+        const agent = new Agent({ name: 'SessionReasoningAgent', model });
+        const session = new ReasoningPreservingSession([
+          {
+            id: 'rs_persisted',
+            type: 'reasoning',
+            content: [{ type: 'input_text', text: 'stored reasoning' }],
+          },
+        ]);
+        const runner = new Runner({ reasoningItemIdPolicy: 'omit' });
+
+        await runner.run(agent, 'new input', { session });
+
+        expect(model.lastRequest).toBeDefined();
+        const reasoningItem = getRequestInputItems(model.lastRequest!).find(
+          (item): item is protocol.ReasoningItem => item.type === 'reasoning',
+        );
+        expect(reasoningItem).toEqual({
+          type: 'reasoning',
+          content: [{ type: 'input_text', text: 'stored reasoning' }],
+        });
       });
 
       it('allows list inputs with session history and no session input callback', async () => {
@@ -4406,7 +4856,7 @@ describe('Runner.run', () => {
       };
     }
 
-    it('strips GPT-5-only settings when the runner model is not a GPT-5 string', async () => {
+    it('strips GPT-5-only settings when the RunConfig model is not a GPT-5 string', async () => {
       const modelResponse: ModelResponse = {
         output: [fakeModelMessage('Hello non GPT-5')],
         usage: new Usage(),
@@ -4468,6 +4918,53 @@ describe('Runner.run', () => {
       expect(requestSettings.reasoning?.effort).toBe('high');
       expect(requestSettings.reasoning?.summary).toBe('detailed');
       expect(requestSettings.text?.verbosity).toBe('medium');
+    });
+
+    it('uses model-specific defaults when the RunConfig model is explicit', async () => {
+      const modelResponse: ModelResponse = {
+        output: [fakeModelMessage('Hello explicit runner GPT-5')],
+        usage: new Usage(),
+      };
+      const inspectableModel = new InspectableModel(modelResponse);
+      const runner = new Runner({
+        model: 'gpt-5',
+        modelProvider: new InspectableModelProvider(inspectableModel),
+      });
+      const agent = new Agent({ name: 'RunnerModelAgent' });
+
+      const result = await runner.run(agent, 'hello');
+
+      expect(result.finalOutput).toBe('Hello explicit runner GPT-5');
+      expect(inspectableModel.lastRequest?.modelSettings).toMatchObject({
+        reasoning: { effort: 'low' },
+        text: { verbosity: 'low' },
+      });
+    });
+
+    it('lets RunConfig modelSettings override implicit model defaults', async () => {
+      const modelResponse: ModelResponse = {
+        output: [fakeModelMessage('Hello runner override')],
+        usage: new Usage(),
+      };
+      const inspectableModel = new InspectableModel(modelResponse);
+      const runner = new Runner({
+        model: 'gpt-5',
+        modelProvider: new InspectableModelProvider(inspectableModel),
+        modelSettings: {
+          reasoning: { effort: 'medium' },
+          temperature: 0.7,
+        },
+      });
+      const agent = new Agent({ name: 'RunnerModelSettingsAgent' });
+
+      const result = await runner.run(agent, 'hello');
+
+      expect(result.finalOutput).toBe('Hello runner override');
+      expect(inspectableModel.lastRequest?.modelSettings).toMatchObject({
+        reasoning: { effort: 'medium' },
+        text: { verbosity: 'low' },
+        temperature: 0.7,
+      });
     });
   });
 
@@ -5484,6 +5981,72 @@ describe('Runner.run', () => {
         type: 'function_call_result',
         callId: 'call-approved',
       });
+    });
+
+    it('does not re-emit missing function tool results when resuming an interrupted turn', async () => {
+      const approvalTool = tool({
+        name: 'test',
+        description: 'tool that requires approval',
+        parameters: z.object({ test: z.string() }),
+        needsApproval: async () => true,
+        execute: async ({ test }) => `result:${test}`,
+      });
+      const missingToolCall: protocol.FunctionCallItem = {
+        ...buildToolCall('call-missing', 'missing'),
+        name: 'missing_tool',
+      };
+
+      const model = new TrackingModel([
+        buildResponse(
+          [buildToolCall('call-approved', 'foo'), missingToolCall],
+          'resp-mixed-missing-1',
+        ),
+        buildResponse([fakeModelMessage('done')], 'resp-mixed-missing-2'),
+      ]);
+
+      const agent = new Agent({
+        name: 'MixedMissingToolResumeAgent',
+        model,
+        tools: [approvalTool],
+      });
+
+      const runner = new Runner();
+      const firstResult = await runner.run(agent, 'user_message', {
+        conversationId: 'conv-mixed-missing',
+        toolNotFoundBehavior: 'return_error_to_model',
+      });
+
+      expect(firstResult.interruptions).toHaveLength(1);
+      const preResumeMissingResults = firstResult.state._generatedItems.filter(
+        (item) =>
+          item.rawItem.type === 'function_call_result' &&
+          item.rawItem.callId === 'call-missing',
+      );
+      expect(preResumeMissingResults).toHaveLength(1);
+
+      firstResult.state.approve(firstResult.interruptions[0]);
+      const secondResult = await runner.run(agent, firstResult.state, {
+        conversationId: 'conv-mixed-missing',
+        toolNotFoundBehavior: 'return_error_to_model',
+      });
+
+      expect(secondResult.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(2);
+
+      const allMissingResults = secondResult.state._generatedItems.filter(
+        (item) =>
+          item.rawItem.type === 'function_call_result' &&
+          item.rawItem.callId === 'call-missing',
+      );
+      expect(allMissingResults).toHaveLength(1);
+
+      const secondInput = model.requests[1].input as AgentInputItem[];
+      const missingResultsSentOnResume = secondInput.filter(
+        (item) =>
+          item.type === 'function_call_result' &&
+          item.callId === 'call-missing',
+      );
+      expect(missingResultsSentOnResume).toHaveLength(1);
     });
 
     it('does not resend prior items when resuming with previousResponseId', async () => {

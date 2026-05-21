@@ -1,9 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
 import { Agent } from '../../src/agent';
-import { RunToolCallItem, RunToolCallOutputItem } from '../../src/items';
+import {
+  RunMessageOutputItem,
+  RunReasoningItem,
+  RunToolCallItem,
+  RunToolCallOutputItem,
+} from '../../src/items';
 import {
   dropOrphanToolCalls,
+  extractOutputItemsFromRunItems,
   prepareModelInputItems,
 } from '../../src/runner/items';
 import type { AgentInputItem } from '../../src/types';
@@ -122,6 +128,127 @@ describe('prepareModelInputItems', () => {
       shellOutput.rawItem,
     ]);
   });
+
+  it('drops reasoning items tied to orphan generated tool calls', () => {
+    const agent = new Agent({ name: 'HelperAgent' });
+    const orphanReasoningA = new RunReasoningItem(
+      {
+        type: 'reasoning',
+        id: 'rs_orphan_a',
+        content: [],
+      },
+      agent,
+    );
+    const orphanReasoningB = new RunReasoningItem(
+      {
+        type: 'reasoning',
+        id: 'rs_orphan_b',
+        content: [],
+      },
+      agent,
+    );
+    const orphanCall = new RunToolCallItem(
+      {
+        type: 'function_call',
+        callId: 'orphan_call',
+        name: 'orphan',
+        arguments: '{}',
+      } satisfies protocol.FunctionCallItem,
+      agent,
+    );
+    const pairedReasoning = new RunReasoningItem(
+      {
+        type: 'reasoning',
+        id: 'rs_paired',
+        content: [],
+      },
+      agent,
+    );
+    const pairedCall = new RunToolCallItem(
+      {
+        type: 'function_call',
+        callId: 'paired_call',
+        name: 'paired',
+        arguments: '{}',
+      } satisfies protocol.FunctionCallItem,
+      agent,
+    );
+    const pairedOutput = new RunToolCallOutputItem(
+      {
+        type: 'function_call_result',
+        name: 'paired',
+        callId: 'paired_call',
+        status: 'completed',
+        output: 'ok',
+      } satisfies protocol.FunctionCallResultItem,
+      agent,
+      'ok',
+    );
+
+    const prepared = prepareModelInputItems('hello', [
+      orphanReasoningA,
+      orphanReasoningB,
+      orphanCall,
+      pairedReasoning,
+      pairedCall,
+      pairedOutput,
+    ]);
+
+    expect(prepared).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: 'hello',
+      },
+      pairedReasoning.rawItem,
+      pairedCall.rawItem,
+      pairedOutput.rawItem,
+    ]);
+  });
+
+  it('keeps generated lone reasoning when no tool calls are dropped', () => {
+    const agent = new Agent({ name: 'HelperAgent' });
+    const reasoning = new RunReasoningItem(
+      {
+        type: 'reasoning',
+        id: 'rs_lone',
+        content: [],
+      },
+      agent,
+    );
+
+    const prepared = prepareModelInputItems('hello', [reasoning]);
+
+    expect(prepared).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: 'hello',
+      },
+      reasoning.rawItem,
+    ]);
+  });
+});
+
+describe('extractOutputItemsFromRunItems', () => {
+  it('omits null statuses from model input history', () => {
+    const agent = new Agent({ name: 'HelperAgent' });
+    const message = {
+      type: 'message',
+      role: 'assistant',
+      content: [],
+      status: null,
+    } as unknown as protocol.AssistantMessageItem;
+    const runItem = new RunMessageOutputItem(message, agent);
+
+    expect(extractOutputItemsFromRunItems([runItem])).toEqual([
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [],
+      },
+    ]);
+  });
 });
 
 describe('dropOrphanToolCalls', () => {
@@ -159,5 +286,25 @@ describe('dropOrphanToolCalls', () => {
     });
 
     expect(prepared).toEqual([pendingShell]);
+  });
+
+  it('does not drop reasoning outside the explicit pruning indexes', () => {
+    const callerReasoning: AgentInputItem = {
+      type: 'reasoning',
+      id: 'rs_caller',
+      content: [],
+    };
+    const historyShell: AgentInputItem = {
+      type: 'shell_call',
+      callId: 'history_shell',
+      status: 'completed',
+      action: { commands: ['echo old'] },
+    };
+
+    const prepared = dropOrphanToolCalls([callerReasoning, historyShell], {
+      pruningIndexes: new Set([1]),
+    });
+
+    expect(prepared).toEqual([callerReasoning]);
   });
 });

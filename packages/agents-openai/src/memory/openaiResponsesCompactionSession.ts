@@ -204,10 +204,11 @@ export class OpenAIResponsesCompactionSession
     const compacted = await this.client.responses.compact(compactRequest);
 
     const outputItems = normalizeCompactionOutputItems(compacted.output ?? []);
-    await this.underlyingSession.clearSession();
-    if (outputItems.length > 0) {
-      await this.underlyingSession.addItems(outputItems);
-    }
+    const previousItems = await this.getAllUnderlyingSessionItems();
+    await this.replaceUnderlyingSessionItems({
+      outputItems,
+      previousItems,
+    });
     this.compactionCandidateItems = selectCompactionCandidateItems(outputItems);
     this.sessionItems = outputItems;
 
@@ -285,6 +286,97 @@ export class OpenAIResponsesCompactionSession
     await this.underlyingSession.clearSession();
     this.compactionCandidateItems = [];
     this.sessionItems = [];
+  }
+
+  private async getAllUnderlyingSessionItems(): Promise<AgentInputItem[]> {
+    return this.underlyingSession.getItems();
+  }
+
+  private async replaceUnderlyingSessionItems({
+    outputItems,
+    previousItems,
+  }: {
+    outputItems: AgentInputItem[];
+    previousItems: AgentInputItem[];
+  }): Promise<void> {
+    try {
+      await this.underlyingSession.clearSession();
+    } catch (error) {
+      await this.restoreUnderlyingSessionItemsAfterFailedClear(
+        previousItems,
+        error,
+      );
+      throw error;
+    }
+
+    try {
+      if (outputItems.length > 0) {
+        await this.underlyingSession.addItems(outputItems);
+      }
+    } catch (error) {
+      await this.restoreUnderlyingSessionItems(previousItems, error);
+      throw error;
+    }
+  }
+
+  private async restoreUnderlyingSessionItemsAfterFailedClear(
+    previousItems: AgentInputItem[],
+    error: unknown,
+  ): Promise<void> {
+    let currentItems: AgentInputItem[];
+    try {
+      currentItems = await this.getAllUnderlyingSessionItems();
+    } catch (inspectionError) {
+      logger.warn(
+        'Failed to inspect session history after compaction replacement clear failed.',
+        inspectionError,
+      );
+      return;
+    }
+
+    if (areAgentItemsEqual(currentItems, previousItems)) {
+      return;
+    }
+
+    await this.restoreUnderlyingSessionItems(previousItems, error, {
+      popExistingItemCount: currentItems.length,
+    });
+  }
+
+  private async restoreUnderlyingSessionItems(
+    previousItems: AgentInputItem[],
+    error: unknown,
+    options: {
+      clearExistingItems?: boolean;
+      popExistingItemCount?: number;
+    } = {},
+  ): Promise<void> {
+    try {
+      if (options.popExistingItemCount !== undefined) {
+        for (let i = 0; i < options.popExistingItemCount; i += 1) {
+          const popped = await this.underlyingSession.popItem();
+          if (!popped) {
+            break;
+          }
+        }
+      } else if (options.clearExistingItems !== false) {
+        await this.underlyingSession.clearSession();
+      }
+      if (previousItems.length > 0) {
+        await this.underlyingSession.addItems(previousItems);
+      }
+    } catch (restoreError) {
+      logger.warn(
+        'Failed to restore session history after compaction replacement failed.',
+        restoreError,
+      );
+      return;
+    }
+
+    logger.warn(
+      'Restored previous session history after compaction replacement failed.',
+      error,
+    );
   }
 
   private async ensureCompactionCandidates(): Promise<{
@@ -524,4 +616,11 @@ function isOpenAIConversationsSessionDelegate(
       OPENAI_SESSION_API
     ] === 'conversations'
   );
+}
+
+function areAgentItemsEqual(
+  left: AgentInputItem[],
+  right: AgentInputItem[],
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }

@@ -34,6 +34,7 @@ Use this page as the hub for agent definition. Jump out to the adjacent guide th
 | --- | --- |
 | Choose a model or configure stored prompts | [Models](/openai-agents-js/guides/models) |
 | Add capabilities to the agent | [Tools](/openai-agents-js/guides/tools) |
+| Give the agent an isolated filesystem workspace | [Sandbox agents](/openai-agents-js/guides/sandbox-agents/concepts) |
 | Decide between managers and handoffs | [Agent orchestration](/openai-agents-js/guides/multi-agent) |
 | Configure handoff behavior | [Handoffs](/openai-agents-js/guides/handoffs) |
 | Run turns, stream events, or manage state | [Running agents](/openai-agents-js/guides/running-agents) |
@@ -60,6 +61,7 @@ The `Agent` constructor takes a single configuration object. The most commonlyâ€
 | `modelSettings` | no | Tuning parameters (temperature, top_p, etc.). See [Models](/openai-agents-js/guides/models#modelsettings). If the properties you need arenâ€™t at the top level, you can include them under `providerData`. |
 | `tools` | no | Array of [`Tool`](/openai-agents-js/openai/agents/type-aliases/tool/) instances the model can call. See [Tools](/openai-agents-js/guides/tools). |
 | `mcpServers` | no | MCP-backed tools for the agent. See the [MCP guide](/openai-agents-js/guides/mcp). |
+| `mcpConfig` | no | Options for local MCP tools, such as strict schemas, error handling, and server-prefixed tool names. See [Agent-level MCP configuration](/openai-agents-js/guides/mcp#agent-level-mcp-configuration). |
 | `inputGuardrails` | no | Guardrails applied to the first user input for this agent chain. See [Guardrails](/openai-agents-js/guides/guardrails). |
 | `outputGuardrails` | no | Guardrails applied to the final output for this agent. See [Guardrails](/openai-agents-js/guides/guardrails). |
 | `outputType` | no | Return structured output instead of plain text. See [Output types](#output-types) and [Results](/openai-agents-js/guides/results#final-output). |

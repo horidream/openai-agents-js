@@ -9,6 +9,7 @@ import {
 } from './defaults';
 import {
   OpenAIResponsesModel,
+  type OpenAIResponsesWebSocketOptions,
   OpenAIResponsesWSModel,
 } from './openaiResponsesModel';
 import { OpenAIChatCompletionsModel } from './openaiChatCompletionsModel';
@@ -25,6 +26,13 @@ export type OpenAIProviderOptions = {
   project?: string;
   useResponses?: boolean;
   useResponsesWebSocket?: boolean;
+  /**
+   * When false, Chat Completions models warn and ignore Responses-only
+   * features such as previousResponseId, conversationId, and prompt. When true,
+   * they raise UserError instead.
+   */
+  strictFeatureValidation?: boolean;
+  responsesWebSocketOptions?: OpenAIResponsesWebSocketOptions;
   openAIClient?: OpenAI;
 };
 
@@ -134,10 +142,13 @@ export class OpenAIProvider implements ModelProvider {
             websocketBaseURL:
               this.#getWebSocketBaseURLForResponsesModel(client),
             reuseConnection: shouldCacheModelWrapper,
+            websocketOptions: this.#options.responsesWebSocketOptions,
           })
         : new OpenAIResponsesModel(client, model);
     } else {
-      resolvedModel = new OpenAIChatCompletionsModel(this.#getClient(), model);
+      resolvedModel = new OpenAIChatCompletionsModel(this.#getClient(), model, {
+        strictFeatureValidation: this.#options.strictFeatureValidation,
+      });
     }
 
     if (shouldCacheModelWrapper) {

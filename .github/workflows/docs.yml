@@ -23,21 +23,22 @@ jobs:
         with:
           persist-credentials: false
       - name: Setup Node.js
-        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 24
       - name: Install pnpm
-        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
+        uses: pnpm/action-setup@91ab88e2619ed1f46221f0ba42d1492c02baf788
         with:
           run_install: true
       - name: Run build
         run: pnpm build:ci
-      - name: Install, build, and upload your site
-        uses: withastro/action@44706356b4eb735f8b9035699eb4796241a040c4
+      - name: Build docs
+        run: pnpm docs:build
+      - name: Upload docs artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
         with:
-          path: docs
-          # with:
-          # path: . # The root location of your Astro project inside the repository. (optional)
-          # node-version: 20 # The specific version of Node that should be used to build your site. Defaults to 20. (optional)
-          package-manager: pnpm@10.33.2 # The Node package manager that should be used to install dependencies and build your site. Automatically detected based on your lockfile. (optional)
+          path: docs/dist/
+          include-hidden-files: true
 
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

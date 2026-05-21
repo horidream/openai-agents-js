@@ -1,5 +1,92 @@
 # @openai/agents-core
 
+## 0.11.4
+
+### Patch Changes
+
+- 087ce4b: fix: preserve Conversations reasoning identities without replaying omitted IDs
+- 2c993cf: fix: preserve local approval rejection reasons
+- f36e7b2: fix: abort active tracing exports on shutdown timeout
+
+## 0.11.3
+
+### Patch Changes
+
+- 2d39801: fix: make tracing shutdown best-effort on process exit
+
+## 0.11.2
+
+### Patch Changes
+
+- 3f855d4: fix: allow callback-only handoff hooks without input schemas
+- 077876e: fix: keep output guardrail tripwires behind sibling completion
+- 9e6d1e3: fix: drop reasoning items orphaned by dropped tool calls
+- 2b5c8d2: fix: exclude computer instances from provider detection
+- 398b21f: test: isolate and speed up slow sandbox tests
+- 8e59259: fix: add configurable sandbox archive extraction limits
+- c5731d1: fix: guard no-op tracing span ids
+- 81508e8: fix: preserve GitRepo root subpath aliases while validating unsafe subpaths
+- 8d2f707: fix: preserve latest response id when resuming server-managed runs
+- 6883833: fix: keep trace batch processing alive after exporter errors
+- b0d2a68: fix: validate sandbox GitRepo subpaths before materialization
+
+## 0.11.1
+
+### Patch Changes
+
+- e4a7557: fix: align Blaxel sandbox errors, timeouts, and pause-on-exit behavior
+- 1a61a5c: fix: preserve sandbox environment resolvers across manifest merges
+
+## 0.11.0
+
+### Minor Changes
+
+- eb81397: fix: require extra path grants for local sandbox sources outside the base directory
+- 295229c: fix: upgrade realtime defaults and model support for gpt-realtime-2
+
+## 0.10.1
+
+### Patch Changes
+
+- 0cd060f: fix: validate hosted MCP approval policies
+
+## 0.10.0
+
+### Minor Changes
+
+- 2e7e48a: feat: switch the default model to gpt-5.4-mini
+
+### Patch Changes
+
+- 3546add: feat: allow maxTurns null to disable turn limits
+- 0e7cbf0: feat: add function tool execution concurrency config
+- d31526b: feat: accept manifest init shorthands in sandbox configuration
+- 0630108: feat: align local MCP config with the Python SDK
+
+## 0.9.1
+
+### Patch Changes
+
+- 06f425a: fix: avoid replaying assistant conversation item IDs from OpenAI Conversations history
+- dde1037: fix: preserve duplicate-name agent identity in RunState serialization
+- a081190: fix: #1190 reconcile streamed function calls when server-managed runs abort
+
+## 0.9.0
+
+### Minor Changes
+
+- 00b4032: fix: align sandbox mounts with Python and protect rclone credentials
+- 2e1d626: feat: add sandbox agents core runtime and extension provider package groundwork
+- 6e50eca: fix: narrow sandbox public entrypoint
+
+### Patch Changes
+
+- 16c26e7: fix: keep public sandbox agent identity in model filters
+- 2d2501a: fix: support sandbox filesystem runAs for compatible providers
+- a34f506: feat: add model settings support for context management
+- 30681be: fix: surface model refusals during run resolution
+- 4a879bb: feat: add tool item convenience accessors
+
 ## 0.8.5
 
 ## 0.8.4

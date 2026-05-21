@@ -4,8 +4,10 @@ import {
   buildAgentMap,
   deserializeModelResponse,
   deserializeItem,
+  rehydrateProcessedResponseTools,
   CURRENT_SCHEMA_VERSION,
 } from '../src/runState';
+import { processedResponseRequiresExecutionToolRehydration } from '../src/sandbox/runtime/toolRehydration';
 import { RunContext } from '../src/runContext';
 import { Agent } from '../src/agent';
 import { Usage } from '../src/usage';
@@ -15,10 +17,12 @@ import {
   RunReasoningItem,
   RunToolCallItem,
   RunToolCallOutputItem,
+  RunHandoffOutputItem,
   RunToolSearchCallItem,
   RunToolSearchOutputItem,
 } from '../src/items';
 import {
+  attachClientToolSearchExecutor,
   applyPatchTool,
   computerTool,
   shellTool,
@@ -36,7 +40,27 @@ import { RunResult } from '../src/result';
 import { createAgentSpan } from '../src/tracing';
 import { getGlobalTraceProvider } from '../src/tracing/provider';
 import type { MCPServer, MCPTool } from '../src/mcp';
+import { SANDBOX_SESSION_STATE_VERSION, SandboxAgent } from '../src/sandbox';
 import { z } from 'zod';
+
+function sandboxSessionStateEnvelope(
+  providerState: Record<string, unknown>,
+  overrides: Record<string, unknown> = {},
+): any {
+  return {
+    version: SANDBOX_SESSION_STATE_VERSION,
+    backendId: 'unix-local',
+    manifest: {
+      version: 1,
+      root: '/workspace',
+      entries: {},
+      environment: {},
+    },
+    workspaceReady: true,
+    providerState,
+    ...overrides,
+  };
+}
 
 describe('RunState', () => {
   it('initializes with default values', () => {
@@ -170,6 +194,70 @@ describe('RunState', () => {
 
     const restored = await RunState.fromString(agent, state.toString());
     expect(restored._context.toolInput).toEqual(context.toolInput);
+  });
+
+  it('serializes sandbox state with the current schema version', async () => {
+    const context = new RunContext({ foo: 'bar' });
+    const agent = new Agent({ name: 'SandboxStateAgent' });
+    const state = new RunState(context, 'input', agent, 1);
+    state._sandbox = {
+      backendId: 'unix-local',
+      currentAgentKey: 'sandbox-state-agent',
+      currentAgentName: 'SandboxStateAgent',
+      sessionState: sandboxSessionStateEnvelope(
+        { workspaceId: 'ws_123' },
+        {
+          snapshotFingerprint: 'fp_123',
+          snapshotFingerprintVersion: 'v1',
+        },
+      ),
+      sessionsByAgent: {
+        SandboxStateAgent: {
+          backendId: 'unix-local',
+          currentAgentKey: 'sandbox-state-agent',
+          currentAgentName: 'SandboxStateAgent',
+          sessionState: sandboxSessionStateEnvelope(
+            { workspaceId: 'ws_123' },
+            {
+              snapshotFingerprint: 'fp_123',
+              snapshotFingerprintVersion: 'v1',
+            },
+          ),
+          preservedOwnedSession: true,
+          reuseLiveSession: false,
+        },
+      },
+    };
+
+    const serialized = state.toJSON();
+    expect(serialized.$schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(serialized.sandbox).toEqual(state._sandbox);
+
+    const restored = await RunState.fromString(
+      agent,
+      JSON.stringify(serialized),
+    );
+    expect(restored._sandbox).toEqual(state._sandbox);
+  });
+
+  it('keeps reading schema 1.8 payloads without sandbox state', async () => {
+    const context = new RunContext({ foo: 'bar' });
+    const agent = new Agent({ name: 'LegacySandboxStateAgent' });
+    const state = new RunState(context, 'input', agent, 1);
+    const serialized = state.toJSON();
+    const legacyPayload = {
+      ...serialized,
+      $schemaVersion: '1.8' as const,
+    };
+    delete (legacyPayload as { sandbox?: unknown }).sandbox;
+
+    const restored = await RunState.fromString(
+      agent,
+      JSON.stringify(legacyPayload),
+    );
+
+    expect(restored._sandbox).toBeUndefined();
+    expect(restored._currentAgent.name).toBe('LegacySandboxStateAgent');
   });
 
   it('does not serialize runtime-only agent-tool metadata', async () => {
@@ -464,30 +552,228 @@ describe('RunState', () => {
     expect(JSON.parse(str)).toEqual(json);
   });
 
-  it('toJSON throws when handoff agents have duplicate names', () => {
-    const childA = new Agent({ name: 'SharedSkill' });
-    const childB = new Agent({ name: 'SharedSkill' });
+  it('serializes null maxTurns', async () => {
+    const context = new RunContext();
+    const agent = new Agent({ name: 'NoMaxTurns' });
+    const state = new RunState(context, 'input1', agent, null);
+
+    const json = state.toJSON();
+    expect(json.maxTurns).toBeNull();
+
+    const restored = await RunState.fromString(agent, state.toString());
+    expect(restored._maxTurns).toBeNull();
+  });
+
+  it('serializes duplicate-name agents with stable identities', async () => {
+    const childA = new Agent({
+      name: 'SharedSkill',
+      instructions: 'alpha child',
+    });
+    const childB = new Agent({
+      name: 'SharedSkill',
+      instructions: 'bravo child',
+    });
     const agentA = new Agent({ name: 'AgentA', handoffs: [childA] });
     const agentB = new Agent({ name: 'AgentB', handoffs: [childB] });
     const root = new Agent({ name: 'Root', handoffs: [agentA, agentB] });
     const state = new RunState(new RunContext(), 'input', root, 2);
     state._currentAgent = childB;
 
-    expect(() => state.toJSON()).toThrow(
-      'Duplicate agent name "SharedSkill" detected. Use unique agent names when serializing RunState.',
+    const json = state.toJSON();
+
+    expect(json.currentAgent).toEqual({
+      name: 'SharedSkill',
+      identity: 'SharedSkill#2',
+    });
+
+    const restored = await RunState.fromString(root, JSON.stringify(json));
+    expect(restored._currentAgent).toBe(childB);
+
+    const restoredFromSchema110 = await RunState.fromString(
+      root,
+      JSON.stringify({ ...json, $schemaVersion: '1.10' as const }),
     );
+    expect(restoredFromSchema110._currentAgent).toBe(childB);
+
+    const restoredFromSchema111 = await RunState.fromString(
+      root,
+      JSON.stringify({ ...json, $schemaVersion: '1.11' as const }),
+    );
+    expect(restoredFromSchema111._currentAgent).toBe(childB);
   });
 
-  it('fromString throws when deserializing with duplicate agent names', async () => {
+  it('keeps literal identity suffixes from colliding with generated identities', () => {
+    const duplicateA = new Agent({
+      name: 'SharedSkill',
+      instructions: 'alpha child',
+    });
+    const literalSuffix = new Agent({ name: 'SharedSkill#2' });
+    const duplicateB = new Agent({
+      name: 'SharedSkill',
+      instructions: 'bravo child',
+    });
+    const root = new Agent({
+      name: 'Root',
+      handoffs: [duplicateA, literalSuffix, duplicateB],
+    });
+    const state = new RunState(new RunContext(), 'input', root, 2);
+    state._currentAgent = duplicateB;
+
+    const json = state.toJSON();
+
+    expect(json.currentAgent).toEqual({
+      name: 'SharedSkill',
+      identity: 'SharedSkill#3',
+    });
+  });
+
+  it('restores duplicate-name run item ownership by identity', async () => {
+    const childA = new Agent({
+      name: 'SharedSkill',
+      instructions: 'alpha child',
+    });
+    const childB = new Agent({
+      name: 'SharedSkill',
+      instructions: 'bravo child',
+    });
+    const root = new Agent({ name: 'Root', handoffs: [childA, childB] });
+    const approvalCall = {
+      type: 'function_call',
+      name: 'needs_approval',
+      callId: 'approval-call',
+      status: 'completed',
+      arguments: '{}',
+    } satisfies protocol.FunctionCallItem;
+    const state = new RunState(new RunContext(), 'input', root, 2);
+    state._currentAgent = childB;
+    state._generatedItems = [
+      new ToolApprovalItem(approvalCall, childB),
+      new RunHandoffOutputItem(
+        {
+          type: 'function_call_result',
+          name: 'transfer_to_sharedskill',
+          callId: 'handoff-call',
+          status: 'completed',
+          output: '{"assistant":"SharedSkill"}',
+        },
+        childA,
+        childB,
+      ),
+    ];
+    state._currentStep = {
+      type: 'next_step_interruption',
+      data: { interruptions: [state._generatedItems[0]] },
+    };
+    state._lastProcessedResponse = {
+      newItems: [state._generatedItems[0]],
+      toolsUsed: [],
+      handoffs: [],
+      functions: [],
+      computerActions: [],
+      shellActions: [],
+      applyPatchActions: [],
+      mcpApprovalRequests: [],
+      hasToolsOrApprovalsToRun: () => true,
+    };
+
+    const json = state.toJSON();
+    expect(json.generatedItems[0]).toMatchObject({
+      type: 'tool_approval_item',
+      agent: { name: 'SharedSkill', identity: 'SharedSkill#2' },
+    });
+    expect(json.generatedItems[1]).toMatchObject({
+      type: 'handoff_output_item',
+      sourceAgent: { name: 'SharedSkill' },
+      targetAgent: { name: 'SharedSkill', identity: 'SharedSkill#2' },
+    });
+
+    const restored = await RunState.fromString(root, JSON.stringify(json));
+    expect((restored._generatedItems[0] as ToolApprovalItem).agent).toBe(
+      childB,
+    );
+    expect(
+      (restored._generatedItems[1] as RunHandoffOutputItem).sourceAgent,
+    ).toBe(childA);
+    expect(
+      (restored._generatedItems[1] as RunHandoffOutputItem).targetAgent,
+    ).toBe(childB);
+    expect(restored.getInterruptions()[0]?.agent).toBe(childB);
+    expect(
+      (restored._lastProcessedResponse?.newItems[0] as ToolApprovalItem).agent,
+    ).toBe(childB);
+  });
+
+  it('preserves live duplicate-name processed response ownership during tool rehydration', async () => {
+    const childA = new Agent({
+      name: 'SharedSkill',
+      instructions: 'alpha child',
+    });
+    const childB = new Agent({
+      name: 'SharedSkill',
+      instructions: 'bravo child',
+    });
+    const root = new Agent({ name: 'Root', handoffs: [childA, childB] });
+    const approvalCall = {
+      type: 'function_call',
+      name: 'needs_approval',
+      callId: 'approval-call',
+      status: 'completed',
+      arguments: '{}',
+    } satisfies protocol.FunctionCallItem;
+    const state = new RunState(new RunContext(), 'input', root, 2);
+    state._currentAgent = childB;
+    state._lastProcessedResponse = {
+      newItems: [new ToolApprovalItem(approvalCall, childB)],
+      toolsUsed: [],
+      handoffs: [],
+      functions: [],
+      computerActions: [],
+      shellActions: [],
+      applyPatchActions: [],
+      mcpApprovalRequests: [],
+      hasToolsOrApprovalsToRun: () => true,
+    };
+
+    await rehydrateProcessedResponseTools(root, state, []);
+
+    expect(
+      (state._lastProcessedResponse?.newItems[0] as ToolApprovalItem).agent,
+    ).toBe(childB);
+  });
+
+  it('rejects duplicate-name states when a saved identity is missing', async () => {
+    const childA = new Agent({
+      name: 'SharedSkill',
+      instructions: 'alpha child',
+    });
+    const childB = new Agent({
+      name: 'SharedSkill',
+      instructions: 'bravo child',
+    });
+    const root = new Agent({ name: 'Root', handoffs: [childA, childB] });
+    const state = new RunState(new RunContext(), 'input', root, 2);
+    state._currentAgent = childB;
+    const json = state.toJSON();
+    json.currentAgent = { name: 'SharedSkill', identity: 'SharedSkill#99' };
+
+    await expect(() =>
+      RunState.fromString(root, JSON.stringify(json)),
+    ).rejects.toThrow('Agent identity SharedSkill#99 not found');
+  });
+
+  it('keeps legacy duplicate-name payloads rejected', async () => {
     const childA = new Agent({ name: 'SharedSkill' });
     const childB = new Agent({ name: 'SharedSkill' });
     const agentA = new Agent({ name: 'AgentA', handoffs: [childA] });
     const agentB = new Agent({ name: 'AgentB', handoffs: [childB] });
     const root = new Agent({ name: 'Root', handoffs: [agentA, agentB] });
     const state = new RunState(new RunContext(), 'input', childB, 2);
+    const json = state.toJSON();
+    json.$schemaVersion = '1.9';
+    json.currentAgent = { name: 'SharedSkill' };
 
     await expect(() =>
-      RunState.fromString(root, state.toString()),
+      RunState.fromString(root, JSON.stringify(json)),
     ).rejects.toThrow(
       'Duplicate agent name "SharedSkill" detected. Use unique agent names when serializing RunState.',
     );
@@ -644,7 +930,7 @@ describe('RunState', () => {
     );
   });
 
-  it('accepts schema version 1.8 payloads with tool_search items during deserialization', async () => {
+  it('accepts schema versions with tool_search support during deserialization', async () => {
     const context = new RunContext();
     const agent = new Agent({ name: 'Agent18' });
     const state = new RunState(context, 'input1', agent, 2);
@@ -677,10 +963,19 @@ describe('RunState', () => {
       ),
     );
 
-    const restored = await RunState.fromString(agent, state.toString());
+    for (const $schemaVersion of ['1.8', '1.10', '1.11'] as const) {
+      const jsonVersion = state.toJSON() as any;
+      jsonVersion.$schemaVersion = $schemaVersion;
+      const restored = await RunState.fromString(
+        agent,
+        JSON.stringify(jsonVersion),
+      );
 
-    expect(restored._generatedItems[0]).toBeInstanceOf(RunToolSearchCallItem);
-    expect(restored._generatedItems[1]).toBeInstanceOf(RunToolSearchOutputItem);
+      expect(restored._generatedItems[0]).toBeInstanceOf(RunToolSearchCallItem);
+      expect(restored._generatedItems[1]).toBeInstanceOf(
+        RunToolSearchOutputItem,
+      );
+    }
   });
 
   it('preserves raw tool_search call_id and execution fields through RunState serialization', async () => {
@@ -786,6 +1081,166 @@ describe('RunState', () => {
     expect(restored._generatedItems[0]).toBeInstanceOf(RunToolSearchCallItem);
     expect(restored._generatedItems[1]).toBeInstanceOf(RunToolSearchOutputItem);
     expect(restored.getToolSearchRuntimeTools(agent)).toEqual([]);
+  });
+
+  it('rehydrates duplicate-name client tool_search calls by agent identity', async () => {
+    const alphaLookup = tool({
+      name: 'lookup_alpha',
+      description: 'Look up alpha data.',
+      parameters: z.object({}).strict(),
+      execute: async () => 'alpha',
+    });
+    const betaLookup = tool({
+      name: 'lookup_beta',
+      description: 'Look up beta data.',
+      parameters: z.object({}).strict(),
+      execute: async () => 'beta',
+    });
+    let alphaExecuteCount = 0;
+    let betaExecuteCount = 0;
+    const alphaToolSearch = attachClientToolSearchExecutor(
+      {
+        type: 'hosted_tool',
+        name: 'tool_search',
+        providerData: {
+          type: 'tool_search',
+          execution: 'client',
+          parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+      },
+      async () => {
+        alphaExecuteCount += 1;
+        return alphaLookup;
+      },
+    );
+    const betaToolSearch = attachClientToolSearchExecutor(
+      {
+        type: 'hosted_tool',
+        name: 'tool_search',
+        providerData: {
+          type: 'tool_search',
+          execution: 'client',
+          parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+      },
+      async () => {
+        betaExecuteCount += 1;
+        return betaLookup;
+      },
+    );
+    const alphaAgent = new Agent({
+      name: 'SharedSkill',
+      instructions: 'alpha agent',
+      tools: [alphaToolSearch],
+    });
+    const betaAgent = new Agent({
+      name: 'SharedSkill',
+      instructions: 'beta agent',
+      tools: [betaToolSearch],
+    });
+    const root = new Agent({
+      name: 'Root',
+      handoffs: [alphaAgent, betaAgent],
+    });
+    const state = new RunState(new RunContext(), 'input1', root, 2);
+    const sharedCallId = 'call_tool_search_shared';
+    state._generatedItems.push(
+      new RunToolSearchCallItem(
+        {
+          type: 'tool_search_call',
+          id: 'ts_call_alpha',
+          status: 'completed',
+          arguments: {},
+          providerData: {
+            call_id: sharedCallId,
+            execution: 'client',
+          },
+        } as protocol.ToolSearchCallItem,
+        alphaAgent,
+      ),
+      new RunToolSearchCallItem(
+        {
+          type: 'tool_search_call',
+          id: 'ts_call_beta',
+          status: 'completed',
+          arguments: {},
+          providerData: {
+            call_id: sharedCallId,
+            execution: 'client',
+          },
+        } as protocol.ToolSearchCallItem,
+        betaAgent,
+      ),
+      new RunToolSearchOutputItem(
+        {
+          type: 'tool_search_output',
+          id: 'ts_output_alpha',
+          status: 'completed',
+          tools: [
+            {
+              type: 'function',
+              name: 'lookup_alpha',
+              description: 'Look up alpha data.',
+              strict: true,
+              parameters: {
+                type: 'object',
+                properties: {},
+                required: [],
+                additionalProperties: false,
+              },
+            },
+          ],
+          providerData: {
+            call_id: sharedCallId,
+            execution: 'client',
+          },
+        } as protocol.ToolSearchOutputItem,
+        alphaAgent,
+      ),
+      new RunToolSearchOutputItem(
+        {
+          type: 'tool_search_output',
+          id: 'ts_output_beta',
+          status: 'completed',
+          tools: [
+            {
+              type: 'function',
+              name: 'lookup_beta',
+              description: 'Look up beta data.',
+              strict: true,
+              parameters: {
+                type: 'object',
+                properties: {},
+                required: [],
+                additionalProperties: false,
+              },
+            },
+          ],
+          providerData: {
+            call_id: sharedCallId,
+            execution: 'client',
+          },
+        } as protocol.ToolSearchOutputItem,
+        betaAgent,
+      ),
+    );
+
+    const restored = await RunState.fromString(root, state.toString());
+
+    expect(alphaExecuteCount).toBe(1);
+    expect(betaExecuteCount).toBe(1);
+    expect(restored.getToolSearchRuntimeTools(alphaAgent)).toEqual([
+      alphaLookup,
+    ]);
+    expect(restored.getToolSearchRuntimeTools(betaAgent)).toEqual([betaLookup]);
   });
 
   it('accepts schema version 1.7 payloads when non-item context data mentions tool_search types', async () => {
@@ -1907,6 +2362,40 @@ describe('deserialize helpers', () => {
     expect(
       restored._lastProcessedResponse?.applyPatchActions[0]?.applyPatch,
     ).toBe(editorTool);
+  });
+
+  it('deserializeProcessedResponse restores sandbox-injected apply_patch placeholders', async () => {
+    const editorTool = applyPatchTool({ editor: new FakeEditor() });
+    const agent = new SandboxAgent({ name: 'SandboxEditor' });
+    const state = new RunState(new RunContext(), '', agent, 1);
+    const call: protocol.ApplyPatchCallItem = {
+      type: 'apply_patch_call',
+      callId: 'ap_sandbox',
+      status: 'completed',
+      operation: { type: 'delete_file', path: 'tmp.txt' },
+    };
+    state._lastProcessedResponse = {
+      newItems: [],
+      functions: [],
+      handoffs: [],
+      computerActions: [],
+      shellActions: [],
+      applyPatchActions: [{ toolCall: call, applyPatch: editorTool }],
+      mcpApprovalRequests: [],
+      toolsUsed: [],
+      hasToolsOrApprovalsToRun: () => true,
+    };
+
+    const restored = await RunState.fromString(agent, state.toString());
+
+    expect(
+      restored._lastProcessedResponse?.applyPatchActions[0]?.applyPatch.name,
+    ).toBe('apply_patch');
+    expect(
+      processedResponseRequiresExecutionToolRehydration(
+        restored._lastProcessedResponse,
+      ),
+    ).toBe(true);
   });
 
   it('fromString tolerates agents gaining MCP servers after serialization', async () => {

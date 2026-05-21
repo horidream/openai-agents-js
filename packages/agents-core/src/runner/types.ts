@@ -1,23 +1,23 @@
-import { Handoff } from '../handoff';
-import { RunItem, RunToolApprovalItem } from '../items';
-import {
+import type { Handoff } from '../handoff';
+import type { RunItem, RunToolApprovalItem } from '../items';
+import type {
   Model,
   ModelSettings,
   Prompt,
   SerializedHandoff,
   SerializedTool,
 } from '../model';
-import {
+import type {
   ApplyPatchTool,
   ComputerTool,
   FunctionTool,
   HostedMCPTool,
   ShellTool,
 } from '../tool';
-import { Tool } from '../tool';
-import { AgentInputItem, UnknownContext } from '../types';
-import * as protocol from '../types/protocol';
-import { ModelInputData } from './conversation';
+import type { Tool } from '../tool';
+import type { AgentInputItem, UnknownContext } from '../types';
+import type * as protocol from '../types/protocol';
+import type { ModelInputData } from './conversation';
 
 export type ToolRunHandoff = {
   toolCall: protocol.FunctionCallItem;
@@ -27,6 +27,11 @@ export type ToolRunHandoff = {
 export type ToolRunFunction<TContext = UnknownContext> = {
   toolCall: protocol.FunctionCallItem;
   tool: FunctionTool<TContext>;
+};
+
+export type ToolRunFunctionNotFound = {
+  toolCall: protocol.FunctionCallItem;
+  toolName: string;
 };
 
 export type ToolRunComputer = {
@@ -53,6 +58,7 @@ export type ProcessedResponse<TContext = UnknownContext> = {
   newItems: RunItem[];
   handoffs: ToolRunHandoff[];
   functions: ToolRunFunction<TContext>[];
+  functionToolsNotFound?: ToolRunFunctionNotFound[];
   computerActions: ToolRunComputer[];
   shellActions: ToolRunShell[];
   applyPatchActions: ToolRunApplyPatch[];

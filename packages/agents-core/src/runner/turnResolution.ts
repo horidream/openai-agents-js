@@ -1,16 +1,31 @@
 import { z } from 'zod';
 import { Agent } from '../agent';
-import { ModelBehaviorError } from '../errors';
-import { RunItem, RunMessageOutputItem, RunToolApprovalItem } from '../items';
+import { ModelBehaviorError, ModelRefusalError } from '../errors';
+import {
+  RunItem,
+  RunMessageOutputItem,
+  RunToolApprovalItem,
+  RunToolCallOutputItem,
+} from '../items';
+import logger from '../logger';
 import { ModelResponse } from '../model';
-import type { Runner, ToolErrorFormatter } from '../run';
+import type { RunConfig, Runner, ToolErrorFormatter } from '../run';
 import { RunState } from '../runState';
-import { getTextFromOutputMessage } from '../utils/messages';
+import {
+  getRefusalFromOutputMessage,
+  getTextFromOutputMessage,
+} from '../utils/messages';
 import { getSchemaAndParserFromInputType } from '../utils/tools';
 import { safeExecute } from '../utils/safeExecute';
 import { addErrorToCurrentSpan } from '../tracing/context';
 import { NextStep, SingleStepResult, nextStepSchema } from './steps';
-import type { ProcessedResponse, ToolRunHandoff } from './types';
+import type {
+  ProcessedResponse,
+  ToolRunApplyPatch,
+  ToolRunHandoff,
+  ToolRunFunctionNotFound,
+  ToolRunShell,
+} from './types';
 import {
   checkForFinalOutputFromTools,
   executeApplyPatchOperations,
@@ -19,6 +34,7 @@ import {
   executeHandoffCalls,
   executeShellActions,
   collectInterruptions,
+  getToolCallOutputItem,
 } from './toolExecution';
 import { handleHostedMcpApprovals } from './mcpApprovals';
 import * as ProviderData from '../types/providerData';
@@ -26,6 +42,78 @@ import * as protocol from '../types/protocol';
 import { AgentInputItem } from '../types';
 import type { FunctionToolResult } from '../tool';
 import { getFunctionToolQualifiedName } from '../toolIdentity';
+import type { RunErrorData, RunErrorHandlers } from './errorHandlers';
+import {
+  createRunErrorFinalOutputItem,
+  formatRunErrorFinalOutput,
+  resolveRunErrorHandler,
+} from './errorHandlers';
+import { getTurnInput } from './items';
+
+const DEFAULT_TOOL_NOT_FOUND_MESSAGE = (toolName: string) =>
+  `Tool '${toolName}' not found.`;
+
+async function resolveToolNotFoundMessage<TContext>(
+  state: RunState<TContext, Agent<TContext, any>>,
+  toolRun: ToolRunFunctionNotFound,
+  toolErrorFormatter?: ToolErrorFormatter<TContext>,
+): Promise<string> {
+  const defaultMessage = DEFAULT_TOOL_NOT_FOUND_MESSAGE(toolRun.toolName);
+  if (!toolErrorFormatter) {
+    return defaultMessage;
+  }
+
+  try {
+    const formattedMessage = await toolErrorFormatter({
+      kind: 'tool_not_found',
+      toolType: 'function',
+      toolName: toolRun.toolName,
+      callId: toolRun.toolCall.callId,
+      defaultMessage,
+      runContext: state._context,
+    });
+
+    if (typeof formattedMessage === 'string') {
+      return formattedMessage;
+    }
+    if (typeof formattedMessage !== 'undefined') {
+      logger.warn(
+        'toolErrorFormatter returned a non-string value. Falling back to the default tool not found message.',
+      );
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.warn(
+      `toolErrorFormatter threw while formatting tool not found: ${message}`,
+    );
+  }
+
+  return defaultMessage;
+}
+
+async function buildToolNotFoundOutputItems<TContext>(
+  agent: Agent<TContext, any>,
+  state: RunState<TContext, Agent<TContext, any>>,
+  toolRuns: ToolRunFunctionNotFound[],
+  toolErrorFormatter?: ToolErrorFormatter<TContext>,
+): Promise<RunToolCallOutputItem[]> {
+  const items: RunToolCallOutputItem[] = [];
+  for (const toolRun of toolRuns) {
+    const message = await resolveToolNotFoundMessage(
+      state,
+      toolRun,
+      toolErrorFormatter,
+    );
+    items.push(
+      new RunToolCallOutputItem(
+        getToolCallOutputItem(toolRun.toolCall, message),
+        agent,
+        message,
+      ),
+    );
+  }
+  return items;
+}
 
 type ApprovalItemLike =
   | RunToolApprovalItem
@@ -196,10 +284,9 @@ function buildApprovedCallIdSet(
     if (!rawItem || rawItem.type !== type) {
       continue;
     }
-    if ('callId' in rawItem && rawItem.callId) {
-      callIds.add(rawItem.callId);
-    } else if ('id' in rawItem && rawItem.id) {
-      callIds.add(rawItem.id);
+    const callKey = getToolActionKey(rawItem);
+    if (callKey) {
+      callIds.add(callKey);
     }
   }
   return callIds;
@@ -232,14 +319,24 @@ function filterActionsByApproval<T extends { toolCall: { callId?: string } }>(
   if (allowedCallIds.size === 0) {
     return [];
   }
-  return actions.filter(
-    (action) =>
-      typeof action.toolCall.callId === 'string' &&
-      allowedCallIds.has(action.toolCall.callId),
-  );
+  return actions.filter((action) => {
+    const callKey = getToolActionKey(action.toolCall);
+    return typeof callKey === 'string' && allowedCallIds.has(callKey);
+  });
 }
 
-type ToolActionWithCallId = { toolCall: { callId?: string } };
+type ToolActionWithCallId = {
+  toolCall: { callId?: string; id?: string };
+};
+
+type OrderedShellOrApplyPatchAction =
+  | { type: 'shell'; action: ToolRunShell }
+  | { type: 'apply_patch'; action: ToolRunApplyPatch };
+
+type QueuedActionsByCallId<T> = {
+  byCallId: Map<string, T[]>;
+  withoutCallId: T[];
+};
 
 function filterPendingActions<T extends ToolActionWithCallId>(
   actions: T[],
@@ -263,6 +360,155 @@ function filterPendingActions<T extends ToolActionWithCallId>(
 
     return true;
   });
+}
+
+function queueActionsByCallId<T extends ToolActionWithCallId>(
+  actions: T[],
+): QueuedActionsByCallId<T> {
+  const queued: QueuedActionsByCallId<T> = {
+    byCallId: new Map<string, T[]>(),
+    withoutCallId: [],
+  };
+  for (const action of actions) {
+    const callKey = getToolActionKey(action.toolCall);
+    if (!callKey) {
+      queued.withoutCallId.push(action);
+      continue;
+    }
+    const actionsForCallId = queued.byCallId.get(callKey) ?? [];
+    actionsForCallId.push(action);
+    queued.byCallId.set(callKey, actionsForCallId);
+  }
+  return queued;
+}
+
+function takeQueuedAction<T>(
+  actionsByCallId: Map<string, T[]>,
+  callId: string,
+): T | undefined {
+  const queued = actionsByCallId.get(callId);
+  const action = queued?.shift();
+  if (!queued || queued.length === 0) {
+    actionsByCallId.delete(callId);
+  }
+  return action;
+}
+
+function appendRemainingQueuedActions<T>(
+  target: T[],
+  actionsByCallId: Map<string, T[]>,
+): void {
+  for (const queued of actionsByCallId.values()) {
+    target.push(...queued);
+  }
+}
+
+function orderShellAndApplyPatchActions(
+  sourceItems: RunItem[],
+  shellActions: ToolRunShell[],
+  applyPatchActions: ToolRunApplyPatch[],
+): OrderedShellOrApplyPatchAction[] {
+  const shellActionsByCallId = queueActionsByCallId(shellActions);
+  const applyPatchActionsByCallId = queueActionsByCallId(applyPatchActions);
+  const orderedActions: OrderedShellOrApplyPatchAction[] = [];
+
+  for (const item of sourceItems) {
+    const rawItem = item.rawItem;
+    if (rawItem?.type === 'shell_call') {
+      const callKey = getToolActionKey(rawItem);
+      const action = takeQueuedAction(
+        shellActionsByCallId.byCallId,
+        callKey ?? '',
+      );
+      if (action) {
+        orderedActions.push({ type: 'shell', action });
+      }
+      continue;
+    }
+    if (rawItem?.type === 'apply_patch_call') {
+      const callKey = getToolActionKey(rawItem);
+      const action = takeQueuedAction(
+        applyPatchActionsByCallId.byCallId,
+        callKey ?? '',
+      );
+      if (action) {
+        orderedActions.push({ type: 'apply_patch', action });
+      }
+    }
+  }
+
+  const remainingShellActions: ToolRunShell[] = [];
+  appendRemainingQueuedActions(
+    remainingShellActions,
+    shellActionsByCallId.byCallId,
+  );
+  remainingShellActions.push(...shellActionsByCallId.withoutCallId);
+  for (const action of remainingShellActions) {
+    orderedActions.push({ type: 'shell', action });
+  }
+
+  const remainingApplyPatchActions: ToolRunApplyPatch[] = [];
+  appendRemainingQueuedActions(
+    remainingApplyPatchActions,
+    applyPatchActionsByCallId.byCallId,
+  );
+  remainingApplyPatchActions.push(...applyPatchActionsByCallId.withoutCallId);
+  for (const action of remainingApplyPatchActions) {
+    orderedActions.push({ type: 'apply_patch', action });
+  }
+
+  return orderedActions;
+}
+
+function getToolActionKey(value: {
+  callId?: unknown;
+  id?: unknown;
+}): string | undefined {
+  if (typeof value.callId === 'string' && value.callId.length > 0) {
+    return value.callId;
+  }
+  if (typeof value.id === 'string' && value.id.length > 0) {
+    return value.id;
+  }
+  return undefined;
+}
+
+async function executeShellAndApplyPatchActionsInOrder<TContext>(args: {
+  agent: Agent<TContext, any>;
+  sourceItems: RunItem[];
+  shellActions: ToolRunShell[];
+  applyPatchActions: ToolRunApplyPatch[];
+  runner: Runner;
+  state: RunState<TContext, Agent<TContext, any>>;
+  toolErrorFormatter?: ToolErrorFormatter;
+}): Promise<RunItem[]> {
+  const results: RunItem[] = [];
+  for (const action of orderShellAndApplyPatchActions(
+    args.sourceItems,
+    args.shellActions,
+    args.applyPatchActions,
+  )) {
+    const items =
+      action.type === 'shell'
+        ? await executeShellActions(
+            args.agent,
+            [action.action],
+            args.runner,
+            args.state._context,
+            undefined,
+            args.toolErrorFormatter,
+          )
+        : await executeApplyPatchOperations(
+            args.agent,
+            [action.action],
+            args.runner,
+            args.state._context,
+            undefined,
+            args.toolErrorFormatter,
+          );
+    results.push(...items);
+  }
+  return results;
 }
 
 function truncateForDeveloper(message: string, maxLength = 160): string {
@@ -317,6 +563,7 @@ export async function resolveInterruptedTurn<TContext>(
   runner: Runner,
   state: RunState<TContext, Agent<TContext, any>>,
   toolErrorFormatter?: ToolErrorFormatter,
+  agentToolParentRunConfig?: Partial<RunConfig>,
 ): Promise<SingleStepResult> {
   // call_ids for function tools
   const functionCallIds = originalPreStepItems
@@ -452,6 +699,7 @@ export async function resolveInterruptedTurn<TContext>(
     runner,
     state,
     toolErrorFormatter,
+    agentToolParentRunConfig,
   );
 
   // Computer actions may require approval; only pending approved actions are executed on resume.
@@ -467,29 +715,30 @@ export async function resolveInterruptedTurn<TContext>(
         )
       : [];
 
-  const shellResults =
-    shellRuns.length > 0
-      ? await executeShellActions(
+  const shellAndApplyPatchResults =
+    shellRuns.length > 0 || applyPatchRuns.length > 0
+      ? await executeShellAndApplyPatchActionsInOrder({
           agent,
-          shellRuns,
+          sourceItems: originalPreStepItems,
+          shellActions: shellRuns,
+          applyPatchActions: applyPatchRuns,
           runner,
-          state._context,
-          undefined,
+          state,
           toolErrorFormatter,
-        )
+        })
       : [];
-
-  const applyPatchResults =
-    applyPatchRuns.length > 0
-      ? await executeApplyPatchOperations(
-          agent,
-          applyPatchRuns,
-          runner,
-          state._context,
-          undefined,
-          toolErrorFormatter,
-        )
-      : [];
+  const pendingFunctionToolsNotFound = filterPendingActions(
+    processedResponse.functionToolsNotFound ?? [],
+    {
+      completedCallIds: completedFunctionCallIds,
+    },
+  );
+  const toolNotFoundResults = await buildToolNotFoundOutputItems(
+    agent,
+    state,
+    pendingFunctionToolsNotFound,
+    toolErrorFormatter,
+  );
 
   const newItems: RunItem[] = [];
   const appendContext = buildAppendContext(originalPreStepItems);
@@ -507,21 +756,21 @@ export async function resolveInterruptedTurn<TContext>(
     appendIfNew(result.runItem);
   }
 
+  for (const result of toolNotFoundResults) {
+    appendIfNew(result);
+  }
+
   for (const result of computerResults) {
     appendIfNew(result);
   }
 
-  for (const result of shellResults) {
-    appendIfNew(result);
-  }
-
-  for (const result of applyPatchResults) {
+  for (const result of shellAndApplyPatchResults) {
     appendIfNew(result);
   }
 
   const additionalInterruptions = collectInterruptions(
     [],
-    [...computerResults, ...shellResults, ...applyPatchResults],
+    [...computerResults, ...shellAndApplyPatchResults],
   );
 
   const hostedMcpApprovals = await handleHostedMcpApprovals({
@@ -628,15 +877,20 @@ export async function resolveInterruptedTurn<TContext>(
  * Executes every follow-up action the model requested (function tools, computer actions, MCP flows),
  * appends their outputs to the run history, and determines the next step for the agent loop.
  */
-export async function resolveTurnAfterModelResponse<TContext>(
-  agent: Agent<TContext, any>,
+export async function resolveTurnAfterModelResponse<
+  TContext,
+  TAgent extends Agent<TContext, any>,
+>(
+  agent: TAgent,
   originalInput: string | AgentInputItem[],
   originalPreStepItems: RunItem[],
   newResponse: ModelResponse,
   processedResponse: ProcessedResponse<TContext>,
   runner: Runner,
-  state: RunState<TContext, Agent<TContext, any>>,
+  state: RunState<TContext, TAgent>,
   toolErrorFormatter?: ToolErrorFormatter,
+  agentToolParentRunConfig?: Partial<RunConfig>,
+  errorHandlers?: RunErrorHandlers<TContext, TAgent>,
 ): Promise<SingleStepResult> {
   // Reuse the same array reference so we can compare object identity when deciding whether to
   // append new items, ensuring we never double-stream existing RunItems.
@@ -651,40 +905,44 @@ export async function resolveTurnAfterModelResponse<TContext>(
   }
 
   // Run function tools and computer actions in parallel; neither depends on the other's side effects.
-  const [functionResults, computerResults, shellResults, applyPatchResults] =
-    await Promise.all([
-      executeFunctionToolCalls(
-        agent,
-        processedResponse.functions,
-        runner,
-        state,
-        toolErrorFormatter,
-      ),
-      executeComputerActions(
-        agent,
-        processedResponse.computerActions,
-        runner,
-        state._context,
-        undefined,
-        toolErrorFormatter,
-      ),
-      executeShellActions(
-        agent,
-        processedResponse.shellActions,
-        runner,
-        state._context,
-        undefined,
-        toolErrorFormatter,
-      ),
-      executeApplyPatchOperations(
-        agent,
-        processedResponse.applyPatchActions,
-        runner,
-        state._context,
-        undefined,
-        toolErrorFormatter,
-      ),
-    ]);
+  // Shell and apply_patch actions both mutate the sandbox filesystem, so preserve model order.
+  const [functionResults, computerResults] = await Promise.all([
+    executeFunctionToolCalls(
+      agent,
+      processedResponse.functions,
+      runner,
+      state,
+      toolErrorFormatter,
+      agentToolParentRunConfig,
+    ),
+    executeComputerActions(
+      agent,
+      processedResponse.computerActions,
+      runner,
+      state._context,
+      undefined,
+      toolErrorFormatter,
+    ),
+  ]);
+  const shellAndApplyPatchResults =
+    processedResponse.shellActions.length > 0 ||
+    processedResponse.applyPatchActions.length > 0
+      ? await executeShellAndApplyPatchActionsInOrder({
+          agent,
+          sourceItems: processedResponse.newItems,
+          shellActions: processedResponse.shellActions,
+          applyPatchActions: processedResponse.applyPatchActions,
+          runner,
+          state,
+          toolErrorFormatter,
+        })
+      : [];
+  const toolNotFoundResults = await buildToolNotFoundOutputItems(
+    agent,
+    state,
+    processedResponse.functionToolsNotFound ?? [],
+    toolErrorFormatter,
+  );
 
   for (const result of functionResults) {
     if (
@@ -696,19 +954,19 @@ export async function resolveTurnAfterModelResponse<TContext>(
     }
     appendIfNew(result.runItem);
   }
+  for (const item of toolNotFoundResults) {
+    appendIfNew(item);
+  }
   for (const item of computerResults) {
     appendIfNew(item);
   }
-  for (const item of shellResults) {
-    appendIfNew(item);
-  }
-  for (const item of applyPatchResults) {
+  for (const item of shellAndApplyPatchResults) {
     appendIfNew(item);
   }
 
   const additionalInterruptions = collectInterruptions(
     [],
-    [...computerResults, ...shellResults, ...applyPatchResults],
+    [...computerResults, ...shellAndApplyPatchResults],
   );
 
   if (processedResponse.mcpApprovalRequests.length > 0) {
@@ -786,6 +1044,59 @@ export async function resolveTurnAfterModelResponse<TContext>(
       ? getTextFromOutputMessage(messageItems[messageItems.length - 1].rawItem)
       : undefined;
 
+  // Keep looping if any tool output placeholders still require an approval follow-up.
+  const hasPendingToolsOrApprovals =
+    functionResults.some(
+      (result) => result.runItem instanceof RunToolApprovalItem,
+    ) || additionalInterruptions.length > 0;
+
+  if (!hasPendingToolsOrApprovals && messageItems.length > 0) {
+    const refusal = getRefusalFromOutputMessage(
+      messageItems[messageItems.length - 1].rawItem,
+    );
+    if (refusal && typeof potentialFinalOutput === 'undefined') {
+      const refusalError = new ModelRefusalError(refusal, state);
+      const generatedItems = preStepItems.concat(newItems);
+      const runData: RunErrorData<TContext, TAgent> = {
+        input: originalInput,
+        newItems: generatedItems,
+        history: getTurnInput(
+          originalInput,
+          generatedItems,
+          state._reasoningItemIdPolicy,
+        ),
+        output: getTurnInput([], generatedItems, state._reasoningItemIdPolicy),
+        rawResponses: state._modelResponses,
+        lastAgent: agent,
+        state,
+      };
+      const handlerResult = await resolveRunErrorHandler({
+        error: refusalError,
+        errorHandlers,
+        context: state._context,
+        runData,
+      });
+      if (!handlerResult) {
+        throw refusalError;
+      }
+
+      const outputText = formatRunErrorFinalOutput(
+        agent,
+        handlerResult.finalOutput,
+      );
+      if (handlerResult.includeInHistory !== false) {
+        newItems.push(createRunErrorFinalOutputItem(agent, outputText));
+      }
+      return new SingleStepResult(
+        originalInput,
+        newResponse,
+        preStepItems,
+        newItems,
+        { type: 'next_step_final_output', output: outputText },
+      );
+    }
+  }
+
   // if there is no output we just run again
   if (typeof potentialFinalOutput === 'undefined') {
     return new SingleStepResult(
@@ -796,12 +1107,6 @@ export async function resolveTurnAfterModelResponse<TContext>(
       { type: 'next_step_run_again' },
     );
   }
-
-  // Keep looping if any tool output placeholders still require an approval follow-up.
-  const hasPendingToolsOrApprovals =
-    functionResults.some(
-      (result) => result.runItem instanceof RunToolApprovalItem,
-    ) || additionalInterruptions.length > 0;
 
   if (!hasPendingToolsOrApprovals) {
     if (agent.outputType === 'text') {

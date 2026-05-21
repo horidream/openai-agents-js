@@ -396,6 +396,60 @@ describe('OpenAIConversationsSession', () => {
     ]);
   });
 
+  it('strips assistant conversation replay metadata only for model input', async () => {
+    const session = createSession({
+      client: {
+        conversations: {
+          items: {
+            list: vi.fn(),
+            create: vi.fn(),
+            delete: vi.fn(),
+          },
+          create: vi.fn(),
+          delete: vi.fn(),
+        },
+      } as any,
+      conversationId: 'conv-123',
+    });
+
+    const userItem = {
+      id: 'conv-user',
+      type: 'message',
+      role: 'user',
+      content: 'user history',
+      providerData: { server: 'metadata' },
+    };
+    const assistantItem = {
+      id: 'conv-assistant',
+      type: 'message',
+      role: 'assistant',
+      content: [],
+      providerData: { server: 'metadata' },
+      provider_data: { server: 'snake' },
+    };
+    const functionCallItem = {
+      id: 'conv-call',
+      type: 'function_call',
+      name: 'lookup',
+      callId: 'call-history',
+      arguments: '{}',
+    };
+
+    expect(session.prepareHistoryItemForModelInput(userItem as any)).toEqual(
+      userItem,
+    );
+    expect(
+      session.prepareHistoryItemForModelInput(functionCallItem as any),
+    ).toEqual(functionCallItem);
+    expect(
+      session.prepareHistoryItemForModelInput(assistantItem as any),
+    ).toEqual({
+      type: 'message',
+      role: 'assistant',
+      content: [],
+    });
+  });
+
   it('adds items without requesting additional response includes', async () => {
     const createMock = vi.fn();
     const inputItems = [
@@ -413,7 +467,6 @@ describe('OpenAIConversationsSession', () => {
         type: 'message',
         role: 'user',
         content: [],
-        // model should be stripped, but other providerData should stay if present
         providerData: { extra: 'keep-me' },
       },
     ];
@@ -451,11 +504,157 @@ describe('OpenAIConversationsSession', () => {
       }),
     );
     expect(createMock).toHaveBeenCalledWith('conv-123', {
-      items: converted,
+      items: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [],
+        },
+      ],
     });
   });
 
-  it('keeps providerData for hosted tool calls', async () => {
+  it('preserves reasoning identity and encrypted content when adding items', async () => {
+    const createMock = vi.fn();
+    const inputItems = [
+      {
+        id: 'rs-input',
+        type: 'reasoning',
+        content: [],
+        providerData: { model: 'some-model' },
+      },
+    ];
+    const converted = [
+      {
+        id: 'rs-output',
+        type: 'reasoning',
+        summary: [],
+        encrypted_content: 'encrypted',
+        providerData: { server: 'metadata' },
+        provider_data: { server: 'snake' },
+      },
+    ];
+
+    getInputItemsMock.mockReturnValue(converted as any);
+
+    const session = createSession({
+      client: {
+        conversations: {
+          items: {
+            list: vi.fn(),
+            create: createMock,
+            delete: vi.fn(),
+          },
+          create: vi.fn(),
+          delete: vi.fn(),
+        },
+      } as any,
+      conversationId: 'conv-123',
+    });
+
+    await session.addItems(inputItems as any);
+
+    expect(createMock).toHaveBeenCalledWith('conv-123', {
+      items: [
+        {
+          id: 'rs-output',
+          type: 'reasoning',
+          summary: [],
+          encrypted_content: 'encrypted',
+        },
+      ],
+    });
+  });
+
+  it('drops reasoning items that Conversations cannot persist', async () => {
+    const createMock = vi.fn();
+    const inputItems = [
+      { type: 'message', role: 'user', content: 'hello' },
+      { type: 'reasoning', id: 'rs-input', content: [] },
+      { type: 'message', role: 'assistant', content: [] },
+    ];
+    const converted = [
+      {
+        id: 'msg-user',
+        type: 'message',
+        role: 'user',
+        content: 'hello',
+      },
+      {
+        type: 'reasoning',
+        summary: [],
+      },
+      {
+        id: 'msg-assistant',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+      },
+    ];
+
+    getInputItemsMock.mockReturnValue(converted as any);
+
+    const session = createSession({
+      client: {
+        conversations: {
+          items: {
+            list: vi.fn(),
+            create: createMock,
+            delete: vi.fn(),
+          },
+          create: vi.fn(),
+          delete: vi.fn(),
+        },
+      } as any,
+      conversationId: 'conv-123',
+    });
+
+    await session.addItems(inputItems as any);
+
+    expect(createMock).toHaveBeenCalledWith('conv-123', {
+      items: [
+        {
+          type: 'message',
+          role: 'user',
+          content: 'hello',
+        },
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [],
+        },
+      ],
+    });
+  });
+
+  it('skips the Conversations write when every item is unpersistable', async () => {
+    const createMock = vi.fn();
+    const inputItems = [{ type: 'reasoning', id: 'rs-input', content: [] }];
+    const converted = [{ type: 'reasoning', summary: [] }];
+
+    getInputItemsMock.mockReturnValue(converted as any);
+
+    const session = createSession({
+      client: {
+        conversations: {
+          items: {
+            list: vi.fn(),
+            create: createMock,
+            delete: vi.fn(),
+          },
+          create: vi.fn(),
+          delete: vi.fn(),
+        },
+      } as any,
+      conversationId: 'conv-123',
+    });
+
+    await session.addItems(inputItems as any);
+
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
+  it('strips persistence metadata after converting hosted tool calls', async () => {
     const createMock = vi.fn();
     const inputItems = [
       {
@@ -509,7 +708,14 @@ describe('OpenAIConversationsSession', () => {
       }),
     );
     expect(createMock).toHaveBeenCalledWith('conv-123', {
-      items: converted,
+      items: [
+        {
+          type: 'function_call',
+          name: 'search',
+          call_id: 'call-1',
+          arguments: '{}',
+        },
+      ],
     });
   });
 

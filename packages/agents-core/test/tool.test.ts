@@ -261,6 +261,31 @@ describe('Tool', () => {
     expect(initSpy).not.toHaveBeenCalled();
   });
 
+  it('resolveComputer treats computer instances with create methods as static instances', async () => {
+    const create = vi.fn();
+    const staticComp = {
+      environment: 'mac' as const,
+      dimensions: [1, 1] as [number, number],
+      screenshot: async () => 'img',
+      click: async () => {},
+      doubleClick: async () => {},
+      drag: async () => {},
+      keypress: async () => {},
+      move: async () => {},
+      scroll: async () => {},
+      type: async () => {},
+      wait: async () => {},
+      create,
+    };
+    const t = computerTool({ computer: staticComp });
+    const ctx = new RunContext();
+
+    const resolved = await resolveComputer({ tool: t, runContext: ctx });
+
+    expect(resolved).toBe(staticComp);
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it('supports lifecycle initializers with dispose per run context', async () => {
     let counter = 0;
     const makeComputer = (label: string) =>
@@ -314,6 +339,26 @@ describe('Tool', () => {
     expect(t.environment.type).toBe('local');
     expect(t.environment).toEqual({ type: 'local' });
     expect(t.shell).toBe(shell);
+  });
+
+  it('tool allows reserved built-in names for compatibility', () => {
+    const shellWrapper = tool({
+      name: 'shell',
+      description: 'compatibility shell wrapper',
+      parameters: z.object({}),
+      execute: async () => 'ok',
+    });
+    const computerWrapper = tool({
+      name: 'computer_use_preview',
+      description: 'compatibility computer wrapper',
+      parameters: z.object({}),
+      execute: async () => 'ok',
+    });
+
+    expect(shellWrapper.type).toBe('function');
+    expect(shellWrapper.name).toBe('shell');
+    expect(computerWrapper.type).toBe('function');
+    expect(computerWrapper.name).toBe('computer_use_preview');
   });
 
   it('ShellTool keeps local environment optional for compatibility', () => {
@@ -581,6 +626,71 @@ describe('create a tool using hostedMcpTool utility', () => {
     expect(t.providerData.server_description).toBe('Repository operations');
     expect(t.providerData.defer_loading).toBe(true);
   });
+
+  it('rejects invalid MCP approval string policies', () => {
+    expect(() =>
+      hostedMcpTool({
+        serverLabel: 'gitmcp',
+        serverUrl: 'https://gitmcp.io/openai/codex',
+        requireApproval: 'alwyas',
+      } as any),
+    ).toThrowError(/Invalid hosted MCP requireApproval/);
+  });
+
+  it('rejects unsupported MCP approval object keys', () => {
+    expect(() =>
+      hostedMcpTool({
+        serverLabel: 'gitmcp',
+        serverUrl: 'https://gitmcp.io/openai/codex',
+        requireApproval: { delete: 'alwyas' },
+      } as any),
+    ).toThrowError(/unsupported key "delete"/);
+  });
+
+  it('rejects MCP approval policies with overlapping tool names', () => {
+    expect(() =>
+      hostedMcpTool({
+        serverLabel: 'gitmcp',
+        serverUrl: 'https://gitmcp.io/openai/codex',
+        requireApproval: {
+          always: { toolNames: ['delete'] },
+          never: { toolNames: ['delete'] },
+        },
+      }),
+    ).toThrowError(/cannot be listed in both always and never/);
+  });
+
+  it('normalizes MCP approval tool name filters', () => {
+    const t = hostedMcpTool({
+      serverLabel: 'gitmcp',
+      serverUrl: 'https://gitmcp.io/openai/codex',
+      requireApproval: {
+        always: { toolNames: ['delete'] },
+        never: { toolNames: ['search'] },
+      },
+    });
+
+    expect(t.providerData.require_approval).toEqual({
+      always: { tool_names: ['delete'] },
+      never: { tool_names: ['search'] },
+    });
+  });
+
+  it('normalizes MCP approval read-only filters', () => {
+    const t = hostedMcpTool({
+      serverLabel: 'gitmcp',
+      serverUrl: 'https://gitmcp.io/openai/codex',
+      requireApproval: {
+        always: { readOnly: false },
+        never: { toolNames: ['search'], readOnly: true },
+      },
+    });
+
+    expect(t.providerData.require_approval).toEqual({
+      always: { read_only: false },
+      never: { tool_names: ['search'], read_only: true },
+    });
+  });
 });
 
 describe('tool.invoke', () => {
@@ -736,8 +846,12 @@ describe('tool.invoke', () => {
       description: 'slow',
       parameters: z.object({}),
       timeoutMs: 5,
-      execute: async () => {
-        await new Promise((resolve) => setTimeout(resolve, 30));
+      execute: async (_input, _context, details) => {
+        await new Promise<void>((resolve) => {
+          details?.signal?.addEventListener('abort', () => resolve(), {
+            once: true,
+          });
+        });
         return 'done';
       },
     });

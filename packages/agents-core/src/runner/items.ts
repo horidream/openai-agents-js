@@ -99,27 +99,52 @@ function shouldOmitReasoningItemIds(
   return reasoningItemIdPolicy === 'omit';
 }
 
+export function stripReasoningItemIdForPolicy(
+  item: AgentInputItem,
+  reasoningItemIdPolicy?: ReasoningItemIdPolicy,
+): AgentInputItem {
+  if (
+    !shouldOmitReasoningItemIds(reasoningItemIdPolicy) ||
+    !item ||
+    typeof item !== 'object' ||
+    item.type !== 'reasoning' ||
+    !('id' in item)
+  ) {
+    return item;
+  }
+
+  const { id: _id, ...withoutId } = item as Record<string, unknown>;
+  return withoutId as AgentInputItem;
+}
+
 // Extracts model-ready output items from run items, excluding approval placeholders.
 export function extractOutputItemsFromRunItems(
   items: RunItem[],
   reasoningItemIdPolicy?: ReasoningItemIdPolicy,
 ): AgentInputItem[] {
-  const omitReasoningItemIds = shouldOmitReasoningItemIds(
-    reasoningItemIdPolicy,
-  );
   return items
     .filter((item) => item.type !== 'tool_approval_item')
     .map((item) => {
-      const rawItem = item.rawItem as AgentInputItem;
-      if (!omitReasoningItemIds || item.type !== 'reasoning_item') {
+      const rawItem = withoutNullStatus(item.rawItem as AgentInputItem);
+      if (item.type !== 'reasoning_item') {
         return rawItem;
       }
-      if (!rawItem || typeof rawItem !== 'object' || !('id' in rawItem)) {
-        return rawItem;
-      }
-      const { id: _id, ...withoutId } = rawItem as Record<string, unknown>;
-      return withoutId as AgentInputItem;
+      return stripReasoningItemIdForPolicy(rawItem, reasoningItemIdPolicy);
     });
+}
+
+function withoutNullStatus(item: AgentInputItem): AgentInputItem {
+  if (
+    !item ||
+    typeof item !== 'object' ||
+    !('status' in item) ||
+    (item as { status?: unknown }).status !== null
+  ) {
+    return item;
+  }
+
+  const { status: _status, ...withoutStatus } = item as Record<string, unknown>;
+  return withoutStatus as AgentInputItem;
 }
 
 function collectCompletedCallIdsByResultType(
@@ -167,8 +192,9 @@ export function dropOrphanToolCalls(
 ): AgentInputItem[] {
   const pruningIndexes = options?.pruningIndexes;
   const completedByResultType = collectCompletedCallIdsByResultType(items);
+  const droppedIndexes = new Set<number>();
 
-  return items.filter((item, index) => {
+  const filtered = items.filter((item, index) => {
     if (pruningIndexes && !pruningIndexes.has(index)) {
       return true;
     }
@@ -190,8 +216,66 @@ export function dropOrphanToolCalls(
     if (isPendingHostedShellCall(item)) {
       return true;
     }
-    return completedByResultType.get(resultType)?.has(callId) ?? false;
+    if (completedByResultType.get(resultType)?.has(callId) ?? false) {
+      return true;
+    }
+    droppedIndexes.add(index);
+    return false;
   });
+
+  if (droppedIndexes.size === 0) {
+    return filtered;
+  }
+
+  return dropReasoningItemsPrecedingDroppedCalls(
+    items,
+    droppedIndexes,
+    pruningIndexes,
+  );
+}
+
+function dropReasoningItemsPrecedingDroppedCalls(
+  items: AgentInputItem[],
+  droppedIndexes: Set<number>,
+  pruningIndexes?: Set<number>,
+): AgentInputItem[] {
+  const dropReasoning = new Set<number>();
+
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (pruningIndexes && !pruningIndexes.has(index)) {
+      continue;
+    }
+    const item = items[index];
+    if (
+      !item ||
+      typeof item !== 'object' ||
+      (item as { type?: unknown }).type !== 'reasoning' ||
+      droppedIndexes.has(index)
+    ) {
+      continue;
+    }
+
+    for (let nextIndex = index + 1; nextIndex < items.length; nextIndex += 1) {
+      if (dropReasoning.has(nextIndex)) {
+        continue;
+      }
+      const nextItem = items[nextIndex];
+      if (
+        nextItem &&
+        typeof nextItem === 'object' &&
+        (nextItem as { type?: unknown }).type === 'reasoning'
+      ) {
+        continue;
+      }
+      if (droppedIndexes.has(nextIndex)) {
+        dropReasoning.add(index);
+      }
+      break;
+    }
+  }
+
+  const excluded = new Set([...droppedIndexes, ...dropReasoning]);
+  return items.filter((_item, index) => !excluded.has(index));
 }
 
 export function prepareModelInputItems(

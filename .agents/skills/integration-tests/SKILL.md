@@ -11,6 +11,12 @@ Run integration tests that require a local npm registry by starting `pnpm local-
 
 ## Workflow
 
+### Codex execution environment
+
+- When Codex invokes this skill, run both `pnpm local-npm:start` and the main pipeline outside the Codex sandbox by default (`sandbox_permissions=require_escalated`). The integration suites install dependencies inside fixture projects with `npm install`, `bun install`, Deno, Wrangler, local emulators, Docker, and other subprocesses; running them inside the Codex sandbox can cause environment-only failures such as `npm` `EPERM` writing to `~/.npm/_cacache/tmp` or Bun `PermissionDenied` writing to its tempdir.
+- Use sandboxed execution only when the user explicitly asks for it. If a sandboxed run fails during dependency installation or temp/cache writes, rerun the same exact pipeline outside the sandbox before classifying the failure as repo-induced.
+- Still keep the registry lifecycle local to the run: start Verdaccio before the pipeline and stop it after the pipeline, even when a failure occurs.
+
 ### 1. Start the local registry (subprocess)
 
 - Start a background process with `pnpm local-npm:start` and keep its session id so it can be stopped later.
@@ -22,10 +28,11 @@ Run integration tests that require a local npm registry by starting `pnpm local-
 Run this exact sequence in the main process and capture the output:
 
 ```bash
-pnpm i && pnpm build:ci && pnpm local-npm:reset && pnpm local-npm:publish && pnpm test:integration
+pnpm i && pnpm build:ci && pnpm local-npm:reset && pnpm local-npm:publish && OPENAI_AGENTS_RUN_STORAGE_MOUNT_INTEGRATION=1 pnpm test:integration
 ```
 
 - Use `pnpm build:ci` here so the skill validates the same serialized build path that GitHub Actions now uses, while still running the normal `prebuild` and `postbuild` lifecycle steps.
+- Run `pnpm test:integration` with `OPENAI_AGENTS_RUN_STORAGE_MOUNT_INTEGRATION=1` so the optional sandbox storage mount coverage runs by default when this skill is used. This enables the local Azurite and MinIO smoke tests without changing the repository's plain `pnpm test:integration` default.
 
 - Return the full success/failure outcome and a concise summary of the results.
 - Always capture the stdout/stderr from `pnpm test:integration` and include it in the final response (trim obvious noise if extremely long) inside a fenced code block.

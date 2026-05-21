@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { RealtimeClientMessage } from '../src/clientMessages';
-import { OpenAIRealtimeBase } from '../src/openaiRealtimeBase';
+import {
+  DEFAULT_OPENAI_REALTIME_SESSION_CONFIG,
+  OpenAIRealtimeBase,
+} from '../src/openaiRealtimeBase';
 import logger from '../src/logger';
 
 class TestBase extends OpenAIRealtimeBase {
@@ -67,6 +70,26 @@ describe('OpenAIRealtimeBase helpers', () => {
     expect(config.audio?.output?.voice).toBeUndefined();
   });
 
+  it('uses gpt-realtime-2 as the default model', () => {
+    const base = new TestBase();
+    const config = (base as any)._getMergedSessionConfig({});
+
+    expect(config.model).toBe('gpt-realtime-2');
+  });
+
+  it('maps reasoning-capable realtime session settings', () => {
+    const base = new TestBase();
+    const config = (base as any)._getMergedSessionConfig({
+      model: 'gpt-realtime-2',
+      parallelToolCalls: false,
+      reasoning: { effort: 'low' },
+    });
+
+    expect(config.model).toBe('gpt-realtime-2');
+    expect(config.parallel_tool_calls).toBe(false);
+    expect(config.reasoning).toEqual({ effort: 'low' });
+  });
+
   it('preserves explicit null audio input config values', () => {
     const base = new TestBase();
     const config = (base as any)._getMergedSessionConfig({
@@ -82,6 +105,29 @@ describe('OpenAIRealtimeBase helpers', () => {
     expect(config.audio?.input?.noise_reduction).toBeNull();
     expect(config.audio?.input?.transcription).toBeNull();
     expect(config.audio?.input?.turn_detection).toBeNull();
+  });
+
+  it('treats null audio channels as unset when building config', () => {
+    const base = new TestBase();
+    const config = (base as any)._getMergedSessionConfig({
+      audio: {
+        input: null,
+        output: null,
+      },
+    });
+
+    expect(config.audio?.input?.format).toEqual(
+      DEFAULT_OPENAI_REALTIME_SESSION_CONFIG.audio?.input?.format,
+    );
+    expect(config.audio?.input?.transcription).toEqual(
+      DEFAULT_OPENAI_REALTIME_SESSION_CONFIG.audio?.input?.transcription,
+    );
+    expect(config.audio?.output?.format).toEqual(
+      DEFAULT_OPENAI_REALTIME_SESSION_CONFIG.audio?.output?.format,
+    );
+    expect(config.audio?.output?.speed).toEqual(
+      DEFAULT_OPENAI_REALTIME_SESSION_CONFIG.audio?.output?.speed,
+    );
   });
 
   it('preserves falsy turn detection values when building payload', () => {
@@ -184,6 +230,60 @@ describe('OpenAIRealtimeBase helpers', () => {
         headers: { Authorization: 'Bearer t' },
         allowed_tools: ['a'],
         require_approval: 'always',
+      },
+    ]);
+  });
+
+  it('omits mcp require_approval when realtime config leaves it undefined', () => {
+    const base = new TestBase();
+    const payload = (base as any)._getMergedSessionConfig({
+      instructions: 'hi',
+      model: 'gpt-realtime-1.5',
+      tools: [
+        {
+          type: 'mcp',
+          server_label: 'deepwiki',
+          server_url: 'https://mcp.deepwiki.com/sse',
+        },
+      ],
+    });
+
+    expect(payload.tools).toEqual([
+      {
+        type: 'mcp',
+        server_label: 'deepwiki',
+        server_url: 'https://mcp.deepwiki.com/sse',
+      },
+    ]);
+  });
+
+  it('preserves mcp require_approval read_only filters in realtime config', () => {
+    const base = new TestBase();
+    const payload = (base as any)._getMergedSessionConfig({
+      instructions: 'hi',
+      model: 'gpt-realtime-1.5',
+      tools: [
+        {
+          type: 'mcp',
+          server_label: 'deepwiki',
+          server_url: 'https://mcp.deepwiki.com/sse',
+          require_approval: {
+            always: { read_only: false },
+            never: { tool_names: ['search'], read_only: true },
+          },
+        },
+      ],
+    });
+
+    expect(payload.tools).toEqual([
+      {
+        type: 'mcp',
+        server_label: 'deepwiki',
+        server_url: 'https://mcp.deepwiki.com/sse',
+        require_approval: {
+          always: { read_only: false },
+          never: { tool_names: ['search'], read_only: true },
+        },
       },
     ]);
   });
@@ -495,6 +595,89 @@ describe('OpenAIRealtimeBase helpers', () => {
 
     expect(funcs[0]?.name).toBe('calc');
     expect(updates.find((u) => (u as any).itemId === 'mcp1')).toBeTruthy();
+  });
+
+  it('preserves GA output_audio content on output item messages', () => {
+    const base = new TestBase();
+    const updates: any[] = [];
+    base.on('item_update', (i) => updates.push(i));
+
+    (base as any)._onMessage({
+      data: JSON.stringify({
+        type: 'response.output_item.added',
+        event_id: 'o3',
+        response_id: 'r5',
+        output_index: 0,
+        item: {
+          id: 'audio1',
+          type: 'message',
+          role: 'assistant',
+          content: [
+            {
+              type: 'output_audio',
+              audio: 'base64data',
+              transcript: 'hi',
+            },
+          ],
+        },
+      }),
+    });
+
+    expect(updates[0]).toMatchObject({
+      itemId: 'audio1',
+      type: 'message',
+      role: 'assistant',
+      status: 'in_progress',
+      content: [
+        {
+          type: 'output_audio',
+          audio: 'base64data',
+          transcript: 'hi',
+        },
+      ],
+    });
+  });
+
+  it('normalizes legacy audio content on output item messages', () => {
+    const base = new TestBase();
+    const updates: any[] = [];
+    base.on('item_update', (i) => updates.push(i));
+
+    (base as any)._onMessage({
+      data: JSON.stringify({
+        type: 'response.output_item.done',
+        event_id: 'o4',
+        response_id: 'r6',
+        output_index: 0,
+        item: {
+          id: 'audio2',
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [
+            {
+              type: 'audio',
+              audio: 'legacydata',
+              transcript: 'hello',
+            },
+          ],
+        },
+      }),
+    });
+
+    expect(updates[0]).toMatchObject({
+      itemId: 'audio2',
+      type: 'message',
+      role: 'assistant',
+      status: 'completed',
+      content: [
+        {
+          type: 'output_audio',
+          audio: 'legacydata',
+          transcript: 'hello',
+        },
+      ],
+    });
   });
 
   it('retrieves MCP tool call items on in-progress signals', () => {

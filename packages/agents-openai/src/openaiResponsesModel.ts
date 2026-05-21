@@ -16,6 +16,7 @@ import type {
   SerializedTool,
   ModelRequest,
   ModelResponse,
+  ModelSettingsContextManagement,
   ModelSettingsToolChoice,
   ResponseStreamEvent,
   SerializedOutputType,
@@ -40,6 +41,7 @@ import {
   webSocketFrameToText,
   withAbortSignal,
   withTimeout,
+  type ResponsesWebSocketKeepAliveOptions,
   type WebSocketMessageValue,
 } from './responsesWebSocketConnection';
 import {
@@ -61,11 +63,13 @@ import {
   camelOrSnakeToSnakeCase,
   getSnakeCasedProviderDataWithoutReservedKeys,
 } from './utils/providerData';
+import { normalizePromptCacheRetention } from './utils/modelSettings';
 import { ProviderData } from '@openai/agents-core/types';
 import {
   encodeUint8ArrayToBase64,
   getToolSearchExecution,
   getToolSearchProviderCallId,
+  normalizeHostedMcpRequireApproval,
 } from '@openai/agents-core/utils';
 
 type ToolChoice =
@@ -275,7 +279,8 @@ function isNeverSentWebSocketError(error: unknown): boolean {
 function isAmbiguousWebSocketReplayError(error: unknown): boolean {
   if (
     error instanceof ResponsesWebSocketInternalError &&
-    error.code === 'connection_closed_before_terminal_response_event'
+    (error.code === 'connection_closed_before_terminal_response_event' ||
+      error.code === 'pong_timeout')
   ) {
     return true;
   }
@@ -287,7 +292,8 @@ function isAmbiguousWebSocketReplayError(error: unknown): boolean {
 
   return (
     errorCause instanceof ResponsesWebSocketInternalError &&
-    errorCause.code === 'connection_closed_before_terminal_response_event'
+    (errorCause.code === 'connection_closed_before_terminal_response_event' ||
+      errorCause.code === 'pong_timeout')
   );
 }
 
@@ -695,6 +701,16 @@ function getResponseFormat(
     ...otherProperties,
     format: outputType,
   };
+}
+
+function getContextManagement(
+  contextManagement: ModelSettingsContextManagement | undefined,
+): unknown {
+  if (!contextManagement) {
+    return undefined;
+  }
+
+  return contextManagement.map((entry) => camelOrSnakeToSnakeCase(entry));
 }
 
 function normalizeFunctionCallOutputForRequest(
@@ -1629,17 +1645,18 @@ function converTool<_TContext = unknown>(
 function convertMCPRequireApproval(
   requireApproval: ProviderData.HostedMCPTool['require_approval'],
 ): OpenAI.Responses.Tool.Mcp.McpToolApprovalFilter | 'always' | 'never' | null {
-  if (requireApproval === 'never' || requireApproval === undefined) {
+  const normalized = normalizeHostedMcpRequireApproval(requireApproval);
+  if (normalized === 'never') {
     return 'never';
   }
 
-  if (requireApproval === 'always') {
+  if (normalized === 'always') {
     return 'always';
   }
 
   return {
-    never: { tool_names: requireApproval.never?.tool_names },
-    always: { tool_names: requireApproval.always?.tool_names },
+    never: normalized.never,
+    always: normalized.always,
   };
 }
 
@@ -3022,7 +3039,12 @@ export class OpenAIResponsesModel implements Model {
       stream,
       text: responseFormat,
       store: request.modelSettings.store,
-      prompt_cache_retention: request.modelSettings.promptCacheRetention,
+      prompt_cache_retention: normalizePromptCacheRetention(
+        request.modelSettings.promptCacheRetention,
+      ),
+      context_management: getContextManagement(
+        request.modelSettings.contextManagement,
+      ),
       ...restOfProviderData,
     };
 
@@ -3229,7 +3251,17 @@ export class OpenAIResponsesModel implements Model {
 export type OpenAIResponsesWSModelOptions = {
   websocketBaseURL?: string;
   reuseConnection?: boolean;
+  websocketOptions?: OpenAIResponsesWebSocketOptions;
 };
+
+export type OpenAIResponsesWebSocketOptions =
+  ResponsesWebSocketKeepAliveOptions;
+
+function cloneResponsesWebSocketOptions(
+  options: OpenAIResponsesWebSocketOptions | undefined,
+): OpenAIResponsesWebSocketOptions {
+  return { ...(options ?? {}) };
+}
 
 /**
  * Model implementation that uses the OpenAI Responses API over a websocket transport.
@@ -3239,6 +3271,7 @@ export type OpenAIResponsesWSModelOptions = {
 export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
   #websocketBaseURL?: string;
   #reuseConnection: boolean;
+  #websocketOptions: OpenAIResponsesWebSocketOptions;
   #wsConnection: ResponsesWebSocketConnection | undefined;
   #wsConnectionIdentity: string | undefined;
   #wsRequestLock: Promise<void> = Promise.resolve();
@@ -3251,6 +3284,9 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
     super(client, model);
     this.#websocketBaseURL = options.websocketBaseURL;
     this.#reuseConnection = options.reuseConnection ?? true;
+    this.#websocketOptions = cloneResponsesWebSocketOptions(
+      options.websocketOptions,
+    );
   }
 
   override getRetryAdvice(
@@ -3653,6 +3689,7 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
       signal,
       connectTimeout.timeoutMs,
       connectTimeout.errorMessage,
+      this.#websocketOptions,
     );
     this.#wsConnectionIdentity = identity;
     return { connection: this.#wsConnection, reused: false };

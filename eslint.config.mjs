@@ -19,6 +19,8 @@ export default tseslint.config(
   globalIgnores([
     '**/dist/**',
     '**/node_modules/**',
+    '**/.tmp/**',
+    '**/.cache/**',
     '**/docs/.astro/**',
     'examples/realtime-next/**',
     'examples/realtime-demo/**',

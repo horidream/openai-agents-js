@@ -205,20 +205,30 @@ export function itemsToLanguageV2Messages(
     | { text: string; providerOptions: Record<string, any> }
     | undefined;
   const collapsedItems = collapseReplacedToolSearchOutputs(items);
-  const flushPendingReasonerReasoningToMessages = () => {
+  const consumePendingReasonerReasoning = () => {
     if (
       !(
         shouldIncludeReasoningContent(model, modelSettings) &&
         pendingReasonerReasoning
       )
     ) {
+      return undefined;
+    }
+
+    const pending = pendingReasonerReasoning;
+    pendingReasonerReasoning = undefined;
+    return pending;
+  };
+  const flushPendingReasonerReasoningToMessages = () => {
+    const pendingReasoning = consumePendingReasonerReasoning();
+    if (!pendingReasoning) {
       return;
     }
 
     const reasoningPart: LanguageModelV2ReasoningPart = {
       type: 'reasoning',
-      text: pendingReasonerReasoning.text,
-      providerOptions: pendingReasonerReasoning.providerOptions,
+      text: pendingReasoning.text,
+      providerOptions: pendingReasoning.providerOptions,
     };
 
     if (
@@ -228,18 +238,41 @@ export function itemsToLanguageV2Messages(
     ) {
       currentAssistantMessage.content.unshift(reasoningPart);
       currentAssistantMessage.providerOptions = {
-        ...pendingReasonerReasoning.providerOptions,
+        ...pendingReasoning.providerOptions,
         ...currentAssistantMessage.providerOptions,
       };
     } else {
       messages.push({
         role: 'assistant',
         content: [reasoningPart],
-        providerOptions: pendingReasonerReasoning.providerOptions,
+        providerOptions: pendingReasoning.providerOptions,
       });
     }
+  };
+  const appendPendingReasonerReasoningToCurrentAssistant = () => {
+    if (
+      !currentAssistantMessage ||
+      !Array.isArray(currentAssistantMessage.content) ||
+      currentAssistantMessage.role !== 'assistant'
+    ) {
+      return;
+    }
 
-    pendingReasonerReasoning = undefined;
+    const pendingReasoning = consumePendingReasonerReasoning();
+    if (!pendingReasoning) {
+      return;
+    }
+
+    // Signed reasoning blocks must be attached once before parallel tool calls.
+    currentAssistantMessage.content.push({
+      type: 'reasoning',
+      text: pendingReasoning.text,
+      providerOptions: pendingReasoning.providerOptions,
+    });
+    currentAssistantMessage.providerOptions = {
+      ...pendingReasoning.providerOptions,
+      ...currentAssistantMessage.providerOptions,
+    };
   };
 
   for (const item of collapsedItems) {
@@ -387,21 +420,7 @@ export function itemsToLanguageV2Messages(
         currentAssistantMessage.role === 'assistant'
       ) {
         // Reasoner models (e.g., DeepSeek Reasoner) require reasoning_content on tool-call messages.
-        if (
-          shouldIncludeReasoningContent(model, modelSettings) &&
-          pendingReasonerReasoning
-        ) {
-          currentAssistantMessage.content.push({
-            type: 'reasoning',
-            text: pendingReasonerReasoning.text,
-            providerOptions: pendingReasonerReasoning.providerOptions,
-          });
-          currentAssistantMessage.providerOptions = {
-            ...pendingReasonerReasoning.providerOptions,
-            ...currentAssistantMessage.providerOptions,
-          };
-          pendingReasonerReasoning = undefined;
-        }
+        appendPendingReasonerReasoningToCurrentAssistant();
         const toolName = getAiSdkToolName(item);
         toolCallNamesById.set(item.callId, toolName);
         const content: LanguageModelV2ToolCallPart = {
@@ -448,21 +467,7 @@ export function itemsToLanguageV2Messages(
         Array.isArray(currentAssistantMessage.content) &&
         currentAssistantMessage.role === 'assistant'
       ) {
-        if (
-          shouldIncludeReasoningContent(model, modelSettings) &&
-          pendingReasonerReasoning
-        ) {
-          currentAssistantMessage.content.push({
-            type: 'reasoning',
-            text: pendingReasonerReasoning.text,
-            providerOptions: pendingReasonerReasoning.providerOptions,
-          });
-          currentAssistantMessage.providerOptions = {
-            ...pendingReasonerReasoning.providerOptions,
-            ...currentAssistantMessage.providerOptions,
-          };
-          pendingReasonerReasoning = undefined;
-        }
+        appendPendingReasonerReasoningToCurrentAssistant();
         const toolCallId = resolveToolSearchCallId(item, () => {
           generatedToolSearchCallId += 1;
           return `tool_search_${generatedToolSearchCallId}`;
@@ -1746,6 +1751,7 @@ export class AiSdkModel implements Model {
       let usagePromptTokens = 0;
       let usageCompletionTokens = 0;
       let usageInputTokensDetails: Record<string, number> | undefined;
+      let usageOutputTokensDetails: Record<string, number> | undefined;
       const functionCalls: Record<
         string,
         protocol.FunctionCallItem | protocol.ToolSearchCallItem
@@ -1844,6 +1850,7 @@ export class AiSdkModel implements Model {
             usagePromptTokens = usage.inputTokens;
             usageCompletionTokens = usage.outputTokens;
             usageInputTokensDetails = usage.inputTokensDetails;
+            usageOutputTokensDetails = usage.outputTokensDetails;
             break;
           }
           case 'error': {
@@ -1918,6 +1925,11 @@ export class AiSdkModel implements Model {
                   inputTokensDetails: usageInputTokensDetails,
                 }
               : {}),
+            ...(usageOutputTokensDetails
+              ? {
+                  outputTokensDetails: usageOutputTokensDetails,
+                }
+              : {}),
           },
           output: outputs,
         },
@@ -1931,6 +1943,11 @@ export class AiSdkModel implements Model {
           ...(usageInputTokensDetails
             ? {
                 inputTokensDetails: usageInputTokensDetails,
+              }
+            : {}),
+          ...(usageOutputTokensDetails
+            ? {
+                outputTokensDetails: usageOutputTokensDetails,
               }
             : {}),
         });
@@ -2081,15 +2098,42 @@ function extractInputTokenDetails(
   };
 }
 
+function extractOutputTokenDetails(
+  usage: any,
+): Record<string, number> | undefined {
+  const outputTokens = usage?.outputTokens;
+  if (typeof outputTokens !== 'object' || outputTokens === null) {
+    return undefined;
+  }
+
+  const reasoningTokens = toUsageDetailTokenCount(
+    (outputTokens as any).reasoning,
+  );
+  const textTokens = toUsageDetailTokenCount((outputTokens as any).text);
+
+  if (typeof reasoningTokens !== 'number' && typeof textTokens !== 'number') {
+    return undefined;
+  }
+
+  return {
+    ...(typeof reasoningTokens === 'number'
+      ? { reasoning_tokens: reasoningTokens }
+      : {}),
+    ...(typeof textTokens === 'number' ? { text_tokens: textTokens } : {}),
+  };
+}
+
 function extractUsage(usage: any): {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
   inputTokensDetails?: Record<string, number>;
+  outputTokensDetails?: Record<string, number>;
 } {
   const inputTokens = extractTokenCount(usage, 'inputTokens');
   const outputTokens = extractTokenCount(usage, 'outputTokens');
   const inputTokensDetails = extractInputTokenDetails(usage);
+  const outputTokensDetails = extractOutputTokenDetails(usage);
 
   return {
     inputTokens,
@@ -2100,6 +2144,11 @@ function extractUsage(usage: any): {
           inputTokensDetails,
         }
       : {}),
+    ...(outputTokensDetails
+      ? {
+          outputTokensDetails,
+        }
+      : {}),
   };
 }
 
@@ -2107,6 +2156,7 @@ function toTracingUsage(usage: {
   inputTokens: number;
   outputTokens: number;
   inputTokensDetails?: Record<string, number>;
+  outputTokensDetails?: Record<string, number>;
 }): GenerationUsageData {
   return {
     input_tokens: usage.inputTokens,
@@ -2114,6 +2164,11 @@ function toTracingUsage(usage: {
     ...(usage.inputTokensDetails
       ? {
           input_tokens_details: usage.inputTokensDetails,
+        }
+      : {}),
+    ...(usage.outputTokensDetails
+      ? {
+          output_tokens_details: usage.outputTokensDetails,
         }
       : {}),
   };

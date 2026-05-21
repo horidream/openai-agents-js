@@ -1,5 +1,143 @@
 # @openai/agents
 
+## 0.11.4
+
+### Patch Changes
+
+- Updated dependencies [087ce4b]
+- Updated dependencies [5dd3b2f]
+- Updated dependencies [2c993cf]
+- Updated dependencies [3dc9b90]
+- Updated dependencies [f36e7b2]
+  - @openai/agents-core@0.11.4
+  - @openai/agents-openai@0.11.4
+  - @openai/agents-realtime@0.11.4
+
+## 0.11.3
+
+### Patch Changes
+
+- Updated dependencies [2d39801]
+  - @openai/agents-core@0.11.3
+  - @openai/agents-openai@0.11.3
+  - @openai/agents-realtime@0.11.3
+
+## 0.11.2
+
+### Patch Changes
+
+- 22461f2: fix: align Chat Completions strict validation for unsupported stream outputs
+- aee260e: fix: add opt-in strict feature validation for Chat Completions models
+- Updated dependencies [22461f2]
+- Updated dependencies [3f855d4]
+- Updated dependencies [077876e]
+- Updated dependencies [aee260e]
+- Updated dependencies [9e6d1e3]
+- Updated dependencies [2b5c8d2]
+- Updated dependencies [398b21f]
+- Updated dependencies [8e59259]
+- Updated dependencies [c5731d1]
+- Updated dependencies [81508e8]
+- Updated dependencies [8d2f707]
+- Updated dependencies [454f0b7]
+- Updated dependencies [6883833]
+- Updated dependencies [a3d28b1]
+- Updated dependencies [b0d2a68]
+  - @openai/agents-openai@0.11.2
+  - @openai/agents-core@0.11.2
+  - @openai/agents-realtime@0.11.2
+
+## 0.11.1
+
+### Patch Changes
+
+- Updated dependencies [e4a7557]
+- Updated dependencies [1a61a5c]
+  - @openai/agents-core@0.11.1
+  - @openai/agents-openai@0.11.1
+  - @openai/agents-realtime@0.11.1
+
+## 0.11.0
+
+### Minor Changes
+
+- 295229c: fix: upgrade realtime defaults and model support for gpt-realtime-2
+
+### Patch Changes
+
+- Updated dependencies [eb81397]
+- Updated dependencies [295229c]
+  - @openai/agents-core@0.11.0
+  - @openai/agents-openai@0.11.0
+  - @openai/agents-realtime@0.11.0
+
+## 0.10.1
+
+### Patch Changes
+
+- Updated dependencies [4dc2614]
+- Updated dependencies [0cd060f]
+  - @openai/agents-openai@0.10.1
+  - @openai/agents-core@0.10.1
+  - @openai/agents-realtime@0.10.1
+
+## 0.10.0
+
+### Minor Changes
+
+- 2e7e48a: feat: switch the default model to gpt-5.4-mini
+
+### Patch Changes
+
+- 3546add: feat: allow maxTurns null to disable turn limits
+- 0e7cbf0: feat: add function tool execution concurrency config
+- d31526b: feat: accept manifest init shorthands in sandbox configuration
+- 0630108: feat: align local MCP config with the Python SDK
+- Updated dependencies [3546add]
+- Updated dependencies [0e7cbf0]
+- Updated dependencies [2e7e48a]
+- Updated dependencies [d31526b]
+- Updated dependencies [0630108]
+  - @openai/agents-core@0.10.0
+  - @openai/agents-openai@0.10.0
+  - @openai/agents-realtime@0.10.0
+
+## 0.9.1
+
+### Patch Changes
+
+- dde1037: fix: preserve duplicate-name agent identity in RunState serialization
+- Updated dependencies [06f425a]
+- Updated dependencies [dde1037]
+- Updated dependencies [a081190]
+  - @openai/agents-core@0.9.1
+  - @openai/agents-openai@0.9.1
+  - @openai/agents-realtime@0.9.1
+
+## 0.9.0
+
+### Minor Changes
+
+- 00b4032: fix: align sandbox mounts with Python and protect rclone credentials
+- 2e1d626: feat: add sandbox agents core runtime and extension provider package groundwork
+
+### Patch Changes
+
+- 21de64d: docs: highlight sandbox agents in the package README.
+- Updated dependencies [00b4032]
+- Updated dependencies [6148ed2]
+- Updated dependencies [2e1d626]
+- Updated dependencies [16c26e7]
+- Updated dependencies [2d2501a]
+- Updated dependencies [6e50eca]
+- Updated dependencies [a34f506]
+- Updated dependencies [5eddaaa]
+- Updated dependencies [30681be]
+- Updated dependencies [4a879bb]
+  - @openai/agents-core@0.9.0
+  - @openai/agents-openai@0.9.0
+  - @openai/agents-realtime@0.9.0
+
 ## 0.8.5
 
 ### Patch Changes

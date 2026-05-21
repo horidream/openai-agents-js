@@ -370,6 +370,78 @@ describe('Trace & Span lifecycle', () => {
     onSpy.mockRestore();
   });
 
+  it('does not force exit when beforeExit tracing cleanup times out', async () => {
+    vi.useFakeTimers();
+    allowConsole(['warn']);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('process.exit should not be called');
+    }) as never);
+    const onceSpy = vi.spyOn(process, 'once');
+    const onSpy = vi.spyOn(process, 'on');
+
+    try {
+      const provider = new TraceProvider();
+      const processor = new TestProcessor();
+      processor.shutdown = vi.fn(
+        () => new Promise<void>(() => {}),
+      ) as TestProcessor['shutdown'];
+      provider.setProcessors([processor]);
+
+      const beforeExitListener = onceSpy.mock.calls.find(
+        ([event]) => event === 'beforeExit',
+      )?.[1];
+      expect(beforeExitListener).toEqual(expect.any(Function));
+
+      const cleanupPromise =
+        typeof beforeExitListener === 'function'
+          ? beforeExitListener(0 as never)
+          : Promise.resolve();
+      await vi.advanceTimersByTimeAsync(5000);
+      await cleanupPromise;
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        'Tracing cleanup timed out; continuing exit',
+      );
+      expect(processor.shutdown).toHaveBeenCalledWith(5000);
+      expect(exitSpy).not.toHaveBeenCalled();
+
+      if (typeof beforeExitListener === 'function') {
+        process.off('beforeExit', beforeExitListener);
+      }
+      for (const [event, listener] of onSpy.mock.calls) {
+        if (
+          (event === 'SIGINT' ||
+            event === 'SIGTERM' ||
+            event === 'unhandledRejection') &&
+          typeof listener === 'function'
+        ) {
+          process.off(event, listener);
+        }
+      }
+    } finally {
+      warnSpy.mockRestore();
+      exitSpy.mockRestore();
+      onceSpy.mockRestore();
+      onSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears shutdown timeout when tracing buffer is empty', async () => {
+    vi.useFakeTimers();
+
+    try {
+      const processor = new BatchTraceProcessor(new TestExporter());
+
+      await processor.shutdown(5000);
+
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('falls back to module provider when global registration fails', () => {
     const symbol = Symbol.for('openai.agents.core.traceProvider');
     const globalHolder = globalThis as unknown as Record<
@@ -657,6 +729,50 @@ describe('BatchTraceProcessor', () => {
     vi.useRealTimers();
   });
 
+  it('continues scheduled exports after an exporter exception', async () => {
+    vi.useFakeTimers();
+    const errorSpy = vi.spyOn(coreLogger, 'error').mockImplementation(() => {});
+    try {
+      let exportCalls = 0;
+      const exported: Array<(Trace | Span<any>)[]> = [];
+      const flakyExporter: TracingExporter = {
+        export: async (items) => {
+          exportCalls += 1;
+          if (exportCalls === 1) {
+            throw new Error('simulated exporter failure');
+          }
+          exported.push([...items]);
+        },
+      };
+      const processor = new BatchTraceProcessor(flakyExporter, {
+        maxQueueSize: 10,
+        maxBatchSize: 1,
+        scheduleDelay: 50,
+      });
+      const failed = new Trace({ name: 'failed' });
+      const recovered = new Trace({ name: 'recovered' });
+
+      await processor.onTraceStart(failed);
+      await vi.advanceTimersByTimeAsync(60);
+      expect(exportCalls).toBe(1);
+      expect(errorSpy).toHaveBeenCalledWith(
+        'Tracing exporter failed to export batch',
+        expect.any(Error),
+      );
+
+      await processor.onTraceStart(recovered);
+      await vi.advanceTimersByTimeAsync(60);
+
+      expect(exportCalls).toBe(2);
+      expect(exported).toEqual([[recovered]]);
+
+      await processor.shutdown();
+    } finally {
+      errorSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('waits while an export is in progress during shutdown', async () => {
     vi.useFakeTimers();
     try {
@@ -753,6 +869,84 @@ describe('BatchTraceProcessor', () => {
 
     debugSpy.mockRestore();
     vi.useRealTimers();
+  });
+
+  it('passes an abort signal to exporter during timed shutdown', async () => {
+    vi.useFakeTimers();
+    let exportSignal: AbortSignal | undefined;
+    let resolveExport: (() => void) | undefined;
+    const exporter: TracingExporter = {
+      export: async (_items, signal) => {
+        exportSignal = signal;
+        await new Promise<void>((resolve) => {
+          resolveExport = resolve;
+        });
+      },
+    };
+    const processor = new BatchTraceProcessor(exporter, {
+      maxQueueSize: 10,
+      maxBatchSize: 5,
+      scheduleDelay: 10000,
+    });
+
+    try {
+      await processor.onTraceStart(new Trace({ name: 'abortable-export' }));
+      const shutdownPromise = processor.shutdown(1);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(exportSignal).toBeDefined();
+      expect(exportSignal?.aborted).toBe(true);
+
+      resolveExport?.();
+      await shutdownPromise;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('aborts active exports when timed shutdown elapses', async () => {
+    vi.useFakeTimers();
+    let exportSignal: AbortSignal | undefined;
+    let exportCalls = 0;
+    const exporter: TracingExporter = {
+      export: async (_items, signal) => {
+        exportCalls += 1;
+        exportSignal = signal;
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve();
+            return;
+          }
+          signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+      },
+    };
+    const processor = new BatchTraceProcessor(exporter, {
+      maxQueueSize: 10,
+      maxBatchSize: 5,
+      exportTriggerRatio: 0.1,
+      scheduleDelay: 10000,
+    });
+
+    try {
+      await processor.onTraceStart(new Trace({ name: 'queued' }));
+      const activeExport = processor.onTraceStart(
+        new Trace({ name: 'trigger-export' }),
+      );
+
+      expect(exportCalls).toBe(1);
+      expect(exportSignal).toBeDefined();
+
+      const shutdownPromise = processor.shutdown(1);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(exportSignal?.aborted).toBe(true);
+      await activeExport;
+      await shutdownPromise;
+      expect(exportCalls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -1029,6 +1223,7 @@ describe('TraceProvider disabled behavior', () => {
 
     const trace = provider.createTrace({ name: 'disabled' });
     expect(trace).toBeInstanceOf(NoopTrace);
+    expect(trace.traceId).toBe('no-op');
 
     const span = provider.createSpan(
       {
@@ -1045,6 +1240,9 @@ describe('TraceProvider span creation without parents', () => {
     const loggerError = vi
       .spyOn(coreLogger, 'error')
       .mockImplementation(() => {});
+    const loggerDebug = vi
+      .spyOn(coreLogger, 'debug')
+      .mockImplementation(() => {});
     const provider = new TraceProvider();
     provider.setDisabled(false);
 
@@ -1052,6 +1250,11 @@ describe('TraceProvider span creation without parents', () => {
       data: { type: 'custom', name: 'no-trace', data: {} },
     });
     expect(span).toBeInstanceOf(NoopSpan);
+    expect(loggerDebug).toHaveBeenCalledWith(
+      'No active trace. Make sure to start a trace with `withTrace()` first. Returning NoopSpan.',
+    );
+    expect(loggerError).not.toHaveBeenCalled();
+    loggerDebug.mockRestore();
     loggerError.mockRestore();
   });
 
@@ -1082,6 +1285,16 @@ describe('TraceProvider span creation without parents', () => {
     );
     expect(fromTrace).toBeInstanceOf(NoopSpan);
 
+    const traceWithNoopId = new Trace({
+      name: 'noop-trace-id',
+      traceId: 'no-op',
+    });
+    const fromTraceId = provider.createSpan(
+      { data: { type: 'custom', name: 'noop-trace-id', data: {} } },
+      traceWithNoopId,
+    );
+    expect(fromTraceId).toBeInstanceOf(NoopSpan);
+
     const noopSpan = new NoopSpan(
       { type: 'custom', name: 'noop-span', data: {} },
       new TestProcessor(),
@@ -1091,6 +1304,52 @@ describe('TraceProvider span creation without parents', () => {
       noopSpan,
     );
     expect(fromSpan).toBeInstanceOf(NoopSpan);
+  });
+
+  it('returns NoopSpan when the span id is the no-op sentinel', async () => {
+    const provider = getGlobalTraceProvider();
+    provider.setDisabled(false);
+
+    await withTrace('active-trace', async () => {
+      const span = provider.createSpan({
+        data: { type: 'custom', name: 'noop-id', data: {} },
+        spanId: 'no-op',
+      });
+      expect(span).toBeInstanceOf(NoopSpan);
+    });
+
+    provider.setDisabled(true);
+  });
+
+  it('returns NoopSpan when the parent span id is the no-op sentinel', async () => {
+    const provider = getGlobalTraceProvider();
+    provider.setDisabled(false);
+
+    await withTrace('active-trace', async () => {
+      const currentTrace = getCurrentTrace();
+      expect(currentTrace).not.toBeNull();
+
+      const parentSpan = new Span(
+        {
+          traceId: currentTrace!.traceId,
+          spanId: 'no-op',
+          data: { type: 'custom', name: 'noop-parent-id', data: {} },
+        },
+        new TestProcessor(),
+      );
+      setCurrentSpan(parentSpan);
+
+      try {
+        const span = provider.createSpan({
+          data: { type: 'custom', name: 'child', data: {} },
+        });
+        expect(span).toBeInstanceOf(NoopSpan);
+      } finally {
+        resetCurrentSpan();
+      }
+    });
+
+    provider.setDisabled(true);
   });
 
   it('returns NoopSpan when span options are disabled', () => {

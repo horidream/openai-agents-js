@@ -43,7 +43,7 @@ import { Computer } from '../computer';
 import type { ApplyPatchResult } from '../editor';
 import { RunState } from '../runState';
 import type { AgentInputItem, UnknownContext } from '../types';
-import type { Runner, ToolErrorFormatter } from '../run';
+import type { RunConfig, Runner, ToolErrorFormatter } from '../run';
 import {
   getFunctionToolQualifiedName,
   matchesFunctionToolName,
@@ -70,6 +70,7 @@ type FunctionToolCallDeps<TContext = UnknownContext> = {
   runner: Runner;
   state: RunState<TContext, Agent<TContext, any>>;
   toolErrorFormatter?: ToolErrorFormatter;
+  agentToolParentRunConfig?: Partial<RunConfig>;
 };
 
 const REDACTED_TOOL_ERROR_MESSAGE =
@@ -172,34 +173,42 @@ export async function executeFunctionToolCalls<TContext = UnknownContext>(
   runner: Runner,
   state: RunState<TContext, Agent<TContext, any>>,
   toolErrorFormatter?: ToolErrorFormatter,
+  agentToolParentRunConfig?: Partial<RunConfig>,
 ): Promise<FunctionToolResult<TContext>[]> {
   const deps: FunctionToolCallDeps<TContext> = {
     agent,
     runner,
     state,
     toolErrorFormatter,
+    agentToolParentRunConfig,
+  };
+
+  const executeToolRun = async (toolRun: ToolRunFunction<TContext>) => {
+    const parseResult = parseToolArguments(toolRun);
+
+    // Handle parse errors gracefully instead of crashing.
+    if (!parseResult.success) {
+      return buildParseErrorResult(deps, toolRun, parseResult.error);
+    }
+
+    const approvalOutcome = await handleFunctionApproval(
+      deps,
+      toolRun,
+      parseResult.args,
+    );
+    if (approvalOutcome !== 'approved') {
+      return approvalOutcome;
+    }
+    return runApprovedFunctionTool(deps, toolRun);
   };
 
   try {
-    const results = await Promise.all(
-      toolRuns.map(async (toolRun) => {
-        const parseResult = parseToolArguments(toolRun);
-
-        // Handle parse errors gracefully instead of crashing
-        if (!parseResult.success) {
-          return buildParseErrorResult(deps, toolRun, parseResult.error);
-        }
-
-        const approvalOutcome = await handleFunctionApproval(
-          deps,
-          toolRun,
-          parseResult.args,
-        );
-        if (approvalOutcome !== 'approved') {
-          return approvalOutcome;
-        }
-        return runApprovedFunctionTool(deps, toolRun);
-      }),
+    const results = await executeToolRunsWithConcurrency(
+      toolRuns,
+      getMaxFunctionToolConcurrency(
+        agentToolParentRunConfig?.toolExecution ?? runner.config.toolExecution,
+      ),
+      executeToolRun,
     );
     return results;
   } catch (e: unknown) {
@@ -214,6 +223,55 @@ export async function executeFunctionToolCalls<TContext = UnknownContext>(
       state,
     );
   }
+}
+
+function getMaxFunctionToolConcurrency(
+  toolExecution: RunConfig['toolExecution'] | undefined,
+): number | undefined {
+  return toolExecution?.maxFunctionToolConcurrency ?? undefined;
+}
+
+async function executeToolRunsWithConcurrency<TContext>(
+  toolRuns: ToolRunFunction<TContext>[],
+  maxConcurrency: number | undefined,
+  executeToolRun: (
+    toolRun: ToolRunFunction<TContext>,
+  ) => Promise<FunctionToolResult<TContext>>,
+): Promise<FunctionToolResult<TContext>[]> {
+  if (
+    maxConcurrency === undefined ||
+    maxConcurrency >= toolRuns.length ||
+    toolRuns.length <= 1
+  ) {
+    return Promise.all(toolRuns.map((toolRun) => executeToolRun(toolRun)));
+  }
+
+  const results: FunctionToolResult<TContext>[] = [];
+  let nextIndex = 0;
+  let firstError: unknown;
+
+  const worker = async () => {
+    while (nextIndex < toolRuns.length && firstError === undefined) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      try {
+        results[currentIndex] = await executeToolRun(toolRuns[currentIndex]);
+      } catch (error) {
+        firstError ??= error;
+        break;
+      }
+    }
+  };
+
+  const workerCount = Math.min(maxConcurrency, toolRuns.length);
+  await Promise.allSettled(
+    Array.from({ length: workerCount }, async () => worker()),
+  );
+
+  if (firstError !== undefined) {
+    throw firstError;
+  }
+  return results;
 }
 
 function parseToolArguments<TContext>(
@@ -350,7 +408,7 @@ async function runApprovedFunctionTool<TContext>(
   deps: FunctionToolCallDeps<TContext>,
   toolRun: ToolRunFunction<TContext>,
 ): Promise<FunctionToolResult<TContext>> {
-  const { agent, runner, state } = deps;
+  const { agent, runner, state, agentToolParentRunConfig } = deps;
   const toolName = getFunctionToolIdentity(toolRun);
   const traceToolName = getFunctionToolTraceName(toolRun);
   return withToolFunctionSpan(runner, traceToolName, async (span) => {
@@ -389,7 +447,10 @@ async function runApprovedFunctionTool<TContext>(
           toolCall: toolRun.toolCall,
           resumeState,
         };
-        setAgentToolParentRunConfigOnDetails(toolDetails, runner.config);
+        setAgentToolParentRunConfigOnDetails(
+          toolDetails,
+          agentToolParentRunConfig ?? runner.config,
+        );
         toolOutput = await invokeFunctionTool({
           tool: toolRun.tool,
           runContext: state._context,
@@ -576,6 +637,11 @@ async function withToolFunctionSpan<T>(
 
 type ApprovalResolution = 'approved' | 'rejected' | 'pending';
 
+type LocalApprovalDecision = {
+  approve?: boolean;
+  reason?: string;
+};
+
 async function resolveToolApproval(options: {
   runContext: RunContext;
   toolName: string;
@@ -586,7 +652,7 @@ async function resolveToolApproval(options: {
     | ((
         runContext: RunContext,
         approvalItem: RunToolApprovalItem,
-      ) => Promise<{ approve?: boolean }>)
+      ) => Promise<LocalApprovalDecision>)
     | undefined;
 }): Promise<ApprovalResolution> {
   const {
@@ -607,7 +673,14 @@ async function resolveToolApproval(options: {
     if (decision.approve === true) {
       runContext.approveTool(approvalItem);
     } else if (decision.approve === false) {
-      runContext.rejectTool(approvalItem);
+      const reason =
+        typeof decision.reason === 'string' && decision.reason.length > 0
+          ? decision.reason
+          : undefined;
+      runContext.rejectTool(
+        approvalItem,
+        reason === undefined ? undefined : { message: reason },
+      );
     }
   }
 
@@ -639,7 +712,7 @@ async function handleToolApprovalDecision(options: {
     | ((
         runContext: RunContext,
         approvalItem: RunToolApprovalItem,
-      ) => Promise<{ approve?: boolean }>)
+      ) => Promise<LocalApprovalDecision>)
     | undefined;
   buildRejectionItem: () => Promise<RunItem> | RunItem;
 }): Promise<ApprovalDecisionResult> {
@@ -698,6 +771,16 @@ function emitToolEnd(
   }
 }
 
+function getToolCallKey(toolCall: protocol.ToolCallItem): string | undefined {
+  if ('callId' in toolCall && typeof toolCall.callId === 'string') {
+    return toolCall.callId;
+  }
+  if ('id' in toolCall && typeof toolCall.id === 'string') {
+    return toolCall.id;
+  }
+  return undefined;
+}
+
 export async function executeShellActions(
   agent: Agent<any, any>,
   actions: ToolRunShell[],
@@ -712,6 +795,7 @@ export async function executeShellActions(
   for (const action of actions) {
     const shellTool = action.shell;
     const toolCall = action.toolCall;
+    const toolCallKey = getToolCallKey(toolCall) ?? toolCall.callId;
     if (!shellTool.shell) {
       _logger.warn(
         `Skipping shell action for tool "${shellTool.name}" because no local shell implementation is configured.`,
@@ -726,12 +810,12 @@ export async function executeShellActions(
     const approvalDecision = await handleToolApprovalDecision({
       runContext,
       toolName: shellTool.name,
-      callId: toolCall.callId,
+      callId: toolCallKey,
       approvalItem,
       needsApproval: await shellTool.needsApproval(
         runContext,
         toolCall.action,
-        toolCall.callId,
+        toolCallKey,
       ),
       onApproval: shellTool.onApproval,
       buildRejectionItem: async () => {
@@ -739,7 +823,7 @@ export async function executeShellActions(
           runContext,
           toolType: 'shell',
           toolName: shellTool.name,
-          callId: toolCall.callId,
+          callId: toolCallKey,
           toolErrorFormatter,
         });
         const rejectionOutput: protocol.ShellCallOutputContent = {
@@ -750,7 +834,7 @@ export async function executeShellActions(
         return new RunToolCallOutputItem(
           {
             type: 'shell_call_output',
-            callId: toolCall.callId,
+            callId: toolCallKey,
             output: [rejectionOutput],
           },
           agent,
@@ -822,7 +906,7 @@ export async function executeShellActions(
 
         const rawItem: protocol.ShellCallResultItem = {
           type: 'shell_call_output',
-          callId: toolCall.callId,
+          callId: toolCallKey,
           output: shellOutputs ?? [],
         };
 
@@ -858,6 +942,7 @@ export async function executeApplyPatchOperations(
   for (const action of actions) {
     const applyPatchTool = action.applyPatch;
     const toolCall = action.toolCall;
+    const toolCallKey = getToolCallKey(toolCall) ?? toolCall.callId;
     const editorContext = { runContext };
     const approvalItem = new RunToolApprovalItem(
       toolCall,
@@ -867,12 +952,12 @@ export async function executeApplyPatchOperations(
     const approvalDecision = await handleToolApprovalDecision({
       runContext,
       toolName: applyPatchTool.name,
-      callId: toolCall.callId,
+      callId: toolCallKey,
       approvalItem,
       needsApproval: await applyPatchTool.needsApproval(
         runContext,
         toolCall.operation,
-        toolCall.callId,
+        toolCallKey,
       ),
       onApproval: applyPatchTool.onApproval,
       buildRejectionItem: async () => {
@@ -880,13 +965,13 @@ export async function executeApplyPatchOperations(
           runContext,
           toolType: 'apply_patch',
           toolName: applyPatchTool.name,
-          callId: toolCall.callId,
+          callId: toolCallKey,
           toolErrorFormatter,
         });
         return new RunToolCallOutputItem(
           {
             type: 'apply_patch_call_output',
-            callId: toolCall.callId,
+            callId: toolCallKey,
             status: 'failed',
             output: response,
           },
@@ -978,7 +1063,7 @@ export async function executeApplyPatchOperations(
 
         const rawItem: protocol.ApplyPatchCallResultItem = {
           type: 'apply_patch_call_output',
-          callId: toolCall.callId,
+          callId: toolCallKey,
           status,
         };
 

@@ -2,7 +2,7 @@
   "name": "@openai/agents",
   "repository": "https://github.com/openai/openai-agents-js",
   "homepage": "https://openai.github.io/openai-agents-js/",
-  "version": "0.8.5",
+  "version": "0.11.4",
   "description": "The OpenAI Agents SDK is a lightweight yet powerful framework for building multi-agent workflows.",
   "author": "OpenAI <support@openai.com>",
   "main": "dist/index.js",
@@ -12,6 +12,16 @@
       "types": "./dist/index.d.ts",
       "require": "./dist/index.js",
       "import": "./dist/index.mjs"
+    },
+    "./sandbox": {
+      "types": "./dist/sandbox/index.d.ts",
+      "require": "./dist/sandbox/index.js",
+      "import": "./dist/sandbox/index.mjs"
+    },
+    "./sandbox/local": {
+      "types": "./dist/sandbox/local.d.ts",
+      "require": "./dist/sandbox/local.js",
+      "import": "./dist/sandbox/local.mjs"
     },
     "./realtime": {
       "types": "./dist/realtime/index.d.ts",
@@ -35,7 +45,7 @@
     "@openai/agents-openai": "workspace:*",
     "@openai/agents-realtime": "workspace:*",
     "debug": "^4.4.0",
-    "openai": "^6.26.0"
+    "openai": "^6.35.0"
   },
   "keywords": [
     "openai",
@@ -56,6 +66,12 @@
   ],
   "typesVersions": {
     "*": {
+      "sandbox": [
+        "dist/sandbox/index.d.ts"
+      ],
+      "sandbox/local": [
+        "dist/sandbox/local.d.ts"
+      ],
       "realtime": [
         "dist/realtime/index.d.ts"
       ],

@@ -36,6 +36,7 @@ import {
 } from './openaiChatCompletionsConverter';
 import { protocol } from '@openai/agents-core';
 import { getOpenAIRetryAdvice } from './retryAdvice';
+import { normalizePromptCacheRetention } from './utils/modelSettings';
 
 export const FAKE_ID = 'FAKE_ID';
 
@@ -59,12 +60,30 @@ function hasReasoningContent(
 /**
  * A model that uses (or is compatible with) OpenAI's Chat Completions API.
  */
+export type OpenAIChatCompletionsModelOptions = {
+  /**
+   * When true, reject Responses-only features that Chat Completions cannot
+   * honor. Defaults to false, which preserves the previous ignore-and-warn
+   * behavior.
+   */
+  strictFeatureValidation?: boolean;
+};
+
 export class OpenAIChatCompletionsModel implements Model {
   #client: OpenAI;
   #model: string;
-  constructor(client: OpenAI, model: string) {
+  #strictFeatureValidation: boolean;
+  #hasWarnedUnsupportedPrompt = false;
+  #hasWarnedUnsupportedConversationState = false;
+
+  constructor(
+    client: OpenAI,
+    model: string,
+    options: OpenAIChatCompletionsModelOptions = {},
+  ) {
     this.#client = client;
     this.#model = model;
+    this.#strictFeatureValidation = options.strictFeatureValidation ?? false;
   }
 
   getRetryAdvice(args: ModelRetryAdviceRequest): ModelRetryAdvice | undefined {
@@ -72,6 +91,9 @@ export class OpenAIChatCompletionsModel implements Model {
   }
 
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    this.#handleUnsupportedServerManagedConversationState(request);
+    this.#handleUnsupportedPrompt(request);
+
     const response = await withGenerationSpan(async (span) => {
       span.spanData.model = this.#model;
       span.spanData.model_config = request.modelSettings
@@ -182,6 +204,12 @@ export class OpenAIChatCompletionsModel implements Model {
                 ...remainingFunctionData,
               },
             });
+          } else if (tool_call.type === 'custom') {
+            if (this.#strictFeatureValidation) {
+              throw new UserError(
+                'Custom tool calls are not supported by the Chat Completions converter.',
+              );
+            }
           }
         }
       }
@@ -201,6 +229,9 @@ export class OpenAIChatCompletionsModel implements Model {
   async *getStreamedResponse(
     request: ModelRequest,
   ): AsyncIterable<ResponseStreamEvent> {
+    this.#handleUnsupportedServerManagedConversationState(request);
+    this.#handleUnsupportedPrompt(request);
+
     const span = request.tracing ? createGenerationSpan() : undefined;
     try {
       if (span) {
@@ -224,6 +255,7 @@ export class OpenAIChatCompletionsModel implements Model {
       for await (const event of convertChatCompletionsStreamToResponses(
         response,
         stream,
+        { strictFeatureValidation: this.#strictFeatureValidation },
       )) {
         if (
           event.type === 'response_done' &&
@@ -271,6 +303,59 @@ export class OpenAIChatCompletionsModel implements Model {
         span.end();
         resetCurrentSpan();
       }
+    }
+  }
+
+  #handleUnsupportedServerManagedConversationState(request: ModelRequest) {
+    const unsupported: string[] = [];
+    if (request.previousResponseId) {
+      unsupported.push('previousResponseId');
+    }
+    if (request.conversationId) {
+      unsupported.push('conversationId');
+    }
+
+    if (unsupported.length === 0) {
+      return;
+    }
+
+    const message =
+      'OpenAIChatCompletionsModel does not support server-managed conversation state ' +
+      `(${unsupported.join(', ')}). Chat Completions requires callers to pass the full ` +
+      'conversation history; use a Responses API model for previousResponseId or a ' +
+      'conversation-capable model for conversationId.';
+
+    if (this.#strictFeatureValidation) {
+      throw new UserError(message);
+    }
+
+    if (!this.#hasWarnedUnsupportedConversationState) {
+      logger.warn(
+        `${message} Ignoring unsupported server-managed conversation state; ` +
+          'enable strict feature validation to raise an error instead.',
+      );
+      this.#hasWarnedUnsupportedConversationState = true;
+    }
+  }
+
+  #handleUnsupportedPrompt(request: ModelRequest) {
+    if (!request.prompt) {
+      return;
+    }
+
+    const message =
+      'Reusable prompts are only supported by the Responses API. ' +
+      'OpenAIChatCompletionsModel does not support prompt; use a Responses model instead.';
+
+    if (this.#strictFeatureValidation) {
+      throw new UserError(message);
+    }
+
+    if (!this.#hasWarnedUnsupportedPrompt) {
+      logger.warn(
+        `${message} Ignoring prompt; enable strict feature validation to raise an error instead.`,
+      );
+      this.#hasWarnedUnsupportedPrompt = true;
     }
   }
 
@@ -332,7 +417,9 @@ export class OpenAIChatCompletionsModel implements Model {
       parallelToolCalls = request.modelSettings.parallelToolCalls;
     }
 
-    const messages = itemsToMessages(request.input);
+    const messages = itemsToMessages(request.input, {
+      strictFeatureValidation: this.#strictFeatureValidation,
+    });
     if (request.systemInstructions) {
       messages.unshift({
         content: request.systemInstructions,
@@ -380,7 +467,9 @@ export class OpenAIChatCompletionsModel implements Model {
       stream: stream ? true : false,
       stream_options: stream ? { include_usage: true } : undefined,
       store: request.modelSettings.store,
-      prompt_cache_retention: request.modelSettings.promptCacheRetention,
+      prompt_cache_retention: normalizePromptCacheRetention(
+        request.modelSettings.promptCacheRetention,
+      ),
       ...providerData,
     };
 

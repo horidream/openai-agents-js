@@ -9,6 +9,18 @@ export type SessionInputCallback = (
   newItems: AgentInputItem[],
 ) => AgentInputItem[] | Promise<AgentInputItem[]>;
 
+export type SessionHistoryReplaceFunctionCallMutation = {
+  type: 'replace_function_call';
+  callId: string;
+  replacement: Extract<AgentInputItem, { type: 'function_call' }>;
+};
+
+export type SessionHistoryMutation = SessionHistoryReplaceFunctionCallMutation;
+
+export type SessionHistoryRewriteArgs = {
+  mutations: SessionHistoryMutation[];
+};
+
 /**
  * Interface representing a persistent session store for conversation history.
  */
@@ -27,6 +39,22 @@ export interface Session {
   getItems(limit?: number): Promise<AgentInputItem[]>;
 
   /**
+   * Optionally rewrite a stored history item before it is sent back to the model.
+   *
+   * Session implementations can use this to strip provider-managed replay metadata while
+   * preserving their public `getItems()` shape for UI and deletion workflows.
+   */
+  prepareHistoryItemForModelInput?(item: AgentInputItem): AgentInputItem;
+
+  /**
+   * Optionally preserve reasoning item IDs when persisting generated output.
+   *
+   * Some remote session stores require provider-assigned reasoning identities to accept stored
+   * reasoning items, even when model replay should omit those IDs.
+   */
+  preserveReasoningItemIdsForPersistence?(): boolean;
+
+  /**
    * Append new items to the conversation history.
    *
    * @param items - Items to add to the session history.
@@ -43,6 +71,10 @@ export interface Session {
    * Remove all items that belong to the session and reset its state.
    */
   clearSession(): Promise<void>;
+}
+
+export interface SessionHistoryRewriteAwareSession extends Session {
+  applyHistoryMutations(args: SessionHistoryRewriteArgs): Promise<void> | void;
 }
 
 /**
@@ -102,5 +134,15 @@ export function isOpenAIResponsesCompactionAwareSession(
     !!session &&
     typeof (session as OpenAIResponsesCompactionAwareSession).runCompaction ===
       'function'
+  );
+}
+
+export function isSessionHistoryRewriteAwareSession(
+  session: Session | undefined,
+): session is SessionHistoryRewriteAwareSession {
+  return (
+    !!session &&
+    typeof (session as SessionHistoryRewriteAwareSession)
+      .applyHistoryMutations === 'function'
   );
 }

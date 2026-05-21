@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { withTrace, setTracingDisabled } from '@openai/agents-core';
 import { OpenAIChatCompletionsModel } from '../src/openaiChatCompletionsModel';
 import { HEADERS } from '../src/defaults';
+import logger from '../src/logger';
 
 vi.mock('../src/openaiChatCompletionsStreaming', () => {
   return {
@@ -77,6 +78,206 @@ describe('OpenAIChatCompletionsModel', () => {
         ],
       },
     ]);
+  });
+
+  it('sends placeholder for non-text-only tool output by default', async () => {
+    const client = new FakeClient();
+    const response = {
+      id: 'r',
+      choices: [{ message: { content: 'ok' } }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    } as any;
+    client.chat.completions.create.mockResolvedValue(response);
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    const req: any = {
+      input: [
+        {
+          type: 'function_call_result',
+          id: '2',
+          callId: 'call_image',
+          name: 'f',
+          status: 'completed',
+          output: [
+            {
+              type: 'input_image',
+              image: 'https://example.com/image.png',
+            },
+          ],
+        },
+      ],
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+    };
+
+    await withTrace('t', () => model.getResponse(req));
+
+    expect(client.chat.completions.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messages: [
+          {
+            role: 'tool',
+            tool_call_id: 'call_image',
+            content: '[tool output omitted]',
+          },
+        ],
+      }),
+      { headers: HEADERS, signal: undefined },
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Replacing the tool output with a placeholder'),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it('rejects non-text-only tool output in strict mode before sending a request', async () => {
+    const client = new FakeClient();
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt', {
+      strictFeatureValidation: true,
+    });
+    const req: any = {
+      input: [
+        {
+          type: 'function_call_result',
+          id: '2',
+          callId: 'call_image',
+          name: 'f',
+          status: 'completed',
+          output: [
+            {
+              type: 'input_image',
+              image: 'https://example.com/image.png',
+            },
+          ],
+        },
+      ],
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+    };
+
+    await expect(withTrace('t', () => model.getResponse(req))).rejects.toThrow(
+      /cannot be empty or contain only non-text content/,
+    );
+    expect(client.chat.completions.create).not.toHaveBeenCalled();
+  });
+
+  it('warns and ignores server-managed conversation state by default', async () => {
+    const client = new FakeClient();
+    const response = {
+      id: 'r',
+      choices: [{ message: { content: 'hi' } }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    } as any;
+    client.chat.completions.create.mockResolvedValue(response);
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    const req: any = {
+      input: 'u',
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+      previousResponseId: 'resp_123',
+      conversationId: 'conv_123',
+    };
+
+    await withTrace('t', () => model.getResponse(req));
+    await withTrace('t', () => model.getResponse(req));
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0]?.[0]).toContain(
+      'server-managed conversation state',
+    );
+    expect(warnSpy.mock.calls[0]?.[0]).toContain('previousResponseId');
+    expect(warnSpy.mock.calls[0]?.[0]).toContain('conversationId');
+    expect(client.chat.completions.create).toHaveBeenCalledTimes(2);
+    warnSpy.mockRestore();
+  });
+
+  it('throws for server-managed conversation state in strict mode', async () => {
+    const client = new FakeClient();
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt', {
+      strictFeatureValidation: true,
+    });
+    const req: any = {
+      input: 'u',
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+      previousResponseId: 'resp_123',
+    };
+
+    await expect(withTrace('t', () => model.getResponse(req))).rejects.toThrow(
+      'server-managed conversation state',
+    );
+    expect(client.chat.completions.create).not.toHaveBeenCalled();
+  });
+
+  it('warns and ignores reusable prompts by default', async () => {
+    const client = new FakeClient();
+    const response = {
+      id: 'r',
+      choices: [{ message: { content: 'hi' } }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    } as any;
+    client.chat.completions.create.mockResolvedValue(response);
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    const req: any = {
+      input: 'u',
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+      prompt: { promptId: 'pmpt_123' },
+    };
+
+    await withTrace('t', () => model.getResponse(req));
+    await withTrace('t', () => model.getResponse(req));
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0]?.[0]).toContain(
+      'Reusable prompts are only supported by the Responses API',
+    );
+    expect(
+      client.chat.completions.create.mock.calls[0]?.[0],
+    ).not.toHaveProperty('prompt');
+    expect(client.chat.completions.create).toHaveBeenCalledTimes(2);
+    warnSpy.mockRestore();
+  });
+
+  it('throws for reusable prompts in strict mode', async () => {
+    const client = new FakeClient();
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt', {
+      strictFeatureValidation: true,
+    });
+    const req: any = {
+      input: 'u',
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+      prompt: { promptId: 'pmpt_123' },
+    };
+
+    await expect(withTrace('t', () => model.getResponse(req))).rejects.toThrow(
+      'Reusable prompts',
+    );
+    expect(client.chat.completions.create).not.toHaveBeenCalled();
   });
 
   it('preserves SDK retries for direct callers when no runner retry policy is configured', async () => {
@@ -279,7 +480,7 @@ describe('OpenAIChatCompletionsModel', () => {
     const req: any = {
       input: 'u',
       modelSettings: {
-        promptCacheRetention: '24h',
+        promptCacheRetention: 'in-memory',
       },
       tools: [],
       outputType: 'text',
@@ -291,7 +492,7 @@ describe('OpenAIChatCompletionsModel', () => {
 
     expect(client.chat.completions.create).toHaveBeenCalledWith(
       expect.objectContaining({
-        prompt_cache_retention: '24h',
+        prompt_cache_retention: 'in_memory',
       }),
       { headers: HEADERS, signal: undefined },
     );
@@ -528,6 +729,80 @@ describe('OpenAIChatCompletionsModel', () => {
         },
       },
     ]);
+  });
+
+  it('ignores custom tool calls by default', async () => {
+    const client = new FakeClient();
+    const response = {
+      id: 'r',
+      choices: [
+        {
+          message: {
+            tool_calls: [
+              {
+                id: 'call1',
+                type: 'custom',
+                custom: { name: 'raw_tool', input: 'payload' },
+              },
+            ],
+          },
+        },
+      ],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    } as any;
+    client.chat.completions.create.mockResolvedValue(response);
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    const req: any = {
+      input: 'u',
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+    };
+
+    const result = await withTrace('t', () => model.getResponse(req));
+
+    expect(result.output).toEqual([]);
+  });
+
+  it('rejects custom tool calls in strict mode', async () => {
+    const client = new FakeClient();
+    const response = {
+      id: 'r',
+      choices: [
+        {
+          message: {
+            tool_calls: [
+              {
+                id: 'call1',
+                type: 'custom',
+                custom: { name: 'raw_tool', input: 'payload' },
+              },
+            ],
+          },
+        },
+      ],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    } as any;
+    client.chat.completions.create.mockResolvedValue(response);
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt', {
+      strictFeatureValidation: true,
+    });
+    const req: any = {
+      input: 'u',
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+    };
+
+    await expect(withTrace('t', () => model.getResponse(req))).rejects.toThrow(
+      'Custom tool calls are not supported',
+    );
   });
 
   it('rejects namespaced function tools before sending a request', async () => {
@@ -857,7 +1132,103 @@ describe('OpenAIChatCompletionsModel', () => {
       { headers: HEADERS, signal: undefined },
     );
     expect(convertChatCompletionsStreamToResponses).toHaveBeenCalled();
+    expect(
+      vi.mocked(convertChatCompletionsStreamToResponses).mock.calls[0]?.[2],
+    ).toEqual({ strictFeatureValidation: false });
     expect(events).toEqual([{ type: 'first' }, { type: 'second' }]);
+  });
+
+  it('passes strict feature validation to the stream converter', async () => {
+    const client = new FakeClient();
+    async function* fakeStream() {
+      yield { id: 'c' } as any;
+    }
+    client.chat.completions.create.mockResolvedValue(fakeStream());
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt', {
+      strictFeatureValidation: true,
+    });
+    const req: any = {
+      input: 'hi',
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+    };
+
+    await withTrace('t', async () => {
+      for await (const _event of model.getStreamedResponse(req)) {
+        // Consume the stream.
+      }
+    });
+
+    expect(
+      vi.mocked(convertChatCompletionsStreamToResponses).mock.calls[0]?.[2],
+    ).toEqual({ strictFeatureValidation: true });
+  });
+
+  it('warns and ignores unsupported stream response features by default', async () => {
+    const client = new FakeClient();
+    async function* fakeStream() {
+      yield { id: 'c' } as any;
+    }
+    client.chat.completions.create.mockResolvedValue(fakeStream());
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    const req: any = {
+      input: 'hi',
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+      previousResponseId: 'resp_123',
+      prompt: { promptId: 'pmpt_123' },
+    };
+
+    await withTrace('t', async () => {
+      for await (const _event of model.getStreamedResponse(req)) {
+        // Consume the stream.
+      }
+    });
+
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+    expect(warnSpy.mock.calls[0]?.[0]).toContain(
+      'server-managed conversation state',
+    );
+    expect(warnSpy.mock.calls[1]?.[0]).toContain('Reusable prompts');
+    expect(
+      client.chat.completions.create.mock.calls[0]?.[0],
+    ).not.toHaveProperty('prompt');
+    expect(client.chat.completions.create).toHaveBeenCalledTimes(1);
+    warnSpy.mockRestore();
+  });
+
+  it('throws for unsupported stream response features in strict mode', async () => {
+    const client = new FakeClient();
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt', {
+      strictFeatureValidation: true,
+    });
+    const req: any = {
+      input: 'hi',
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+      conversationId: 'conv_123',
+    };
+
+    await expect(
+      withTrace('t', async () => {
+        for await (const _event of model.getStreamedResponse(req)) {
+          // Consume the stream.
+        }
+      }),
+    ).rejects.toThrow('server-managed conversation state');
+    expect(client.chat.completions.create).not.toHaveBeenCalled();
   });
 
   it('populates usage from response_done event when initial usage is zero', async () => {

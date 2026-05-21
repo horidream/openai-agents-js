@@ -1,4 +1,5 @@
 import { RuntimeEventEmitter, Usage } from '@openai/agents-core';
+import { normalizeHostedMcpRequireApproval } from '@openai/agents-core/utils';
 import type { MessageEvent as WebSocketMessageEvent } from 'ws';
 
 import {
@@ -42,6 +43,7 @@ import { EventEmitterDelegate } from '@openai/agents-core/utils';
 export type OpenAIRealtimeModels =
   | 'gpt-realtime'
   | 'gpt-realtime-1.5'
+  | 'gpt-realtime-2'
   | 'gpt-realtime-2025-08-28'
   | 'gpt-4o-realtime-preview'
   | 'gpt-4o-realtime-preview-2024-10-01'
@@ -58,7 +60,7 @@ export type OpenAIRealtimeModels =
  * The default model that is used during the connection if no model is provided.
  */
 export const DEFAULT_OPENAI_REALTIME_MODEL: OpenAIRealtimeModels =
-  'gpt-realtime-1.5';
+  'gpt-realtime-2';
 
 /**
  * The default session config that gets send over during session connection unless overridden
@@ -115,6 +117,29 @@ export type OpenAIRealtimeEventTypes = {
  * directly into the `openai.realtime.calls.accept` helper without casts.
  */
 export type RealtimeSessionPayload = { type: 'realtime' } & Record<string, any>;
+
+function normalizeRealtimeMessageContent(
+  role: string | undefined,
+  content: unknown,
+): unknown {
+  if (role !== 'assistant' || !Array.isArray(content)) {
+    return content;
+  }
+  return content.map((part) => {
+    if (
+      part &&
+      typeof part === 'object' &&
+      'type' in part &&
+      part.type === 'audio'
+    ) {
+      return {
+        ...part,
+        type: 'output_audio',
+      };
+    }
+    return part;
+  });
+}
 
 export abstract class OpenAIRealtimeBase
   extends EventEmitterDelegate<OpenAIRealtimeEventTypes>
@@ -338,7 +363,10 @@ export abstract class OpenAIRealtimeBase
           previousItemId,
           type: parsed.item.type,
           role: parsed.item.role,
-          content: parsed.item.content,
+          content: normalizeRealtimeMessageContent(
+            parsed.item.role,
+            parsed.item.content,
+          ),
           status: parsed.item.status,
         });
         this.emit('item_update', item);
@@ -453,7 +481,10 @@ export abstract class OpenAIRealtimeBase
           itemId: parsed.item.id,
           type: parsed.item.type,
           role: parsed.item.role,
-          content: parsed.item.content,
+          content: normalizeRealtimeMessageContent(
+            parsed.item.role,
+            parsed.item.content,
+          ),
           status:
             parsed.type === 'response.output_item.done'
               ? (item.status ?? 'completed')
@@ -602,6 +633,10 @@ export abstract class OpenAIRealtimeBase
       tool_choice:
         newConfig.toolChoice ??
         DEFAULT_OPENAI_REALTIME_SESSION_CONFIG.toolChoice,
+      ...(typeof newConfig.parallelToolCalls === 'undefined'
+        ? {}
+        : { parallel_tool_calls: newConfig.parallelToolCalls }),
+      ...(newConfig.reasoning ? { reasoning: newConfig.reasoning } : {}),
       // We don't set tracing here to make sure that we don't try to override it on every
       // session.update as it might lead to errors
       ...(newConfig.providerData ?? {}),
@@ -635,7 +670,10 @@ export abstract class OpenAIRealtimeBase
             authorization: tool.authorization,
             headers: tool.headers,
             allowed_tools: tool.allowed_tools,
-            require_approval: tool.require_approval,
+            require_approval:
+              typeof tool.require_approval === 'undefined'
+                ? undefined
+                : normalizeHostedMcpRequireApproval(tool.require_approval),
           });
         }
 

@@ -772,6 +772,36 @@ describe('OpenAIResponsesModel', () => {
     });
   });
 
+  it('getRetryAdvice marks websocket pong timeouts as unsafe', () => {
+    const fakeClient = {
+      responses: { create: vi.fn() },
+    } as unknown as OpenAI;
+    const model = new OpenAIResponsesWSModel(fakeClient, 'gpt-test');
+
+    expect(
+      model.getRetryAdvice({
+        error: new ResponsesWebSocketInternalError(
+          'pong_timeout',
+          'Responses websocket pong timeout.',
+        ),
+        request: {
+          input: 'hello',
+          modelSettings: {},
+          tools: [],
+          outputType: 'text',
+          handoffs: [],
+          tracing: false,
+        } as any,
+        stream: true,
+        attempt: 1,
+      }),
+    ).toEqual({
+      suggested: false,
+      replaySafety: 'unsafe',
+      reason: 'Responses websocket pong timeout.',
+    });
+  });
+
   it('getRetryAdvice allows non-streaming websocket retries when the request never left the client', () => {
     const fakeClient = {
       responses: { create: vi.fn() },
@@ -1049,7 +1079,41 @@ describe('OpenAIResponsesModel', () => {
       await model.getResponse(request as any);
 
       const [args] = createMock.mock.calls[0];
-      expect(args.prompt_cache_retention).toBe('in-memory');
+      expect(args.prompt_cache_retention).toBe('in_memory');
+    });
+  });
+
+  it('sends context management settings to the Responses API', async () => {
+    await withTrace('test', async () => {
+      const fakeResponse = { id: 'res-context', usage: {}, output: [] };
+      const createMock = vi.fn().mockResolvedValue(fakeResponse);
+      const fakeClient = {
+        responses: { create: createMock },
+      } as unknown as OpenAI;
+      const model = new OpenAIResponsesModel(fakeClient, 'gpt-context');
+
+      const request = {
+        systemInstructions: undefined,
+        input: 'hello',
+        modelSettings: {
+          contextManagement: [{ type: 'compaction', compactThreshold: 200000 }],
+        },
+        tools: [],
+        outputType: 'text',
+        handoffs: [],
+        tracing: false,
+        signal: undefined,
+      };
+
+      await model.getResponse(request as any);
+
+      const [args] = createMock.mock.calls[0];
+      expect(args.context_management).toEqual([
+        {
+          type: 'compaction',
+          compact_threshold: 200000,
+        },
+      ]);
     });
   });
 
