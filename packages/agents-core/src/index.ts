@@ -80,6 +80,7 @@ export {
   getHandoff,
   getTransferMessage,
   Handoff,
+  HandoffCloneOptions,
   handoff,
   HandoffInputData,
   HandoffEnabledFunction,
@@ -293,6 +294,7 @@ export type {
   StreamEventGenericItem,
 } from './types';
 export { RequestUsage, Usage } from './usage';
+export type { RequestUsageInput, UsageInput } from './usage';
 export type {
   Session,
   SessionInputCallback,

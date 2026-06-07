@@ -23,6 +23,7 @@ import { RunResult, StreamedRunResult } from './result';
 import { RunState } from './runState';
 import { RunItem } from './items';
 import {
+  getCurrentTrace,
   getOrCreateTrace,
   resetCurrentSpan,
   setCurrentSpan,
@@ -211,14 +212,15 @@ function validateToolExecutionConfig(
 export type RunConfig = {
   /**
    * The model to use for the entire agent run. If set, will override the model set on every
-   * agent. The modelProvider passed in below must be able to resolve this model name.
+   * agent. String model names are resolved with the configured modelProvider, or the default
+   * model provider if no explicit provider is configured.
    */
   model?: string | Model;
 
   /**
    * The model provider to use when looking up string model names. Defaults to OpenAI.
    */
-  modelProvider: ModelProvider;
+  modelProvider?: ModelProvider;
 
   /**
    * Configure global model settings. Any non-null values will override the agent-specific model
@@ -385,6 +387,20 @@ export type IndividualRunOptions<
   TAgent extends Agent<any, any> = Agent<any, any>,
 > = StreamRunOptions<TContext, TAgent> | NonStreamRunOptions<TContext, TAgent>;
 
+type RunnerConfig = RunConfig & {
+  modelProvider: ModelProvider;
+};
+
+class LazyDefaultModelProvider implements ModelProvider {
+  #modelProvider: ModelProvider | undefined;
+
+  getModel(modelName?: string): Promise<Model> | Model {
+    const modelProvider = this.#modelProvider ?? getDefaultModelProvider();
+    this.#modelProvider = modelProvider;
+    return modelProvider.getModel(modelName);
+  }
+}
+
 // --------------------------------------------------------------
 //  Runner
 // --------------------------------------------------------------
@@ -427,7 +443,7 @@ export async function run<TAgent extends Agent<any, any>, TContext = undefined>(
  * tracing. Reuse a `Runner` instance when you want consistent configuration across multiple runs.
  */
 export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
-  public readonly config: RunConfig;
+  public readonly config: RunnerConfig;
   private readonly traceOverrides: {
     traceId?: string;
     workflowName?: string;
@@ -444,7 +460,7 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
   constructor(config: Partial<RunConfig> = {}) {
     super();
     this.config = {
-      modelProvider: config.modelProvider ?? getDefaultModelProvider(),
+      modelProvider: config.modelProvider ?? new LazyDefaultModelProvider(),
       model: config.model,
       modelSettings: config.modelSettings,
       handoffInputFilter: config.handoffInputFilter,
@@ -673,14 +689,22 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
         return executeRun();
       });
     }
-    return getOrCreateTrace(async () => executeRun(), {
-      traceId: this.config.traceId,
-      name: this.config.workflowName,
-      groupId: this.config.groupId,
-      metadata: this.config.traceMetadata,
-      // Per-run tracing config overrides exporter defaults such as environment API key.
-      tracingApiKey: tracingConfig?.apiKey,
-    });
+    return getOrCreateTrace(
+      async () => {
+        if (preparedInput instanceof RunState && !preparedInput._trace) {
+          preparedInput._trace = getCurrentTrace();
+        }
+        return executeRun();
+      },
+      {
+        traceId: this.config.traceId,
+        name: this.config.workflowName,
+        groupId: this.config.groupId,
+        metadata: this.config.traceMetadata,
+        // Per-run tracing config overrides exporter defaults such as environment API key.
+        tracingApiKey: tracingConfig?.apiKey,
+      },
+    );
   }
 
   // --------------------------------------------------------------
