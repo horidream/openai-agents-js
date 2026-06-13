@@ -458,6 +458,134 @@ describe('itemsToMessages', () => {
     ]);
   });
 
+  test('replays image tool output as a multimodal user message', () => {
+    const items: protocol.ModelItem[] = [
+      {
+        type: 'function_call',
+        callId: 'call-image',
+        name: 'get_content_detail',
+        arguments: '{}',
+        status: 'completed',
+      } as protocol.FunctionCallItem,
+      {
+        type: 'function_call_result',
+        callId: 'call-image',
+        name: 'get_content_detail',
+        status: 'completed',
+        output: [
+          { type: 'input_text', text: '{"success":true}' },
+          {
+            type: 'input_image',
+            image: 'data:image/png;base64,AAAA',
+            detail: 'low',
+          },
+        ],
+      } as protocol.FunctionCallResultItem,
+    ];
+
+    expect(itemsToMessages(items)).toEqual([
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          {
+            id: 'call-image',
+            type: 'function',
+            function: { name: 'get_content_detail', arguments: '{}' },
+          },
+        ],
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call-image',
+        content: '{"success":true}',
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'Multimodal output returned by tool get_content_detail (call-image):',
+          },
+          {
+            type: 'image_url',
+            image_url: { url: 'data:image/png;base64,AAAA', detail: 'low' },
+          },
+        ],
+      },
+    ]);
+  });
+
+  test('defers parallel tool attachments until every tool result is emitted', () => {
+    const items: protocol.ModelItem[] = [
+      {
+        type: 'function_call',
+        callId: 'call-1',
+        name: 'first',
+        arguments: '{}',
+        status: 'completed',
+      } as protocol.FunctionCallItem,
+      {
+        type: 'function_call',
+        callId: 'call-2',
+        name: 'second',
+        arguments: '{}',
+        status: 'completed',
+      } as protocol.FunctionCallItem,
+      {
+        type: 'function_call_result',
+        callId: 'call-1',
+        name: 'first',
+        status: 'completed',
+        output: [{ type: 'input_image', image: 'https://example.com/one.png' }],
+      } as protocol.FunctionCallResultItem,
+      {
+        type: 'function_call_result',
+        callId: 'call-2',
+        name: 'second',
+        status: 'completed',
+        output: [{ type: 'input_text', text: 'done' }],
+      } as protocol.FunctionCallResultItem,
+    ];
+
+    const messages = itemsToMessages(items);
+    expect(messages.map((message) => message.role)).toEqual([
+      'assistant',
+      'tool',
+      'tool',
+      'user',
+    ]);
+  });
+
+  test('strips image tool attachments for text-only models', () => {
+    const items: protocol.ModelItem[] = [
+      {
+        type: 'function_call_result',
+        callId: 'call-image',
+        name: 'get_content_detail',
+        status: 'completed',
+        output: [
+          { type: 'input_text', text: '{"success":true,"kind":"image"}' },
+          {
+            type: 'input_image',
+            image: 'data:image/png;base64,AAAA',
+            detail: 'low',
+          },
+        ],
+      } as protocol.FunctionCallResultItem,
+    ];
+
+    expect(itemsToMessages(items, { supportsToolOutputImages: false })).toEqual(
+      [
+        {
+          role: 'tool',
+          tool_call_id: 'call-image',
+          content: '{"success":true,"kind":"image"}',
+        },
+      ],
+    );
+  });
+
   test('uses placeholder for empty structured function output by default', () => {
     const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const items: protocol.ModelItem[] = [
@@ -484,7 +612,7 @@ describe('itemsToMessages', () => {
     warnSpy.mockRestore();
   });
 
-  test('uses placeholder for non-text-only structured function output by default', () => {
+  test('replays non-text-only structured function output by default', () => {
     const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const items: protocol.ModelItem[] = [
       {
@@ -508,10 +636,21 @@ describe('itemsToMessages', () => {
         tool_call_id: 'call1',
         content: '[tool output omitted]',
       },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'Multimodal output returned by tool f (call1):',
+          },
+          {
+            type: 'image_url',
+            image_url: { url: 'https://example.com/image.png' },
+          },
+        ],
+      },
     ]);
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('Replacing the tool output with a placeholder'),
-    );
+    expect(warnSpy).not.toHaveBeenCalled();
     warnSpy.mockRestore();
   });
 
@@ -542,6 +681,19 @@ describe('itemsToMessages', () => {
         role: 'tool',
         tool_call_id: 'call1',
         content: 'visible',
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'Multimodal output returned by tool f (call1):',
+          },
+          {
+            type: 'image_url',
+            image_url: { url: 'https://example.com/image.png' },
+          },
+        ],
       },
     ]);
     expect(warnSpy).not.toHaveBeenCalled();

@@ -21,6 +21,7 @@ const OMITTED_TOOL_OUTPUT_PLACEHOLDER = '[tool output omitted]';
 
 type ItemsToMessagesOptions = {
   strictFeatureValidation?: boolean;
+  supportsToolOutputImages?: boolean;
 };
 
 export function convertToolChoice(
@@ -152,6 +153,9 @@ export function extractAllUserContent(
         type: 'image_url',
         image_url: {
           url: imageSource,
+          ...(c.detail === 'low' || c.detail === 'high' || c.detail === 'auto'
+            ? { detail: c.detail }
+            : {}),
           ...imageUrl,
         },
         ...rest,
@@ -259,6 +263,7 @@ export function itemsToMessages(
   }
   const result: ChatCompletionMessageParam[] = [];
   let currentAssistantMsg: ChatCompletionAssistantMessageParam | null = null;
+  let pendingToolAttachments: ChatCompletionContentPart[] = [];
   const flushAssistantMessage = () => {
     if (currentAssistantMsg) {
       if (
@@ -281,7 +286,20 @@ export function itemsToMessages(
     }
     return currentAssistantMsg;
   };
+  const flushToolAttachments = () => {
+    if (pendingToolAttachments.length === 0) {
+      return;
+    }
+    result.push({
+      role: 'user',
+      content: pendingToolAttachments,
+    });
+    pendingToolAttachments = [];
+  };
   for (const item of items) {
+    if (item.type !== 'function_call_result') {
+      flushToolAttachments();
+    }
     if (isMessageItem(item)) {
       const { content, role, providerData } = item;
       flushAssistantMessage();
@@ -443,7 +461,7 @@ export function itemsToMessages(
     } else if (item.type === 'function_call_result') {
       flushAssistantMessage();
       const funcOutput = item;
-      const toolContent = normalizeFunctionCallOutputForChat(
+      const { text, attachments } = normalizeFunctionCallOutputForChat(
         funcOutput.output,
         options,
       );
@@ -451,13 +469,20 @@ export function itemsToMessages(
       result.push({
         role: 'tool',
         tool_call_id: funcOutput.callId,
-        content: toolContent,
+        content: text,
         ...getProviderDataWithoutReservedKeys(funcOutput.providerData, [
           'role',
           'tool_call_id',
           'content',
         ]),
       });
+      if (attachments.length > 0) {
+        pendingToolAttachments.push({
+          type: 'text',
+          text: `Multimodal output returned by tool ${funcOutput.name || 'call'} (${funcOutput.callId}):`,
+        });
+        pendingToolAttachments.push(...attachments);
+      }
     } else if (item.type === 'unknown') {
       result.push({
         ...item.providerData,
@@ -472,32 +497,50 @@ export function itemsToMessages(
     }
   }
   flushAssistantMessage();
+  flushToolAttachments();
   return result;
 }
 
 function normalizeFunctionCallOutputForChat(
   output: protocol.FunctionCallResultItem['output'],
   options: ItemsToMessagesOptions,
-): string {
+): { text: string; attachments: ChatCompletionContentPart[] } {
   if (typeof output === 'string') {
-    return output;
+    return { text: output, attachments: [] };
   }
 
   if (Array.isArray(output)) {
     const textItems = output.filter((item) => item.type === 'input_text');
+    const attachmentItems =
+      options.supportsToolOutputImages === false
+        ? output.filter((item) => item.type === 'input_file')
+        : output.filter((item) => item.type !== 'input_text');
 
     if (textItems.length === 0) {
-      return handleEmptyOrNonTextToolOutput(options);
+      return {
+        text:
+          attachmentItems.length > 0 && !options.strictFeatureValidation
+            ? OMITTED_TOOL_OUTPUT_PLACEHOLDER
+            : handleEmptyOrNonTextToolOutput(options),
+        attachments: extractAllUserContent(
+          attachmentItems,
+        ) as ChatCompletionContentPart[],
+      };
     }
 
-    if (options.strictFeatureValidation && textItems.length !== output.length) {
+    if (options.strictFeatureValidation && attachmentItems.length > 0) {
       throw new UserError(
         'Only text tool outputs are supported for chat completions. Got item: ' +
           JSON.stringify(output),
       );
     }
 
-    return textItems.map((item) => item.text).join('');
+    return {
+      text: textItems.map((item) => item.text).join(''),
+      attachments: extractAllUserContent(
+        attachmentItems,
+      ) as ChatCompletionContentPart[],
+    };
   }
 
   if (
@@ -505,11 +548,28 @@ function normalizeFunctionCallOutputForChat(
     output.type === 'text' &&
     typeof output.text === 'string'
   ) {
-    return output.text;
+    return { text: output.text, attachments: [] };
   }
 
   if (isRecord(output) && (output.type === 'image' || output.type === 'file')) {
-    return handleEmptyOrNonTextToolOutput(options);
+    const includeAttachment =
+      output.type === 'file' || options.supportsToolOutputImages !== false;
+    return {
+      text: options.strictFeatureValidation
+        ? handleEmptyOrNonTextToolOutput(options)
+        : OMITTED_TOOL_OUTPUT_PLACEHOLDER,
+      attachments: includeAttachment
+        ? (extractAllUserContent([
+            output.type === 'image'
+              ? {
+                  type: 'input_image',
+                  image: output.image,
+                  detail: output.detail,
+                }
+              : { type: 'input_file', file: output.file },
+          ] as protocol.UserMessageItem['content']) as ChatCompletionContentPart[])
+        : [],
+    };
   }
 
   throw new UserError(

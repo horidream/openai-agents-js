@@ -67,12 +67,18 @@ export type OpenAIChatCompletionsModelOptions = {
    * behavior.
    */
   strictFeatureValidation?: boolean;
+  /**
+   * Whether image parts returned by tools should be replayed to the model.
+   * Disable this for text-only models; textual tool output is preserved.
+   */
+  supportsToolOutputImages?: boolean;
 };
 
 export class OpenAIChatCompletionsModel implements Model {
   #client: OpenAI;
   #model: string;
   #strictFeatureValidation: boolean;
+  #supportsToolOutputImages: boolean;
   #hasWarnedUnsupportedPrompt = false;
   #hasWarnedUnsupportedConversationState = false;
 
@@ -84,6 +90,7 @@ export class OpenAIChatCompletionsModel implements Model {
     this.#client = client;
     this.#model = model;
     this.#strictFeatureValidation = options.strictFeatureValidation ?? false;
+    this.#supportsToolOutputImages = options.supportsToolOutputImages ?? true;
   }
 
   getRetryAdvice(args: ModelRetryAdviceRequest): ModelRetryAdvice | undefined {
@@ -430,6 +437,7 @@ export class OpenAIChatCompletionsModel implements Model {
 
     const messages = itemsToMessages(request.input, {
       strictFeatureValidation: this.#strictFeatureValidation,
+      supportsToolOutputImages: this.#supportsToolOutputImages,
     });
     if (request.systemInstructions) {
       messages.unshift({
