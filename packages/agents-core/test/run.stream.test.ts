@@ -3,6 +3,7 @@ import { z } from 'zod';
 import {
   Agent,
   AgentInputItem,
+  GuardrailExecutionError,
   MaxTurnsExceededError,
   ModelRefusalError,
   run,
@@ -1475,6 +1476,67 @@ describe('Runner.run (streaming)', () => {
     }
   });
 
+  it('handles invalid final output errors with an error handler', async () => {
+    class InvalidFinalOutputStreamingModel implements Model {
+      async getResponse(_req: ModelRequest): Promise<ModelResponse> {
+        return {
+          output: [fakeModelMessage('not valid json')],
+          usage: new Usage(),
+        };
+      }
+
+      async *getStreamedResponse(
+        req: ModelRequest,
+      ): AsyncIterable<StreamEvent> {
+        const response = await this.getResponse(req);
+        yield {
+          type: 'response_done',
+          response: {
+            id: 'r_invalid_final_output',
+            usage: {
+              requests: 1,
+              inputTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+            },
+            output: response.output,
+          },
+        } as any;
+      }
+    }
+
+    const agent = new Agent({
+      name: 'InvalidFinalOutputHandlerStream',
+      outputType: z.object({ summary: z.string() }),
+      model: new InvalidFinalOutputStreamingModel(),
+    });
+    const result = await run(agent, 'x', {
+      stream: true,
+      errorHandlers: {
+        invalidFinalOutput: () => ({
+          finalOutput: { summary: 'safe fallback' },
+        }),
+      },
+    });
+    const events: RunStreamEvent[] = [];
+    for await (const event of result.toStream()) {
+      events.push(event);
+    }
+    await result.completed;
+
+    expect(result.finalOutput).toEqual({ summary: 'safe fallback' });
+    const runItemEvents = events.filter(
+      (event): event is RunItemStreamEvent =>
+        event.type === 'run_item_stream_event',
+    );
+    expect(runItemEvents).toHaveLength(2);
+    expect(runItemEvents[1].name).toBe('message_output_created');
+    expect(runItemEvents[1].item).toBeInstanceOf(RunMessageOutputItem);
+    if (runItemEvents[1].item instanceof RunMessageOutputItem) {
+      expect(runItemEvents[1].item.content).toBe('{"summary":"safe fallback"}');
+    }
+  });
+
   it('does not advance the turn for streaming runs resuming an interruption without persisted items', async () => {
     const approvalTool = tool({
       name: 'get_weather',
@@ -2410,6 +2472,64 @@ describe('Runner.run (streaming)', () => {
       });
     });
 
+    it('does not replay an acknowledged function result across consecutive streamed approvals', async () => {
+      const approvalTool = tool({
+        name: 'test',
+        description: 'approval tool',
+        parameters: z.object({ test: z.string() }),
+        needsApproval: async () => true,
+        execute: async ({ test }) => `result:${test}`,
+      });
+      const model = new TrackingStreamingModel([
+        buildTurn([buildToolCall('call-stream-1', 'first')], 'resp-stream-1'),
+        buildTurn([buildToolCall('call-stream-2', 'second')], 'resp-stream-2'),
+        buildTurn([fakeModelMessage('done')], 'resp-stream-3'),
+      ]);
+      const agent = new Agent({
+        name: 'ConsecutiveStreamApprovalAgent',
+        model,
+        tools: [approvalTool],
+      });
+      const runner = new Runner();
+
+      const firstResult = await runner.run(agent, 'user_message', {
+        stream: true,
+        previousResponseId: 'initial-response',
+      });
+      await drain(firstResult);
+      expect(firstResult.interruptions).toHaveLength(1);
+      firstResult.state.approve(firstResult.interruptions[0]);
+
+      const secondResult = await runner.run(agent, firstResult.state, {
+        stream: true,
+        previousResponseId: 'initial-response',
+      });
+      await drain(secondResult);
+      expect(secondResult.interruptions).toHaveLength(1);
+      secondResult.state.approve(secondResult.interruptions[0]);
+
+      const thirdResult = await runner.run(agent, secondResult.state, {
+        stream: true,
+        previousResponseId: 'initial-response',
+      });
+      await drain(thirdResult);
+
+      expect(thirdResult.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(3);
+      expect(model.requests[1].input).toEqual([
+        expect.objectContaining({
+          type: 'function_call_result',
+          callId: 'call-stream-1',
+        }),
+      ]);
+      expect(model.requests[2].input).toEqual([
+        expect.objectContaining({
+          type: 'function_call_result',
+          callId: 'call-stream-2',
+        }),
+      ]);
+    });
+
     it('uses runner-level toolErrorFormatter when resuming a rejected approval', async () => {
       const approvalTool = tool({
         name: 'test',
@@ -2752,6 +2872,95 @@ describe('Runner.run (streaming)', () => {
     expect(guardrail.execute).toHaveBeenCalledTimes(1);
   });
 
+  it('does not start streaming while sibling parallel guardrails drain after a failure', async () => {
+    let releaseSlowGuardrail!: () => void;
+    let markSlowStarted!: () => void;
+    let markErrorThrown!: () => void;
+    const slowGuardrailCanFinish = new Promise<void>((resolve) => {
+      releaseSlowGuardrail = resolve;
+    });
+    const slowGuardrailStarted = new Promise<void>((resolve) => {
+      markSlowStarted = resolve;
+    });
+    const errorThrown = new Promise<void>((resolve) => {
+      markErrorThrown = resolve;
+    });
+    const slowGuardrail = {
+      name: 'slow-parallel-guardrail',
+      execute: async () => {
+        markSlowStarted();
+        await slowGuardrailCanFinish;
+        return { tripwireTriggered: false, outputInfo: {} };
+      },
+    };
+    const errorGuardrail = {
+      name: 'failing-parallel-guardrail',
+      execute: async () => {
+        await slowGuardrailStarted;
+        markErrorThrown();
+        throw new Error('boom');
+      },
+    };
+
+    class TrackingStreamingModel implements Model {
+      calls = 0;
+
+      async getResponse(_request: ModelRequest): Promise<ModelResponse> {
+        throw new Error('not implemented');
+      }
+
+      async *getStreamedResponse(
+        _request: ModelRequest,
+      ): AsyncIterable<StreamEvent> {
+        this.calls++;
+        yield {
+          type: 'response_done',
+          response: {
+            id: 'stream-response',
+            usage: {
+              requests: 1,
+              inputTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+            },
+            output: [protocol.OutputModelItem.parse(fakeModelMessage('done'))],
+          },
+        } satisfies StreamEvent;
+      }
+    }
+
+    const model = new TrackingStreamingModel();
+    const agent = new Agent({
+      name: 'StreamingParallelGuardrailFailure',
+      model,
+      inputGuardrails: [slowGuardrail, errorGuardrail],
+    });
+    const runner = new Runner();
+
+    const result = await runner.run(agent, 'hello', { stream: true });
+    let completionSettled = false;
+    void result.completed.then(
+      () => {
+        completionSettled = true;
+      },
+      () => {
+        completionSettled = true;
+      },
+    );
+    await errorThrown;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const callsBeforeSiblingFinished = model.calls;
+    const settledBeforeSiblingFinished = completionSettled;
+    releaseSlowGuardrail();
+
+    await expect(result.completed).rejects.toBeInstanceOf(
+      GuardrailExecutionError,
+    );
+    expect(callsBeforeSiblingFinished).toBe(0);
+    expect(settledBeforeSiblingFinished).toBe(false);
+    expect(model.calls).toBe(0);
+  });
+
   it('persists streaming input but drops the result when an output guardrail trips', async () => {
     const saveInputSpy = vi
       .spyOn(sessionPersistence, 'saveStreamInputToSession')
@@ -2838,8 +3047,7 @@ describe('Runner.run (streaming)', () => {
       .mockResolvedValue();
 
     let resolveGuardrail:
-      | ((value: GuardrailFunctionOutput) => void)
-      | undefined;
+      ((value: GuardrailFunctionOutput) => void) | undefined;
     const guardrail = {
       name: 'parallel-allow',
       execute: vi.fn(

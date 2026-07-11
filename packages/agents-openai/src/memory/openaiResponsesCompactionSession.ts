@@ -18,14 +18,13 @@ import {
   OPENAI_SESSION_API,
   type OpenAISessionApiTagged,
 } from './openaiSessionApi';
+import type { OpenAIClient } from '../openaiClient';
 
 const DEFAULT_COMPACTION_THRESHOLD = 10;
 const logger = getLogger('openai-agents:openai:compaction');
 
 export type OpenAIResponsesCompactionMode =
-  | 'previous_response_id'
-  | 'input'
-  | 'auto';
+  'previous_response_id' | 'input' | 'auto';
 
 export type OpenAIResponsesCompactionDecisionContext = {
   /**
@@ -56,7 +55,7 @@ export type OpenAIResponsesCompactionSessionOptions = {
    * When omitted, the session will use `getDefaultOpenAIClient()` if configured. Otherwise it
    * creates a new `OpenAI()` instance via `new OpenAI()`.
    */
-  client?: OpenAI;
+  client?: OpenAIClient;
   /**
    * Session store that receives items and holds the compacted history.
    *
@@ -431,12 +430,12 @@ function resolveClient(
   options: OpenAIResponsesCompactionSessionOptions,
 ): OpenAI {
   if (options.client) {
-    return options.client;
+    return options.client as OpenAI;
   }
 
   const defaultClient = getDefaultOpenAIClient();
   if (defaultClient) {
-    return defaultClient;
+    return defaultClient as OpenAI;
   }
 
   return new OpenAI();

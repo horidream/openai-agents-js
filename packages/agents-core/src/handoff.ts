@@ -97,8 +97,7 @@ type HandoffEnabledPredicate<TContext = UnknownContext> = (args: {
 }) => boolean | Promise<boolean>;
 
 type HandoffEnabledOption<TContext> =
-  | boolean
-  | HandoffEnabledPredicate<TContext>;
+  boolean | HandoffEnabledPredicate<TContext>;
 
 export type HandoffEnabledFunction<TContext = UnknownContext> = (args: {
   runContext: RunContext<TContext>;
@@ -210,7 +209,7 @@ export class Handoff<
    * sees the entire conversation history. In some cases, you may want to filter inputs e.g. to
    * remove older inputs, or remove tools from existing inputs.
    *
-   * The function will receive the entire conversation hisstory so far, including the input item
+   * The function will receive the entire conversation history so far, including the input item
    * that triggered the handoff and a tool call output item representing the handoff tool's output.
    *
    * You are free to modify the input history or new items as you see fit. The next agent that runs
@@ -434,7 +433,7 @@ export function handoff<
     handoff.toolDescription = config.toolDescriptionOverride;
   }
 
-  if (config.inputFilter) {
+  if (config.inputFilter != null) {
     handoff.inputFilter = config.inputFilter;
   }
 

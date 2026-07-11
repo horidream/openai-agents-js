@@ -1,5 +1,76 @@
 # @openai/agents-extensions
 
+## 0.13.2
+
+### Patch Changes
+
+- Updated dependencies [4c14038]
+- Updated dependencies [e5b75e1]
+- Updated dependencies [240b6eb]
+  - @openai/agents-core@0.13.2
+
+## 0.13.1
+
+### Patch Changes
+
+- Updated dependencies [532ab2b]
+- Updated dependencies [ec48462]
+  - @openai/agents-core@0.13.1
+
+## 0.13.0
+
+### Patch Changes
+
+- @openai/agents-core@0.13.0
+
+## 0.12.1
+
+### Patch Changes
+
+- 5f57fe1: test: improve agents-core and agents-extensions coverage
+- dc7864a: refactor: consolidate internal runtime helpers and adapter normalization
+- f105eff: test: tighten Twilio transport test fakes
+- Updated dependencies [f064c56]
+- Updated dependencies [b65face]
+- Updated dependencies [59a67c4]
+- Updated dependencies [81d654f]
+- Updated dependencies [5f57fe1]
+- Updated dependencies [dc7864a]
+  - @openai/agents-core@0.12.1
+
+## 0.12.0
+
+### Patch Changes
+
+- 8f6a84b: fix: update the ws dependency to 8.21.0
+- Updated dependencies [e044d14]
+- Updated dependencies [a8f81cd]
+- Updated dependencies [c450c2b]
+- Updated dependencies [5350aad]
+- Updated dependencies [395699e]
+- Updated dependencies [f990172]
+  - @openai/agents-core@0.12.0
+
+## 0.11.8
+
+### Patch Changes
+
+- Updated dependencies [dd64ba6]
+- Updated dependencies [b740fb3]
+  - @openai/agents-core@0.11.8
+
+## 0.11.7
+
+### Patch Changes
+
+- 9c6db7c: fix: preserve complete Vercel PAT credentials while delegating incomplete authentication
+- e87c017: Update the Modal sandbox provider for the Modal SDK 0.7.6 sandbox command, filesystem, secrets, and cloud bucket mount APIs.
+- edd0a07: fix: expose sandbox error retryability metadata
+- 6d9152d: fix: recover expired credentials in legacy Vercel sandbox sessions through SDK authentication
+- Updated dependencies [edd0a07]
+- Updated dependencies [dfbc3b0]
+  - @openai/agents-core@0.11.7
+
 ## 0.11.6
 
 ### Patch Changes

@@ -6,6 +6,9 @@ import {
   BaseMCPServerSSE,
   BaseMCPServerStdio,
   BaseMCPServerStreamableHttp,
+} from '../../mcpShared';
+import type {
+  CallToolResult,
   CallToolResultContent,
   InitializeResult,
   MCPListResourcesParams,
@@ -16,8 +19,8 @@ import {
   MCPServerStdioOptions,
   MCPServerStreamableHttpOptions,
   MCPTool,
-  invalidateServerToolsCache,
 } from '../../mcp';
+import { invalidateServerToolsCache } from '../../mcpToolCache';
 import logger from '../../logger';
 
 type MaybeSessionTransport = {
@@ -108,7 +111,15 @@ export class MCPServerStdio extends BaseMCPServerStdio {
       'MCPServerStdio is not supported in browser environments. Use MCPServerStreamableHttp or MCPServerSSE instead.',
     );
   }
-
+  callToolResult(
+    _toolName: string,
+    _args: Record<string, unknown> | null,
+    _meta?: Record<string, unknown> | null,
+  ): Promise<CallToolResult> {
+    throw new Error(
+      'MCPServerStdio is not supported in browser environments. Use MCPServerStreamableHttp or MCPServerSSE instead.',
+    );
+  }
   listResources(
     _params?: MCPListResourcesParams,
   ): Promise<MCPListResourcesResult> {
@@ -240,11 +251,11 @@ class LightweightMcpClient {
     return result?.tools ?? [];
   }
 
-  async callTool(
+  async callToolResult(
     name: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
-  ): Promise<any> {
+  ): Promise<CallToolResult> {
     const params: Record<string, unknown> = {
       name,
       arguments: args ?? {},
@@ -252,8 +263,7 @@ class LightweightMcpClient {
     if (meta != null) {
       params._meta = meta;
     }
-    const result = await this.sendRequest('tools/call', params);
-    return result?.content ?? [];
+    return (await this.sendRequest('tools/call', params)) as CallToolResult;
   }
 
   async listResources(params?: MCPListResourcesParams): Promise<any> {
@@ -371,17 +381,25 @@ export class MCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
   ): Promise<CallToolResultContent> {
+    return (await this.callToolResult(toolName, args, meta)).content;
+  }
+
+  async callToolResult(
+    toolName: string,
+    args: Record<string, unknown> | null,
+    meta?: Record<string, unknown> | null,
+  ): Promise<CallToolResult> {
     if (!this.client) {
       throw new Error(
         'Server not initialized. Make sure you call connect() first.',
       );
     }
-    const result = await this.client.callTool(toolName, args, meta);
+    const result = await this.client.callToolResult(toolName, args, meta);
     this.debugLog(
       () =>
         `Called tool ${toolName} (args: ${JSON.stringify(args)}, result: ${JSON.stringify(result)})`,
     );
-    return result as CallToolResultContent;
+    return result as CallToolResult;
   }
 
   async listResources(
@@ -502,7 +520,15 @@ export class MCPServerSSE extends BaseMCPServerSSE {
       'MCPServerSSE is not yet implemented for browser environments. Use MCPServerStreamableHttp instead.',
     );
   }
-
+  callToolResult(
+    _toolName: string,
+    _args: Record<string, unknown> | null,
+    _meta?: Record<string, unknown> | null,
+  ): Promise<CallToolResult> {
+    throw new Error(
+      'MCPServerSSE is not yet implemented for browser environments. Use MCPServerStreamableHttp instead.',
+    );
+  }
   listResources(
     _params?: MCPListResourcesParams,
   ): Promise<MCPListResourcesResult> {

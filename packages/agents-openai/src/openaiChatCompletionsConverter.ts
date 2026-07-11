@@ -24,6 +24,11 @@ type ItemsToMessagesOptions = {
   supportsToolOutputImages?: boolean;
 };
 
+type ChatCompletionAssistantMessageWithReasoning =
+  ChatCompletionAssistantMessageParam & {
+    reasoning?: string;
+  };
+
 export function convertToolChoice(
   toolChoice: 'auto' | 'required' | 'none' | (string & {}) | undefined | null,
 ): ChatCompletionToolChoiceOption | undefined {
@@ -124,6 +129,9 @@ export function extractAllUserContent(
       out.push({
         type: 'text',
         text: c.text,
+        ...(c.promptCacheBreakpoint
+          ? { prompt_cache_breakpoint: c.promptCacheBreakpoint }
+          : {}),
         ...getProviderDataWithoutReservedKeys(c.providerData, ['type', 'text']),
       });
     } else if (c.type === 'input_image') {
@@ -153,11 +161,17 @@ export function extractAllUserContent(
         type: 'image_url',
         image_url: {
           url: imageSource,
-          ...(c.detail === 'low' || c.detail === 'high' || c.detail === 'auto'
-            ? { detail: c.detail }
+          // Honor the top-level `detail` field, matching the Responses path
+          // (openaiResponsesModel) and the Python SDK. `providerData.image_url.detail`
+          // still takes precedence (spread last) to preserve existing behavior.
+          ...(c.detail !== undefined
+            ? { detail: c.detail as 'auto' | 'low' | 'high' }
             : {}),
           ...imageUrl,
         },
+        ...(c.promptCacheBreakpoint
+          ? { prompt_cache_breakpoint: c.promptCacheBreakpoint }
+          : {}),
         ...rest,
       });
     } else if (c.type === 'input_file') {
@@ -197,6 +211,9 @@ export function extractAllUserContent(
       out.push({
         type: 'file',
         file,
+        ...(c.promptCacheBreakpoint
+          ? { prompt_cache_breakpoint: c.promptCacheBreakpoint }
+          : {}),
         ...rest,
       });
     } else if (c.type === 'audio') {
@@ -232,6 +249,9 @@ export function extractAllUserContent(
           format: inputAudioFormat,
           ...inputAudio,
         } as ChatCompletionContentPartInputAudio['input_audio'],
+        ...(c.promptCacheBreakpoint
+          ? { prompt_cache_breakpoint: c.promptCacheBreakpoint }
+          : {}),
         ...rest,
       });
     } else {
@@ -262,7 +282,8 @@ export function itemsToMessages(
     return [{ role: 'user', content: items }];
   }
   const result: ChatCompletionMessageParam[] = [];
-  let currentAssistantMsg: ChatCompletionAssistantMessageParam | null = null;
+  let currentAssistantMsg: ChatCompletionAssistantMessageWithReasoning | null =
+    null;
   let pendingToolAttachments: ChatCompletionContentPart[] = [];
   const flushAssistantMessage = () => {
     if (currentAssistantMsg) {
@@ -347,8 +368,8 @@ export function itemsToMessages(
       }
     } else if (item.type === 'reasoning') {
       const asst = ensureAssistantMessage();
-      // @ts-expect-error - reasoning is not supported in the official Chat Completion API spec
-      // this is handling third party providers that support reasoning
+      // Some third-party providers support reasoning on assistant messages even
+      // though it is not part of the official Chat Completions API type.
       asst.reasoning = item.rawContent?.[0]?.text;
       continue;
     } else if (item.type === 'hosted_tool_call') {

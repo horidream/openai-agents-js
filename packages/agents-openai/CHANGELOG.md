@@ -1,5 +1,80 @@
 # @openai/agents-openai
 
+## 0.13.2
+
+### Patch Changes
+
+- e5b75e1: feat: support GPT-5.6 reasoning and prompt-cache request controls
+- 48cdb52: feat: add experimental hosted Multi-agent Responses support
+- Updated dependencies [4c14038]
+- Updated dependencies [e5b75e1]
+- Updated dependencies [240b6eb]
+  - @openai/agents-core@0.13.2
+
+## 0.13.1
+
+### Patch Changes
+
+- 532ab2b: fix: support openai-node v6.46.0 usage types
+- ec48462: feat: add GPT-5.6 model defaults, reasoning, and sandbox compaction support
+- Updated dependencies [532ab2b]
+- Updated dependencies [ec48462]
+  - @openai/agents-core@0.13.1
+
+## 0.13.0
+
+### Patch Changes
+
+- @openai/agents-core@0.13.0
+
+## 0.12.1
+
+### Patch Changes
+
+- 75bf1df: fix(memory): restore persisted `input_text` system messages in conversation history
+- dc7864a: refactor: consolidate internal runtime helpers and adapter normalization
+- 28edf80: fix: accept ESM and CommonJS OpenAI clients in public APIs (#1432)
+- Updated dependencies [f064c56]
+- Updated dependencies [b65face]
+- Updated dependencies [59a67c4]
+- Updated dependencies [81d654f]
+- Updated dependencies [5f57fe1]
+- Updated dependencies [dc7864a]
+  - @openai/agents-core@0.12.1
+
+## 0.12.0
+
+### Patch Changes
+
+- 395699e: chore: upgrade openai package to the latest version
+- Updated dependencies [e044d14]
+- Updated dependencies [a8f81cd]
+- Updated dependencies [c450c2b]
+- Updated dependencies [5350aad]
+- Updated dependencies [395699e]
+- Updated dependencies [f990172]
+  - @openai/agents-core@0.12.0
+
+## 0.11.8
+
+### Patch Changes
+
+- Updated dependencies [dd64ba6]
+- Updated dependencies [b740fb3]
+  - @openai/agents-core@0.11.8
+
+## 0.11.7
+
+### Patch Changes
+
+- 9b54b79: fix(openai): honor top-level `input_image.detail` in the Chat Completions converter
+
+  The Chat Completions converter only read `detail` from `providerData.image_url.detail` and silently dropped the top-level `detail` field, even though the protocol defines it as a top-level field and both the Responses path and the Python SDK honor it. Top-level `detail` is now forwarded (with `providerData.image_url.detail` still taking precedence).
+
+- Updated dependencies [edd0a07]
+- Updated dependencies [dfbc3b0]
+  - @openai/agents-core@0.11.7
+
 ## 0.11.6
 
 ### Patch Changes

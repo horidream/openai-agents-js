@@ -1,4 +1,13 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  describe,
+  it,
+  expect,
+  vi,
+  beforeEach,
+  afterEach,
+  expectTypeOf,
+} from 'vitest';
+import type { MessageEvent as WebSocketMessageEvent } from 'ws';
 import type { RealtimeClientMessage } from '../src/clientMessages';
 import {
   DEFAULT_OPENAI_REALTIME_SESSION_CONFIG,
@@ -27,6 +36,14 @@ class TestBase extends OpenAIRealtimeBase {
   }
 }
 
+class VoidMessageOverrideTransport extends TestBase {
+  protected override _onMessage(
+    event: MessageEvent | WebSocketMessageEvent,
+  ): void {
+    super._onMessage(event);
+  }
+}
+
 function createToolCall() {
   return {
     type: 'function_call' as const,
@@ -34,6 +51,7 @@ function createToolCall() {
     callId: 'c1',
     name: 'tool',
     arguments: '{}',
+    responseId: 'response-1',
   };
 }
 
@@ -57,6 +75,13 @@ describe('OpenAIRealtimeBase helpers', () => {
     expect(key2).toBe('override');
   });
 
+  it('allows void-returning _onMessage overrides for subclasses', () => {
+    const transport = new VoidMessageOverrideTransport();
+
+    expect(transport).toBeInstanceOf(OpenAIRealtimeBase);
+    expectTypeOf(transport).toMatchTypeOf<OpenAIRealtimeBase>();
+  });
+
   it('merges session config defaults', () => {
     const base = new TestBase();
     const config = (base as any)._getMergedSessionConfig({
@@ -70,22 +95,22 @@ describe('OpenAIRealtimeBase helpers', () => {
     expect(config.audio?.output?.voice).toBeUndefined();
   });
 
-  it('uses gpt-realtime-2 as the default model', () => {
+  it('uses gpt-realtime-2.1 as the default model', () => {
     const base = new TestBase();
     const config = (base as any)._getMergedSessionConfig({});
 
-    expect(config.model).toBe('gpt-realtime-2');
+    expect(config.model).toBe('gpt-realtime-2.1');
   });
 
   it('maps reasoning-capable realtime session settings', () => {
     const base = new TestBase();
     const config = (base as any)._getMergedSessionConfig({
-      model: 'gpt-realtime-2',
+      model: 'gpt-realtime-2.1',
       parallelToolCalls: false,
       reasoning: { effort: 'low' },
     });
 
-    expect(config.model).toBe('gpt-realtime-2');
+    expect(config.model).toBe('gpt-realtime-2.1');
     expect(config.parallel_tool_calls).toBe(false);
     expect(config.reasoning).toEqual({ effort: 'low' });
   });
@@ -594,6 +619,7 @@ describe('OpenAIRealtimeBase helpers', () => {
     });
 
     expect(funcs[0]?.name).toBe('calc');
+    expect(funcs[0]?.responseId).toBe('r3');
     expect(updates.find((u) => (u as any).itemId === 'mcp1')).toBeTruthy();
   });
 

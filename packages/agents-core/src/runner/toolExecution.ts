@@ -1,10 +1,4 @@
 import { FunctionCallResultItem } from '../types/protocol';
-import type {
-  ToolCallStructuredOutput,
-  ToolOutputFileContent,
-  ToolOutputImage,
-  ToolOutputText,
-} from '../types/protocol';
 import { Agent, AgentOutputType, ToolsToFinalOutputResult } from '../agent';
 import { setAgentToolParentRunConfigOnDetails } from '../agentToolRunConfig';
 import { consumeAgentToolRunResult } from '../agentToolRunResults';
@@ -24,7 +18,11 @@ import { ModelResponse } from '../model';
 import {
   ComputerSafetyCheck,
   ComputerSafetyCheckResult,
+  ComputerToolCustomDataContext,
   FunctionToolResult,
+  FunctionToolCustomDataContext,
+  FUNCTION_TOOL_PARSED_INPUT_CALLBACK,
+  ApplyPatchToolCustomDataContext,
   invokeFunctionTool,
   resolveComputer,
   Tool,
@@ -32,7 +30,6 @@ import {
 import type { ShellResult } from '../shell';
 import { RunContext } from '../runContext';
 import type { RunResult } from '../result';
-import { encodeUint8ArrayToBase64 } from '../utils/base64';
 import { toSmartString } from '../utils/smartString';
 import { isZodObject } from '../utils';
 import { withFunctionSpan, withHandoffSpan } from '../tracing/createSpans';
@@ -49,9 +46,15 @@ import {
   matchesFunctionToolName,
 } from '../toolIdentity';
 import {
+  convertStructuredToolOutputToInputItem,
+  normalizeStructuredToolOutputs,
+} from './toolOutputNormalization';
+import {
   runToolInputGuardrails,
   runToolOutputGuardrails,
 } from '../utils/toolGuardrails';
+import type { ToolInputGuardrailResult } from '../toolGuardrail';
+import { maybeExtractToolOutputCustomData } from '../utils/customData';
 import {
   resolveApprovalRejectionMessage,
   TOOL_APPROVAL_REJECTION_MESSAGE,
@@ -80,13 +83,23 @@ const TOOL_APPROVAL_REJECTION_SCREENSHOT_DATA_URL =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==';
 
 type ParseToolArgumentsResult =
-  | { success: true; args: any }
-  | { success: false; error: Error };
+  { success: true; args: any } | { success: false; error: Error };
+
+type ToolInputGuardrailCheckResult =
+  { type: 'allow' } | { type: 'reject'; message: string };
 
 function getFunctionToolIdentity<TContext>(
   toolRun: ToolRunFunction<TContext>,
 ): string {
   return getFunctionToolQualifiedName(toolRun.tool) ?? toolRun.tool.name;
+}
+
+function cloneForCustomDataContext<T>(value: T): T {
+  try {
+    return structuredClone(value);
+  } catch {
+    return value;
+  }
 }
 
 function getFunctionToolTraceName<TContext>(
@@ -199,7 +212,7 @@ export async function executeFunctionToolCalls<TContext = UnknownContext>(
     if (approvalOutcome !== 'approved') {
       return approvalOutcome;
     }
-    return runApprovedFunctionTool(deps, toolRun);
+    return runApprovedFunctionTool(deps, toolRun, parseResult.args);
   };
 
   try {
@@ -229,6 +242,17 @@ function getMaxFunctionToolConcurrency(
   toolExecution: RunConfig['toolExecution'] | undefined,
 ): number | undefined {
   return toolExecution?.maxFunctionToolConcurrency ?? undefined;
+}
+
+function shouldRunPreApprovalInputGuardrails<TContext>(
+  deps: FunctionToolCallDeps<TContext>,
+): boolean {
+  return (
+    (
+      deps.agentToolParentRunConfig?.toolExecution ??
+      deps.runner.config.toolExecution
+    )?.preApprovalInputGuardrails === true
+  );
 }
 
 async function executeToolRunsWithConcurrency<TContext>(
@@ -375,18 +399,8 @@ async function handleFunctionApproval<TContext>(
   toolRun: ToolRunFunction<TContext>,
   parsedArgs: any,
 ): Promise<'approved' | FunctionToolResult<TContext>> {
-  const { state } = deps;
+  const { agent, state } = deps;
   const toolName = getFunctionToolIdentity(toolRun);
-  const needsApproval = await toolRun.tool.needsApproval(
-    state._context,
-    parsedArgs,
-    toolRun.toolCall.callId,
-  );
-
-  if (!needsApproval) {
-    return 'approved';
-  }
-
   const approval = state._context.isToolApproved({
     toolName,
     callId: toolRun.toolCall.callId,
@@ -397,16 +411,85 @@ async function handleFunctionApproval<TContext>(
     return await buildApprovalRejectionResult(deps, toolRun);
   }
 
-  if (approval !== true) {
-    return buildApprovalRequestResult(deps, toolRun);
+  if (approval === true) {
+    return 'approved';
   }
 
-  return 'approved';
+  const needsApproval = await toolRun.tool.needsApproval(
+    state._context,
+    parsedArgs,
+    toolRun.toolCall.callId,
+  );
+
+  if (!needsApproval) {
+    return 'approved';
+  }
+
+  if (shouldRunPreApprovalInputGuardrails(deps)) {
+    const inputGuardrailResult = await runFunctionToolInputGuardrails({
+      guardrails: toolRun.tool.inputGuardrails,
+      context: state._context,
+      agent,
+      toolCall: toolRun.toolCall,
+      onResult: (result) => {
+        state._toolInputGuardrailResults.push(result);
+      },
+    });
+
+    if (inputGuardrailResult.type === 'reject') {
+      return buildInputGuardrailRejectionResult(
+        deps,
+        toolRun,
+        inputGuardrailResult.message,
+      );
+    }
+  }
+  return buildApprovalRequestResult(deps, toolRun);
+}
+
+function buildInputGuardrailRejectionResult<TContext>(
+  deps: FunctionToolCallDeps<TContext>,
+  toolRun: ToolRunFunction<TContext>,
+  message: string,
+): FunctionToolResult<TContext> {
+  return {
+    type: 'function_output' as const,
+    tool: toolRun.tool,
+    output: message,
+    runItem: new RunToolCallOutputItem(
+      getToolCallOutputItem(toolRun.toolCall, message),
+      deps.agent,
+      message,
+    ),
+  };
+}
+
+async function runFunctionToolInputGuardrails<TContext>({
+  guardrails,
+  context,
+  agent,
+  toolCall,
+  onResult,
+}: {
+  guardrails?: ToolRunFunction<TContext>['tool']['inputGuardrails'];
+  context: RunContext<TContext>;
+  agent: Agent<TContext, any>;
+  toolCall: protocol.FunctionCallItem;
+  onResult?: (result: ToolInputGuardrailResult) => void;
+}): Promise<ToolInputGuardrailCheckResult> {
+  return runToolInputGuardrails({
+    guardrails,
+    context,
+    agent,
+    toolCall,
+    onResult,
+  });
 }
 
 async function runApprovedFunctionTool<TContext>(
   deps: FunctionToolCallDeps<TContext>,
   toolRun: ToolRunFunction<TContext>,
+  parsedInput: unknown,
 ): Promise<FunctionToolResult<TContext>> {
   const { agent, runner, state, agentToolParentRunConfig } = deps;
   const toolName = getFunctionToolIdentity(toolRun);
@@ -417,7 +500,7 @@ async function runApprovedFunctionTool<TContext>(
     }
 
     try {
-      const inputGuardrailResult = await runToolInputGuardrails({
+      const inputGuardrailResult = await runFunctionToolInputGuardrails({
         guardrails: toolRun.tool.inputGuardrails,
         context: state._context,
         agent,
@@ -436,6 +519,7 @@ async function runApprovedFunctionTool<TContext>(
       );
 
       let toolOutput: unknown;
+      let executedInput = parsedInput;
       if (inputGuardrailResult.type === 'reject') {
         toolOutput = inputGuardrailResult.message;
       } else {
@@ -446,6 +530,9 @@ async function runApprovedFunctionTool<TContext>(
         const toolDetails = {
           toolCall: toolRun.toolCall,
           resumeState,
+          [FUNCTION_TOOL_PARSED_INPUT_CALLBACK]: (input: unknown) => {
+            executedInput = cloneForCustomDataContext(input);
+          },
         };
         setAgentToolParentRunConfigOnDetails(
           toolDetails,
@@ -470,6 +557,19 @@ async function runApprovedFunctionTool<TContext>(
       }
       const stringResult = toSmartString(toolOutput);
 
+      const rawItem = getToolCallOutputItem(toolRun.toolCall, toolOutput);
+      const customData = await maybeExtractToolOutputCustomData(
+        toolRun.tool.customDataExtractor,
+        {
+          runContext: state._context,
+          tool: toolRun.tool,
+          toolCall: cloneForCustomDataContext(toolRun.toolCall),
+          input: cloneForCustomDataContext(executedInput),
+          output: cloneForCustomDataContext(toolOutput),
+          rawItem: cloneForCustomDataContext(rawItem),
+        } satisfies FunctionToolCustomDataContext<TContext>,
+      );
+
       emitToolEnd(
         runner,
         state._context,
@@ -488,15 +588,15 @@ async function runApprovedFunctionTool<TContext>(
         tool: toolRun.tool,
         output: toolOutput,
         runItem: new RunToolCallOutputItem(
-          getToolCallOutputItem(toolRun.toolCall, toolOutput),
+          rawItem,
           agent,
           toolOutput,
+          customData,
         ),
       };
 
       const nestedRunResult = consumeAgentToolRunResult(toolRun.toolCall) as
-        | RunResult<TContext, Agent<TContext, any>>
-        | undefined;
+        RunResult<TContext, Agent<TContext, any>> | undefined;
       if (nestedRunResult) {
         functionResult.agentRunResult = nestedRunResult;
         const nestedInterruptions = nestedRunResult.interruptions;
@@ -647,7 +747,7 @@ async function resolveToolApproval(options: {
   toolName: string;
   callId: string;
   approvalItem: RunToolApprovalItem;
-  needsApproval: boolean;
+  needsApproval: () => Promise<boolean>;
   onApproval?:
     | ((
         runContext: RunContext,
@@ -664,7 +764,19 @@ async function resolveToolApproval(options: {
     onApproval,
   } = options;
 
-  if (!needsApproval) {
+  const existingApproval = runContext.isToolApproved({
+    toolName,
+    callId,
+  });
+
+  if (existingApproval === true) {
+    return 'approved';
+  }
+  if (existingApproval === false) {
+    return 'rejected';
+  }
+
+  if (!(await needsApproval())) {
     return 'approved';
   }
 
@@ -699,15 +811,14 @@ async function resolveToolApproval(options: {
 }
 
 type ApprovalDecisionResult =
-  | { status: 'approved' }
-  | { status: 'pending' | 'rejected'; item: RunItem };
+  { status: 'approved' } | { status: 'pending' | 'rejected'; item: RunItem };
 
 async function handleToolApprovalDecision(options: {
   runContext: RunContext;
   toolName: string;
   callId: string;
   approvalItem: RunToolApprovalItem;
-  needsApproval: boolean;
+  needsApproval: () => Promise<boolean>;
   onApproval?:
     | ((
         runContext: RunContext,
@@ -812,11 +923,8 @@ export async function executeShellActions(
       toolName: shellTool.name,
       callId: toolCallKey,
       approvalItem,
-      needsApproval: await shellTool.needsApproval(
-        runContext,
-        toolCall.action,
-        toolCallKey,
-      ),
+      needsApproval: () =>
+        shellTool.needsApproval(runContext, toolCall.action, toolCallKey),
       onApproval: shellTool.onApproval,
       buildRejectionItem: async () => {
         const response = await resolveApprovalRejectionMessage({
@@ -954,11 +1062,12 @@ export async function executeApplyPatchOperations(
       toolName: applyPatchTool.name,
       callId: toolCallKey,
       approvalItem,
-      needsApproval: await applyPatchTool.needsApproval(
-        runContext,
-        toolCall.operation,
-        toolCallKey,
-      ),
+      needsApproval: () =>
+        applyPatchTool.needsApproval(
+          runContext,
+          toolCall.operation,
+          toolCallKey,
+        ),
       onApproval: applyPatchTool.onApproval,
       buildRejectionItem: async () => {
         const response = await resolveApprovalRejectionMessage({
@@ -1048,6 +1157,28 @@ export async function executeApplyPatchOperations(
           _logger.error('Failed to execute apply_patch operation:', err);
         }
 
+        const rawItem: protocol.ApplyPatchCallResultItem = {
+          type: 'apply_patch_call_output',
+          callId: toolCallKey,
+          status,
+        };
+
+        if (output) {
+          rawItem.output = output;
+        }
+
+        const customData = await maybeExtractToolOutputCustomData(
+          applyPatchTool.customDataExtractor,
+          {
+            runContext,
+            tool: applyPatchTool,
+            operation: cloneForCustomDataContext(toolCall.operation),
+            output,
+            status,
+            rawItem: cloneForCustomDataContext(rawItem),
+          } satisfies ApplyPatchToolCustomDataContext,
+        );
+
         emitToolEnd(
           runner,
           runContext,
@@ -1061,17 +1192,7 @@ export async function executeApplyPatchOperations(
           span.spanData.output = output;
         }
 
-        const rawItem: protocol.ApplyPatchCallResultItem = {
-          type: 'apply_patch_call_output',
-          callId: toolCallKey,
-          status,
-        };
-
-        if (output) {
-          rawItem.output = output;
-        }
-
-        return new RunToolCallOutputItem(rawItem, agent, output);
+        return new RunToolCallOutputItem(rawItem, agent, output, customData);
       },
     );
 
@@ -1122,30 +1243,29 @@ export async function executeComputerActions(
     );
     const needsApprovalCandidate = (computerTool as { needsApproval?: unknown })
       .needsApproval;
-    const needsApproval =
-      typeof needsApprovalCandidate === 'function'
-        ? (
-            await Promise.all(
-              computerActions.map((computerAction) =>
-                (
-                  needsApprovalCandidate as (
-                    runContext: RunContext,
-                    action: protocol.ComputerAction,
-                    callId?: string,
-                  ) => Promise<boolean>
-                )(runContext, computerAction, toolCall.callId),
-              ),
-            )
-          ).some(Boolean)
-        : typeof needsApprovalCandidate === 'boolean'
-          ? needsApprovalCandidate
-          : false;
     const approvalDecision = await handleToolApprovalDecision({
       runContext,
       toolName: computerTool.name,
       callId: toolCall.callId,
       approvalItem,
-      needsApproval,
+      needsApproval: async () =>
+        typeof needsApprovalCandidate === 'function'
+          ? (
+              await Promise.all(
+                computerActions.map((computerAction) =>
+                  (
+                    needsApprovalCandidate as (
+                      runContext: RunContext,
+                      action: protocol.ComputerAction,
+                      callId?: string,
+                    ) => Promise<boolean>
+                  )(runContext, computerAction, toolCall.callId),
+                ),
+              )
+            ).some(Boolean)
+          : typeof needsApprovalCandidate === 'boolean'
+            ? needsApprovalCandidate
+            : false,
       buildRejectionItem: async () => {
         const rejectionMessage = await getRejectionMessage();
         const rejectionOutput: protocol.ComputerToolOutput = {
@@ -1235,14 +1355,8 @@ export async function executeComputerActions(
           });
         }
 
-        // Hooks: on_tool_end (global + agent)
-        emitToolEnd(runner, runContext, agent, computerTool, output, toolCall);
-
         // Return the screenshot as a data URL when available; fall back to an empty string on failures.
         const imageUrl = output ? `data:image/png;base64,${output}` : '';
-        if (span && runner.config.traceIncludeSensitiveData) {
-          span.spanData.output = imageUrl;
-        }
         const rawItem: protocol.ComputerCallResultItem = {
           type: 'computer_call_result',
           callId: toolCall.callId,
@@ -1253,7 +1367,25 @@ export async function executeComputerActions(
             acknowledgedSafetyChecks,
           };
         }
-        return new RunToolCallOutputItem(rawItem, agent, imageUrl);
+        const customData = await maybeExtractToolOutputCustomData(
+          computerTool.customDataExtractor,
+          {
+            runContext,
+            tool: computerTool,
+            toolCall: cloneForCustomDataContext(toolCall),
+            output: imageUrl,
+            rawItem: cloneForCustomDataContext(rawItem),
+          } satisfies ComputerToolCustomDataContext,
+        );
+
+        // Hooks: on_tool_end (global + agent)
+        emitToolEnd(runner, runContext, agent, computerTool, output, toolCall);
+
+        if (span && runner.config.traceIncludeSensitiveData) {
+          span.spanData.output = imageUrl;
+        }
+
+        return new RunToolCallOutputItem(rawItem, agent, imageUrl, customData);
       },
     );
 
@@ -1314,6 +1446,18 @@ export async function executeHandoffCalls<
   return withHandoffSpan(
     async (handoffSpan) => {
       const handoff = actualHandoff.handoff;
+      const inputFilter =
+        handoff.inputFilter ?? runner.config.handoffInputFilter;
+      if (inputFilter != null && typeof inputFilter !== 'function') {
+        throw Object.assign(
+          new UserError('Invalid handoff input filter: not callable'),
+          {
+            data: {
+              details: 'not callable',
+            },
+          },
+        );
+      }
 
       const newAgent = await handoff.onInvokeHandoff(
         runContext,
@@ -1346,19 +1490,8 @@ export async function executeHandoffCalls<
       runner.emit('agent_handoff', runContext, agent, newAgent);
       agent.emit('agent_handoff', runContext, newAgent);
 
-      const inputFilter =
-        handoff.inputFilter ?? runner.config.handoffInputFilter;
-      if (inputFilter) {
+      if (inputFilter != null) {
         logger.debug('Filtering inputs for handoff');
-
-        if (typeof inputFilter !== 'function') {
-          handoffSpan.setError({
-            message: 'Invalid input filter',
-            data: {
-              details: 'not callable',
-            },
-          });
-        }
 
         const handoffInputData: HandoffInputData = {
           inputHistory: Array.isArray(originalInput)
@@ -1506,377 +1639,6 @@ export async function checkForFinalOutputFromTools<
   throw new UserError(`Invalid toolUseBehavior: ${toolUseBehavior}`, state);
 }
 
-type StructuredToolOutput =
-  | ToolOutputText
-  | ToolOutputImage
-  | ToolOutputFileContent;
-
-/**
- * Accepts whatever the tool returned and attempts to coerce it into the structured protocol
- * shapes we expose to downstream model adapters (input_text/input_image/input_file). Tools are
- * allowed to return either a single structured object or an array of them; anything else falls
- * back to the legacy string pipeline.
- */
-function normalizeStructuredToolOutputs(
-  output: unknown,
-): StructuredToolOutput[] | null {
-  if (Array.isArray(output)) {
-    const structured: StructuredToolOutput[] = [];
-    for (const item of output) {
-      const normalized = normalizeStructuredToolOutput(item);
-      if (!normalized) {
-        return null;
-      }
-      structured.push(normalized);
-    }
-    return structured;
-  }
-  const normalized = normalizeStructuredToolOutput(output);
-  return normalized ? [normalized] : null;
-}
-
-/**
- * Best-effort normalization of a single tool output item. If the object already matches the
- * protocol shape we simply cast it; otherwise we copy the recognised fields into the canonical
- * structure. Returning null lets the caller know we should revert to plain-string handling.
- */
-function normalizeStructuredToolOutput(
-  value: unknown,
-): StructuredToolOutput | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-  const type = value.type;
-  if (type === 'text' && typeof value.text === 'string') {
-    const output: ToolOutputText = { type: 'text', text: value.text };
-    if (isRecord(value.providerData)) {
-      output.providerData = value.providerData;
-    }
-    return output;
-  }
-
-  if (type === 'image') {
-    const output: ToolOutputImage = { type: 'image' };
-
-    let imageString: string | undefined;
-    let imageFileId: string | undefined;
-    const fallbackImageMediaType = getImageInlineMediaType(value);
-
-    const imageField = value.image;
-    if (typeof imageField === 'string' && imageField.length > 0) {
-      imageString = imageField;
-    } else if (isRecord(imageField)) {
-      const imageObj = imageField as Record<string, any>;
-      const inlineMediaType =
-        getImageInlineMediaType(imageObj) ?? fallbackImageMediaType;
-      if (isNonEmptyString(imageObj.url)) {
-        imageString = imageObj.url;
-      } else if (isNonEmptyString(imageObj.data)) {
-        imageString = toInlineImageString(imageObj.data, inlineMediaType);
-      } else if (
-        imageObj.data instanceof Uint8Array &&
-        imageObj.data.length > 0
-      ) {
-        imageString = toInlineImageString(imageObj.data, inlineMediaType);
-      }
-
-      if (!imageString) {
-        const candidateId =
-          (isNonEmptyString(imageObj.fileId) && imageObj.fileId) ||
-          (isNonEmptyString(imageObj.id) && imageObj.id) ||
-          undefined;
-        if (candidateId) {
-          imageFileId = candidateId;
-        }
-      }
-    }
-
-    if (
-      !imageString &&
-      typeof value.imageUrl === 'string' &&
-      value.imageUrl.length > 0
-    ) {
-      imageString = value.imageUrl;
-    }
-    if (
-      !imageFileId &&
-      typeof value.fileId === 'string' &&
-      value.fileId.length > 0
-    ) {
-      imageFileId = value.fileId;
-    }
-
-    if (
-      !imageString &&
-      typeof value.data === 'string' &&
-      value.data.length > 0
-    ) {
-      imageString = fallbackImageMediaType
-        ? toInlineImageString(value.data, fallbackImageMediaType)
-        : value.data;
-    } else if (
-      !imageString &&
-      value.data instanceof Uint8Array &&
-      value.data.length > 0
-    ) {
-      imageString = toInlineImageString(value.data, fallbackImageMediaType);
-    }
-    if (typeof value.detail === 'string' && value.detail.length > 0) {
-      output.detail = value.detail;
-    }
-
-    if (imageString) {
-      output.image = imageString;
-    } else if (imageFileId) {
-      output.image = { fileId: imageFileId };
-    } else {
-      return null;
-    }
-
-    if (isRecord(value.providerData)) {
-      output.providerData = value.providerData;
-    }
-    return output;
-  }
-
-  if (type === 'file') {
-    const fileValue = normalizeFileValue(value);
-    if (!fileValue) {
-      return null;
-    }
-
-    const output: ToolOutputFileContent = { type: 'file', file: fileValue };
-
-    if (isRecord(value.providerData)) {
-      output.providerData = value.providerData;
-    }
-    return output;
-  }
-
-  return null;
-}
-
-/**
- * Translates the normalized tool output into the protocol `input_*` items. This is the last hop
- * before we hand the data to model-specific adapters, so we generate the exact schema expected by
- * the protocol definitions.
- */
-function convertStructuredToolOutputToInputItem(
-  output: StructuredToolOutput,
-): ToolCallStructuredOutput {
-  if (output.type === 'text') {
-    const result: protocol.InputText = {
-      type: 'input_text',
-      text: output.text,
-    };
-    if (output.providerData) {
-      result.providerData = output.providerData;
-    }
-    return result;
-  }
-  if (output.type === 'image') {
-    const result: protocol.InputImage = { type: 'input_image' };
-    if (typeof output.detail === 'string' && output.detail.length > 0) {
-      result.detail = output.detail;
-    }
-    if (typeof output.image === 'string' && output.image.length > 0) {
-      result.image = output.image;
-    } else if (isRecord(output.image)) {
-      const imageObj = output.image as Record<string, any>;
-      const inlineMediaType = getImageInlineMediaType(imageObj);
-      if (isNonEmptyString(imageObj.url)) {
-        result.image = imageObj.url;
-      } else if (isNonEmptyString(imageObj.data)) {
-        result.image =
-          inlineMediaType && !imageObj.data.startsWith('data:')
-            ? asDataUrl(imageObj.data, inlineMediaType)
-            : imageObj.data;
-      } else if (
-        imageObj.data instanceof Uint8Array &&
-        imageObj.data.length > 0
-      ) {
-        const base64 = encodeUint8ArrayToBase64(imageObj.data);
-        result.image = asDataUrl(base64, inlineMediaType);
-      } else {
-        const referencedId =
-          (isNonEmptyString(imageObj.fileId) && imageObj.fileId) ||
-          (isNonEmptyString(imageObj.id) && imageObj.id) ||
-          undefined;
-        if (referencedId) {
-          result.image = { id: referencedId };
-        }
-      }
-    }
-    if (output.providerData) {
-      result.providerData = output.providerData;
-    }
-    return result;
-  }
-
-  if (output.type === 'file') {
-    const result: protocol.InputFile = { type: 'input_file' };
-    const fileValue = output.file;
-    if (typeof fileValue === 'string') {
-      result.file = fileValue;
-    } else if (fileValue && typeof fileValue === 'object') {
-      const record = fileValue as Record<string, any>;
-      if ('data' in record && record.data) {
-        const mediaType = record.mediaType ?? 'text/plain';
-        if (typeof record.data === 'string') {
-          result.file = asDataUrl(record.data, mediaType);
-        } else {
-          const base64 = encodeUint8ArrayToBase64(record.data);
-          result.file = asDataUrl(base64, mediaType);
-        }
-      } else if (typeof record.url === 'string' && record.url.length > 0) {
-        result.file = { url: record.url };
-      } else {
-        const referencedId =
-          (typeof record.id === 'string' &&
-            record.id.length > 0 &&
-            record.id) ||
-          (typeof record.fileId === 'string' && record.fileId.length > 0
-            ? record.fileId
-            : undefined);
-        if (referencedId) {
-          result.file = { id: referencedId };
-        }
-      }
-
-      if (typeof record.filename === 'string' && record.filename.length > 0) {
-        result.filename = record.filename;
-      }
-    }
-    if (output.providerData) {
-      result.providerData = output.providerData;
-    }
-    return result;
-  }
-  const exhaustiveCheck: never = output;
-  return exhaustiveCheck;
-}
-
-type FileReferenceValue = ToolOutputFileContent['file'];
-
-function normalizeFileValue(
-  value: Record<string, any>,
-): FileReferenceValue | null {
-  const directFile = value.file;
-  if (typeof directFile === 'string' && directFile.length > 0) {
-    return directFile;
-  }
-
-  const normalizedObject = normalizeFileObjectCandidate(directFile);
-  if (normalizedObject) {
-    return normalizedObject;
-  }
-
-  const legacyValue = normalizeLegacyFileValue(value);
-  if (legacyValue) {
-    return legacyValue;
-  }
-
-  return null;
-}
-
-function normalizeFileObjectCandidate(
-  value: unknown,
-): FileReferenceValue | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-
-  if ('data' in value && value.data !== undefined) {
-    const dataValue = value.data;
-    const hasStringData = typeof dataValue === 'string' && dataValue.length > 0;
-    const hasBinaryData =
-      dataValue instanceof Uint8Array && dataValue.length > 0;
-    if (!hasStringData && !hasBinaryData) {
-      return null;
-    }
-
-    if (
-      !isNonEmptyString(value.mediaType) ||
-      !isNonEmptyString(value.filename)
-    ) {
-      return null;
-    }
-
-    return {
-      data:
-        typeof dataValue === 'string' ? dataValue : new Uint8Array(dataValue),
-      mediaType: value.mediaType,
-      filename: value.filename,
-    };
-  }
-
-  if (isNonEmptyString(value.url)) {
-    const result: { url: string; filename?: string } = { url: value.url };
-    if (isNonEmptyString(value.filename)) {
-      result.filename = value.filename;
-    }
-    return result;
-  }
-
-  const referencedId =
-    (isNonEmptyString(value.id) && value.id) ||
-    (isNonEmptyString(value.fileId) && (value.fileId as string));
-  if (referencedId) {
-    const result: { id: string; filename?: string } = { id: referencedId };
-    if (isNonEmptyString(value.filename)) {
-      result.filename = value.filename;
-    }
-    return result;
-  }
-
-  return null;
-}
-
-function normalizeLegacyFileValue(
-  value: Record<string, any>,
-): FileReferenceValue | null {
-  const filename =
-    typeof value.filename === 'string' && value.filename.length > 0
-      ? value.filename
-      : undefined;
-  const mediaType =
-    typeof value.mediaType === 'string' && value.mediaType.length > 0
-      ? value.mediaType
-      : undefined;
-
-  if (typeof value.fileData === 'string' && value.fileData.length > 0) {
-    if (!mediaType || !filename) {
-      return null;
-    }
-    return { data: value.fileData, mediaType, filename };
-  }
-
-  if (value.fileData instanceof Uint8Array && value.fileData.length > 0) {
-    if (!mediaType || !filename) {
-      return null;
-    }
-    return { data: new Uint8Array(value.fileData), mediaType, filename };
-  }
-
-  if (typeof value.fileUrl === 'string' && value.fileUrl.length > 0) {
-    const result: { url: string; filename?: string } = { url: value.fileUrl };
-    if (filename) {
-      result.filename = filename;
-    }
-    return result;
-  }
-
-  if (typeof value.fileId === 'string' && value.fileId.length > 0) {
-    const result: { id: string; filename?: string } = { id: value.fileId };
-    if (filename) {
-      result.filename = filename;
-    }
-    return result;
-  }
-
-  return null;
-}
-
 function normalizeSafetyChecks(
   checks: unknown,
 ): ComputerSafetyCheck[] | undefined {
@@ -1974,34 +1736,4 @@ function isRecord(value: unknown): value is Record<string, any> {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
-}
-
-function getImageInlineMediaType(
-  value: Record<string, any>,
-): string | undefined {
-  if (isNonEmptyString(value.mediaType)) {
-    return value.mediaType;
-  }
-  if (isNonEmptyString((value as any).mimeType)) {
-    return (value as any).mimeType;
-  }
-  return undefined;
-}
-
-function toInlineImageString(
-  data: string | Uint8Array,
-  mediaType?: string,
-): string {
-  if (typeof data === 'string') {
-    if (mediaType && !data.startsWith('data:')) {
-      return asDataUrl(data, mediaType);
-    }
-    return data;
-  }
-  const base64 = encodeUint8ArrayToBase64(data);
-  return asDataUrl(base64, mediaType);
-}
-
-function asDataUrl(base64: string, mediaType?: string): string {
-  return mediaType ? `data:${mediaType};base64,${base64}` : base64;
 }

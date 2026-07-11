@@ -31,19 +31,30 @@ function waitForAsyncResponseCreate() {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 class FakeRTCPeerConnection {
   ontrack: ((ev: any) => void) | null = null;
   onconnectionstatechange: (() => void) | null = null;
   connectionState = 'new';
 
   createDataChannel(_name: string) {
-    lastChannel = new FakeRTCDataChannel();
+    const dataChannel = new FakeRTCDataChannel();
+    lastChannel = dataChannel;
     // simulate async open event
     setTimeout(() => {
       this._simulateStateChange('connected');
-      lastChannel?.dispatchEvent(new Event('open'));
+      dataChannel.dispatchEvent(new Event('open'));
     }, 0);
-    return lastChannel as unknown as RTCDataChannel;
+    return dataChannel as unknown as RTCDataChannel;
   }
   addTrack() {}
   async createOffer() {
@@ -61,12 +72,7 @@ class FakeRTCPeerConnection {
 
   _simulateStateChange(
     state:
-      | 'new'
-      | 'connecting'
-      | 'connected'
-      | 'disconnected'
-      | 'failed'
-      | 'closed',
+      'new' | 'connecting' | 'connected' | 'disconnected' | 'failed' | 'closed',
   ) {
     if (this.connectionState === state) return;
     this.connectionState = state;
@@ -106,6 +112,8 @@ describe('OpenAIRealtimeWebRTC.interrupt', () => {
     });
     Object.defineProperty(globalThis, 'fetch', {
       value: async () => ({
+        ok: true,
+        status: 200,
         text: async () => 'answer',
         headers: {
           get: (headerKey: string) => {
@@ -164,6 +172,33 @@ describe('OpenAIRealtimeWebRTC.interrupt', () => {
     expect(JSON.parse(channel.sent[2])).toEqual({
       type: 'output_audio_buffer.clear',
     });
+  });
+
+  it('rejects with the provider error message when /realtime/calls fails', async () => {
+    Object.defineProperty(globalThis, 'fetch', {
+      value: async () => ({
+        ok: false,
+        status: 429,
+        statusText: 'Too Many Requests',
+        text: async () =>
+          JSON.stringify({
+            error: {
+              message: 'You exceeded your current quota.',
+              type: 'insufficient_quota',
+              code: 'insufficient_quota',
+            },
+          }),
+        headers: { get: () => null },
+      }),
+      configurable: true,
+      writable: true,
+    });
+
+    const rtc = new OpenAIRealtimeWebRTC();
+    rtc.on('error', () => {});
+    await expect(rtc.connect({ apiKey: 'ek_test' })).rejects.toThrow(
+      'Realtime call request failed with status 429: You exceeded your current quota.',
+    );
   });
 
   it('stops sending response.cancel once audio playback is done', async () => {
@@ -385,6 +420,69 @@ describe('OpenAIRealtimeWebRTC.interrupt', () => {
     expect(rtc.currentModel).toBe('rtc-model');
   });
 
+  it('coalesces overlapping connect calls before API key resolution', async () => {
+    const apiKey = createDeferred<string>();
+    const firstApiKey = vi.fn(() => apiKey.promise);
+    const secondApiKey = vi.fn(async () => 'ek_second');
+    let peerConnectionCount = 0;
+
+    class CountingPeerConnection extends FakeRTCPeerConnection {
+      constructor() {
+        super();
+        peerConnectionCount += 1;
+      }
+    }
+
+    (global as any).RTCPeerConnection = CountingPeerConnection as any;
+    const rtc = new OpenAIRealtimeWebRTC();
+    const firstConnect = rtc.connect({
+      apiKey: firstApiKey,
+      model: 'first-model',
+    });
+    const overlappingConnect = rtc.connect({
+      apiKey: secondApiKey,
+      model: 'second-model',
+    });
+
+    expect(firstApiKey).toHaveBeenCalledOnce();
+    expect(secondApiKey).not.toHaveBeenCalled();
+
+    apiKey.resolve('ek_first');
+    await Promise.all([firstConnect, overlappingConnect]);
+
+    expect(peerConnectionCount).toBe(1);
+    expect(rtc.currentModel).toBe('first-model');
+    expect(rtc.status).toBe('connected');
+  });
+
+  it('ignores stale data channel errors after a failed connect is retried', async () => {
+    let shouldFailConnection = true;
+    const rtc = new OpenAIRealtimeWebRTC({
+      changePeerConnection: async (peerConnection) => {
+        if (shouldFailConnection) {
+          shouldFailConnection = false;
+          throw new Error('first connection failed');
+        }
+        return peerConnection;
+      },
+    });
+    rtc.on('error', () => {});
+
+    await expect(rtc.connect({ apiKey: 'ek_test' })).rejects.toThrow(
+      'first connection failed',
+    );
+    const failedChannel = lastChannel as FakeRTCDataChannel;
+
+    await rtc.connect({ apiKey: 'ek_test' });
+    const survivingChannel = lastChannel as FakeRTCDataChannel;
+    expect(rtc.status).toBe('connected');
+
+    failedChannel.dispatchEvent(new Event('error'));
+
+    expect(rtc.status).toBe('connected');
+    expect(rtc.connectionState.dataChannel).toBe(survivingChannel);
+  });
+
   it('resets state on connection failure', async () => {
     class FailingRTCPeerConnection extends FakeRTCPeerConnection {
       createDataChannel(_name: string) {
@@ -504,6 +602,8 @@ describe('OpenAIRealtimeWebRTC.connectionState', () => {
     });
     Object.defineProperty(globalThis, 'fetch', {
       value: async () => ({
+        ok: true,
+        status: 200,
         text: async () => 'answer',
         headers: {
           get: (headerKey: string) => {
@@ -664,6 +764,8 @@ describe('OpenAIRealtimeWebRTC.callId', () => {
     });
     Object.defineProperty(globalThis, 'fetch', {
       value: async () => ({
+        ok: true,
+        status: 200,
         text: async () => 'answer',
         headers: {
           get: (headerName: string) => {
@@ -834,6 +936,8 @@ describe('OpenAIRealtimeWebRTC session.updated ack', () => {
     });
     Object.defineProperty(globalThis, 'fetch', {
       value: async () => ({
+        ok: true,
+        status: 200,
         text: async () => 'answer',
         headers: {
           get: (headerKey: string) => {
@@ -875,7 +979,7 @@ describe('OpenAIRealtimeWebRTC session.updated ack', () => {
     const rtc = new OpenAIRealtimeWebRTC();
     const connectPromise = rtc.connect({ apiKey: 'ek_test' });
 
-    // Flush microtasks so the data channel 'open' fires and session.update is sent
+    // Flush microtasks so the data channel 'open' fires and session.update is sent.
     await vi.advanceTimersByTimeAsync(0);
 
     // Verify session.update was sent but no ack arrived
@@ -886,6 +990,36 @@ describe('OpenAIRealtimeWebRTC session.updated ack', () => {
     await vi.advanceTimersByTimeAsync(5000);
 
     // connect() should have resolved via the timeout path
+    await connectPromise;
+    expect(rtc.status).toBe('connected');
+  });
+
+  it('ignores malformed messages while waiting for session.updated', async () => {
+    const rtc = new OpenAIRealtimeWebRTC();
+    const connectPromise = rtc.connect({ apiKey: 'ek_test' });
+
+    // Flush microtasks so the data channel 'open' fires and session.update is sent
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(() =>
+      noAckChannel!.dispatchEvent(new MessageEvent('message', { data: '{' })),
+    ).not.toThrow();
+    expect(() =>
+      noAckChannel!.dispatchEvent(
+        new MessageEvent('message', { data: new Uint8Array([0, 1, 2]) }),
+      ),
+    ).not.toThrow();
+
+    noAckChannel!.dispatchEvent(
+      new MessageEvent('message', {
+        data: JSON.stringify({
+          type: 'session.updated',
+          event_id: 'session_ack',
+          session: {},
+        }),
+      }),
+    );
+
     await connectPromise;
     expect(rtc.status).toBe('connected');
   });

@@ -2,10 +2,7 @@ import { UserError } from '@openai/agents-core';
 import OpenAI from 'openai';
 
 export type WebSocketMessageValue =
-  | string
-  | Blob
-  | ArrayBuffer
-  | ArrayBufferView;
+  string | Blob | ArrayBuffer | ArrayBufferView;
 
 export type ResponsesWebSocketKeepAliveOptions = {
   /**
@@ -22,16 +19,25 @@ export type ResponsesWebSocketKeepAliveOptions = {
   pingTimeoutMs?: number | null;
 };
 
+export const RESPONSES_WEBSOCKET_ERROR_MESSAGES = {
+  connection_closed_before_opening:
+    'Responses websocket connection closed before opening.',
+  connection_closed_before_terminal_response_event:
+    'Responses websocket connection closed before a terminal response event.',
+  pong_timeout: 'Responses websocket pong timeout.',
+  socket_not_open: 'Responses websocket is not open.',
+} as const;
+
 export type ResponsesWebSocketInternalErrorCode =
-  | 'connection_closed_before_opening'
-  | 'connection_closed_before_terminal_response_event'
-  | 'pong_timeout'
-  | 'socket_not_open';
+  keyof typeof RESPONSES_WEBSOCKET_ERROR_MESSAGES;
 
 export class ResponsesWebSocketInternalError extends Error {
   readonly code: ResponsesWebSocketInternalErrorCode;
 
-  constructor(code: ResponsesWebSocketInternalErrorCode, message: string) {
+  constructor(
+    code: ResponsesWebSocketInternalErrorCode,
+    message: string = RESPONSES_WEBSOCKET_ERROR_MESSAGES[code],
+  ) {
     super(message);
     this.name = 'ResponsesWebSocketInternalError';
     this.code = code;
@@ -141,9 +147,10 @@ export function shouldWrapNoEventWebSocketError(error: unknown): boolean {
   }
 
   return (
-    error.message === 'Responses websocket connection closed before opening.' ||
     error.message ===
-      'Responses websocket connection closed before a terminal response event.'
+      RESPONSES_WEBSOCKET_ERROR_MESSAGES.connection_closed_before_opening ||
+    error.message ===
+      RESPONSES_WEBSOCKET_ERROR_MESSAGES.connection_closed_before_terminal_response_event
   );
 }
 
@@ -156,7 +163,7 @@ export function isWebSocketNotOpenError(error: unknown): boolean {
     return false;
   }
 
-  if (error.message === 'Responses websocket is not open.') {
+  if (error.message === RESPONSES_WEBSOCKET_ERROR_MESSAGES.socket_not_open) {
     return true;
   }
 
@@ -250,8 +257,7 @@ export class ResponsesWebSocketConnection {
     keepAliveOptions: ResponsesWebSocketKeepAliveOptions = {},
   ): Promise<ResponsesWebSocketConnection> {
     const WebSocketCtor = (globalThis as any).WebSocket as
-      | (new (url: string, init?: unknown) => WebSocket)
-      | undefined;
+      (new (url: string, init?: unknown) => WebSocket) | undefined;
 
     if (!WebSocketCtor) {
       throw new UserError(
@@ -310,7 +316,6 @@ export class ResponsesWebSocketConnection {
     ) {
       throw new ResponsesWebSocketInternalError(
         'connection_closed_before_opening',
-        'Responses websocket connection closed before opening.',
       );
     }
 
@@ -334,7 +339,6 @@ export class ResponsesWebSocketConnection {
           this.#error ??
             new ResponsesWebSocketInternalError(
               'connection_closed_before_opening',
-              'Responses websocket connection closed before opening.',
             ),
         );
       };
@@ -363,10 +367,7 @@ export class ResponsesWebSocketConnection {
 
   async send(data: string): Promise<void> {
     if (this.#socket.readyState !== this.#socket.OPEN) {
-      throw new ResponsesWebSocketInternalError(
-        'socket_not_open',
-        'Responses websocket is not open.',
-      );
+      throw new ResponsesWebSocketInternalError('socket_not_open');
     }
 
     this.#socket.send(data);
@@ -486,10 +487,7 @@ export class ResponsesWebSocketConnection {
       }
       this.#pingTimeoutTimer = setTimeout(() => {
         this.#pingTimeoutTimer = undefined;
-        this.#error = new ResponsesWebSocketInternalError(
-          'pong_timeout',
-          'Responses websocket pong timeout.',
-        );
+        this.#error = new ResponsesWebSocketInternalError('pong_timeout');
         try {
           if (typeof socket.terminate === 'function') {
             socket.terminate();

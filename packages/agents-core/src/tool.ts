@@ -38,6 +38,9 @@ import {
   ToolInputGuardrailFunction,
   ToolOutputGuardrailFunction,
 } from './toolGuardrail';
+import type { ToolOutputCustomDataExtractor } from './utils/customData';
+
+export type { ToolOutputCustomData } from './utils/customData';
 
 export type {
   ToolOutputText,
@@ -61,15 +64,71 @@ export type ToolApprovalFunction<TParameters extends ToolInputParameters> = (
   callId?: string,
 ) => Promise<boolean>;
 
+export const FUNCTION_TOOL_PARSED_INPUT_CALLBACK = Symbol(
+  'openai.agents.functionToolParsedInputCallback',
+);
+
 export type ToolCallDetails = {
   toolCall?: protocol.FunctionCallItem;
   resumeState?: string;
   signal?: AbortSignal;
+  [FUNCTION_TOOL_PARSED_INPUT_CALLBACK]?: (input: unknown) => void;
   /**
    * Internal: parent runner config for nested agent-tool runs (Agent.asTool).
    */
   parentRunConfig?: Partial<RunConfig>;
 };
+
+export type FunctionToolCustomDataContext<
+  Context = UnknownContext,
+  TParameters extends ToolInputParameters = ToolInputParameters,
+  Result = unknown,
+> = {
+  runContext: RunContext<Context>;
+  tool: FunctionTool<Context, TParameters, Result>;
+  toolCall: protocol.FunctionCallItem;
+  input: unknown;
+  output: unknown;
+  rawItem: protocol.FunctionCallResultItem;
+};
+
+export type FunctionToolCustomDataExtractor<
+  Context = UnknownContext,
+  TParameters extends ToolInputParameters = ToolInputParameters,
+  Result = unknown,
+> = ToolOutputCustomDataExtractor<
+  FunctionToolCustomDataContext<Context, TParameters, Result>
+>;
+
+export type ComputerToolCustomDataContext<
+  Context = UnknownContext,
+  TComputer extends Computer = Computer,
+> = {
+  runContext: RunContext<Context>;
+  tool: ComputerTool<Context, TComputer>;
+  toolCall: protocol.ComputerUseCallItem;
+  output: string;
+  rawItem: protocol.ComputerCallResultItem;
+};
+
+export type ComputerToolCustomDataExtractor<
+  Context = UnknownContext,
+  TComputer extends Computer = Computer,
+> = ToolOutputCustomDataExtractor<
+  ComputerToolCustomDataContext<Context, TComputer>
+>;
+
+export type ApplyPatchToolCustomDataContext = {
+  runContext: RunContext;
+  tool: ApplyPatchTool;
+  operation: ApplyPatchOperation;
+  output: string;
+  status: protocol.ApplyPatchCallResultItem['status'];
+  rawItem: protocol.ApplyPatchCallResultItem;
+};
+
+export type ApplyPatchToolCustomDataExtractor =
+  ToolOutputCustomDataExtractor<ApplyPatchToolCustomDataContext>;
 
 export type FunctionToolTimeoutBehavior = 'error_as_result' | 'raise_exception';
 
@@ -115,8 +174,7 @@ export type ShellToolInlineSkill = {
 };
 
 export type ShellToolContainerSkill =
-  | ShellToolSkillReference
-  | ShellToolInlineSkill;
+  ShellToolSkillReference | ShellToolInlineSkill;
 
 export type ShellToolContainerNetworkPolicyDomainSecret = {
   domain: string;
@@ -157,12 +215,10 @@ export type ShellToolContainerReferenceEnvironment = {
 };
 
 export type ShellToolHostedEnvironment =
-  | ShellToolContainerAutoEnvironment
-  | ShellToolContainerReferenceEnvironment;
+  ShellToolContainerAutoEnvironment | ShellToolContainerReferenceEnvironment;
 
 export type ShellToolEnvironment =
-  | ShellToolLocalEnvironment
-  | ShellToolHostedEnvironment;
+  ShellToolLocalEnvironment | ShellToolHostedEnvironment;
 
 export type ApplyPatchApprovalFunction = (
   runContext: RunContext,
@@ -211,8 +267,7 @@ type ToolEnabledPredicate<Context = UnknownContext> = (args: {
 }) => boolean | Promise<boolean>;
 
 type ToolEnabledOption<Context = UnknownContext> =
-  | boolean
-  | ToolEnabledPredicate<Context>;
+  boolean | ToolEnabledPredicate<Context>;
 
 /**
  * Exposes a function to the agent as a tool to be called
@@ -293,6 +348,15 @@ export type FunctionTool<
    * Guardrails that run after the tool executes.
    */
   outputGuardrails?: ToolOutputGuardrailDefinition<Context>[];
+
+  /**
+   * Optional callback that attaches SDK-only custom data to the emitted tool output item.
+   */
+  customDataExtractor?: FunctionToolCustomDataExtractor<
+    Context,
+    TParameters,
+    Result
+  >;
 };
 
 /**
@@ -426,6 +490,11 @@ export type ComputerTool<
    * Optional handler to acknowledge pending safety checks.
    */
   onSafetyCheck?: ComputerOnSafetyCheckFunction;
+
+  /**
+   * Optional callback that attaches SDK-only custom data to the emitted tool output item.
+   */
+  customDataExtractor?: ComputerToolCustomDataExtractor<Context, TComputer>;
 };
 
 /**
@@ -442,6 +511,7 @@ export function computerTool<
   computer: ComputerConfig<Context, TComputer>;
   needsApproval?: boolean | ComputerApprovalFunction;
   onSafetyCheck?: ComputerOnSafetyCheckFunction;
+  customDataExtractor?: ComputerToolCustomDataExtractor<Context, TComputer>;
 }): ComputerTool<Context, TComputer> {
   if (!options.computer) {
     throw new UserError(
@@ -463,6 +533,7 @@ export function computerTool<
     computer: options.computer,
     needsApproval,
     onSafetyCheck: options.onSafetyCheck,
+    customDataExtractor: options.customDataExtractor,
   };
 
   if (
@@ -867,6 +938,11 @@ export type ApplyPatchTool = {
    * Optional handler to auto-approve or reject when approval is required.
    */
   onApproval?: ApplyPatchOnApprovalFunction;
+
+  /**
+   * Optional callback that attaches SDK-only custom data to the emitted tool output item.
+   */
+  customDataExtractor?: ApplyPatchToolCustomDataExtractor;
 };
 
 export function applyPatchTool(
@@ -876,6 +952,7 @@ export function applyPatchTool(
     editor: Editor;
     needsApproval?: boolean | ApplyPatchApprovalFunction;
     onApproval?: ApplyPatchOnApprovalFunction;
+    customDataExtractor?: ApplyPatchToolCustomDataExtractor;
   },
 ): ApplyPatchTool {
   const needsApproval: ApplyPatchApprovalFunction =
@@ -892,6 +969,7 @@ export function applyPatchTool(
     editor: options.editor,
     needsApproval,
     onApproval: options.onApproval,
+    customDataExtractor: options.customDataExtractor,
   };
 }
 
@@ -922,7 +1000,8 @@ export function hostedMcpTool<Context = UnknownContext>(
     serverDescription?: string;
   } &
     // MCP server
-    (| {
+    (
+      | {
           serverLabel: string;
           serverUrl?: string;
           authorization?: string;
@@ -1078,10 +1157,7 @@ export type ClientToolSearchExecutorArgs<Context = UnknownContext> = {
 };
 
 export type ClientToolSearchExecutorResult<Context = UnknownContext> =
-  | Tool<Context>
-  | Tool<Context>[]
-  | null
-  | undefined;
+  Tool<Context> | Tool<Context>[] | null | undefined;
 
 export type ClientToolSearchExecutor<Context = UnknownContext> = (
   args: ClientToolSearchExecutorArgs<Context>,
@@ -1228,9 +1304,7 @@ export type FunctionToolResult<
  * If undefined is provided, the arguments to the tool will be passed as a string.
  */
 export type ToolInputParameters =
-  | undefined
-  | ZodObjectLike
-  | JsonObjectSchema<any>;
+  undefined | ZodObjectLike | JsonObjectSchema<any>;
 
 /**
  * The parameters of a tool that has strict mode enabled.
@@ -1245,9 +1319,7 @@ export type ToolInputParameters =
  * If undefined is provided, the arguments to the tool will be passed as a string.
  */
 export type ToolInputParametersStrict =
-  | undefined
-  | ZodObjectLike
-  | JsonObjectSchemaStrict<any>;
+  undefined | ZodObjectLike | JsonObjectSchemaStrict<any>;
 
 /**
  * The parameters of a tool that has strict mode disabled.
@@ -1257,8 +1329,7 @@ export type ToolInputParametersStrict =
  * Zod schemas are not supported without strict: true.
  */
 export type ToolInputParametersNonStrict =
-  | undefined
-  | JsonObjectSchemaNonStrict<any>;
+  undefined | JsonObjectSchemaNonStrict<any>;
 
 /**
  * The arguments to a tool.
@@ -1427,6 +1498,11 @@ type StrictToolOptions<
    * Optional formatter used for timeout messages when timeoutBehavior is `error_as_result`.
    */
   timeoutErrorFunction?: ToolTimeoutErrorFunction<Context>;
+
+  /**
+   * Optional callback that attaches SDK-only custom data to the emitted tool output item.
+   */
+  customDataExtractor?: FunctionToolCustomDataExtractor<Context>;
 };
 
 /**
@@ -1500,6 +1576,11 @@ type NonStrictToolOptions<
    * Optional formatter used for timeout messages when timeoutBehavior is `error_as_result`.
    */
   timeoutErrorFunction?: ToolTimeoutErrorFunction<Context>;
+
+  /**
+   * Optional callback that attaches SDK-only custom data to the emitted tool output item.
+   */
+  customDataExtractor?: FunctionToolCustomDataExtractor<Context>;
 };
 
 /**
@@ -1832,6 +1913,7 @@ export function tool<
       logger.debug(`Invoking tool ${name} with input ${input}`);
     }
 
+    details?.[FUNCTION_TOOL_PARSED_INPUT_CALLBACK]?.(parsed);
     const result = await options.execute(parsed, runContext, details);
     const stringResult = toSmartString(result);
 
@@ -1879,8 +1961,7 @@ export function tool<
     details?: ToolCallDetails,
   ): Promise<string | Result> {
     const detailsWithFlag = details as
-      | ToolCallDetailsWithTimeoutFlag
-      | undefined;
+      ToolCallDetailsWithTimeoutFlag | undefined;
     if (detailsWithFlag?.[FUNCTION_TOOL_TIMEOUT_ALREADY_ENFORCED]) {
       return invokeWithoutTimeout(runContext, input, details);
     }
@@ -1930,6 +2011,7 @@ export function tool<
     isEnabled,
     inputGuardrails: resolveToolInputGuardrails(options.inputGuardrails),
     outputGuardrails: resolveToolOutputGuardrails(options.outputGuardrails),
+    customDataExtractor: options.customDataExtractor,
   };
 }
 

@@ -1,5 +1,58 @@
 # @openai/agents-core
 
+## 0.13.2
+
+### Patch Changes
+
+- 4c14038: fix: remove the MCP shim initialization cycle
+- e5b75e1: feat: support GPT-5.6 reasoning and prompt-cache request controls
+- 240b6eb: fix: restore run usage when deserializing RunState
+
+## 0.13.1
+
+### Patch Changes
+
+- 532ab2b: fix: support openai-node v6.46.0 usage types
+- ec48462: feat: add GPT-5.6 model defaults, reasoning, and sandbox compaction support
+
+## 0.13.0
+
+## 0.12.1
+
+### Patch Changes
+
+- f064c56: fix: prevent acknowledged tool results from replaying on resume (#1435)
+- b65face: chore: correct explicit model flag spelling
+- 59a67c4: fix: reject invalid handoff input filters before invoking handoffs
+- 81d654f: feat: add invalid final output recovery handler
+- 5f57fe1: test: improve agents-core and agents-extensions coverage
+- dc7864a: refactor: consolidate internal runtime helpers and adapter normalization
+
+## 0.12.0
+
+### Patch Changes
+
+- e044d14: fix: tailor remote mount edit guidance to writable editor paths
+- a8f81cd: fix: avoid reevaluating resolved tool approvals
+- c450c2b: fix: parse special filesystem permission bits by position
+- 5350aad: fix: await sibling guardrails after execution failures
+- 395699e: chore: upgrade openai package to the latest version
+- f990172: fix: preserve empty array tool outputs as text
+
+## 0.11.8
+
+### Patch Changes
+
+- dd64ba6: feat: add opt-in pre-approval tool input guardrails
+- b740fb3: feat: add SDK-only custom data for tool outputs
+
+## 0.11.7
+
+### Patch Changes
+
+- edd0a07: fix: expose sandbox error retryability metadata
+- dfbc3b0: feat(mcp): expose serializable full tool results
+
 ## 0.11.6
 
 ### Patch Changes

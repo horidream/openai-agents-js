@@ -12,8 +12,10 @@ import {
 import { z } from 'zod';
 import {
   Agent,
+  GuardrailExecutionError,
   InputGuardrailTripwireTriggered,
   MaxTurnsExceededError,
+  ModelBehaviorError,
   ModelRefusalError,
   ModelResponse,
   OutputGuardrailTripwireTriggered,
@@ -109,6 +111,7 @@ describe('Runner.run', () => {
     it('accepts public tool execution config', () => {
       const toolExecution = {
         maxFunctionToolConcurrency: 2,
+        preApprovalInputGuardrails: true,
       } satisfies ToolExecutionConfig;
 
       const runner = new Runner({
@@ -223,6 +226,18 @@ describe('Runner.run', () => {
           }),
       ).toThrow(
         'toolExecution.maxFunctionToolConcurrency must be an integer greater than or equal to 1.',
+      );
+    });
+
+    it('rejects invalid pre-approval input guardrail config', () => {
+      expect(
+        () =>
+          new Runner({
+            tracingDisabled: true,
+            toolExecution: { preApprovalInputGuardrails: 'yes' as any },
+          }),
+      ).toThrow(
+        'toolExecution.preApprovalInputGuardrails must be a boolean when provided.',
       );
     });
 
@@ -1746,6 +1761,83 @@ describe('Runner.run', () => {
       expect(blockingGuardrail.execute).toHaveBeenCalledTimes(1);
     });
 
+    it('does not call the model while sibling parallel guardrails drain after a failure', async () => {
+      let releaseSlowGuardrail!: () => void;
+      let markSlowStarted!: () => void;
+      let markErrorThrown!: () => void;
+      const slowGuardrailCanFinish = new Promise<void>((resolve) => {
+        releaseSlowGuardrail = resolve;
+      });
+      const slowGuardrailStarted = new Promise<void>((resolve) => {
+        markSlowStarted = resolve;
+      });
+      const errorThrown = new Promise<void>((resolve) => {
+        markErrorThrown = resolve;
+      });
+      const slowGuardrail = {
+        name: 'slow-parallel-guardrail',
+        execute: async () => {
+          markSlowStarted();
+          await slowGuardrailCanFinish;
+          return { tripwireTriggered: false, outputInfo: {} };
+        },
+      };
+      const errorGuardrail = {
+        name: 'failing-parallel-guardrail',
+        execute: async () => {
+          await slowGuardrailStarted;
+          markErrorThrown();
+          throw new Error('boom');
+        },
+      };
+
+      class TrackingModel implements Model {
+        calls = 0;
+
+        async getResponse(_request: ModelRequest): Promise<ModelResponse> {
+          this.calls++;
+          return {
+            output: [fakeModelMessage('should not run')],
+            usage: new Usage(),
+          };
+        }
+
+        /* eslint-disable require-yield */
+        async *getStreamedResponse(_request: ModelRequest) {
+          throw new Error('not implemented');
+        }
+        /* eslint-enable require-yield */
+      }
+
+      const model = new TrackingModel();
+      const agent = new Agent({
+        name: 'ParallelGuardrailFailure',
+        model,
+        inputGuardrails: [slowGuardrail, errorGuardrail],
+      });
+
+      const runPromise = run(agent, 'hello');
+      let runSettled = false;
+      void runPromise.then(
+        () => {
+          runSettled = true;
+        },
+        () => {
+          runSettled = true;
+        },
+      );
+      await errorThrown;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const callsBeforeSiblingFinished = model.calls;
+      const settledBeforeSiblingFinished = runSettled;
+      releaseSlowGuardrail();
+
+      await expect(runPromise).rejects.toBeInstanceOf(GuardrailExecutionError);
+      expect(callsBeforeSiblingFinished).toBe(0);
+      expect(settledBeforeSiblingFinished).toBe(false);
+      expect(model.calls).toBe(0);
+    });
+
     it('throws InputGuardrailTripwireTriggered when parallel guardrail trips with structured output and model returns non-JSON', async () => {
       const fakeModel = new FakeModel([
         {
@@ -2456,6 +2548,333 @@ describe('Runner.run', () => {
         },
       });
       expect(result.finalOutput).toBe('safe fallback');
+    });
+
+    it('throws invalid structured final output without a handler', async () => {
+      const agent = new Agent({
+        name: 'InvalidStructuredOutput',
+        outputType: z.object({ summary: z.string() }),
+        model: new FakeModel([
+          {
+            output: [fakeModelMessage('not valid json')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+
+      await expect(run(agent, 'x')).rejects.toBeInstanceOf(ModelBehaviorError);
+    });
+
+    it('invalid final output handler returns structured final output', async () => {
+      const agent = new Agent({
+        name: 'InvalidStructuredOutputHandler',
+        outputType: z.object({ summary: z.string() }),
+        model: new FakeModel([
+          {
+            output: [fakeModelMessage('not valid json')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+
+      const result = await run(agent, 'x', {
+        errorHandlers: {
+          invalidFinalOutput: ({ error, runData }) => {
+            expect(error).toBeInstanceOf(ModelBehaviorError);
+            expect(runData.rawResponses).toHaveLength(1);
+            expect(extractAllTextOutput(runData.newItems)).toBe(
+              'not valid json',
+            );
+            return { finalOutput: { summary: 'safe fallback' } };
+          },
+        },
+      });
+
+      expect(result.finalOutput).toEqual({ summary: 'safe fallback' });
+      expect(extractAllTextOutput(result.newItems)).toBe(
+        'not valid json{"summary":"safe fallback"}',
+      );
+    });
+
+    it('invalid final output handler can skip history updates', async () => {
+      const agent = new Agent({
+        name: 'InvalidStructuredOutputNoHistory',
+        outputType: z.object({ summary: z.string() }),
+        model: new FakeModel([
+          {
+            output: [fakeModelMessage('not valid json')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+
+      const result = await run(agent, 'x', {
+        errorHandlers: {
+          invalidFinalOutput: () => ({
+            finalOutput: { summary: 'safe fallback' },
+            includeInHistory: false,
+          }),
+        },
+      });
+
+      expect(result.finalOutput).toEqual({ summary: 'safe fallback' });
+      expect(extractAllTextOutput(result.newItems)).toBe('not valid json');
+    });
+
+    it('invalid final output handler can decline recovery', async () => {
+      const agent = new Agent({
+        name: 'InvalidStructuredOutputDeclined',
+        outputType: z.object({ summary: z.string() }),
+        model: new FakeModel([
+          {
+            output: [fakeModelMessage('not valid json')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+
+      await expect(
+        run(agent, 'x', {
+          errorHandlers: {
+            invalidFinalOutput: () => undefined,
+          },
+        }),
+      ).rejects.toBeInstanceOf(ModelBehaviorError);
+    });
+
+    it('invalid final output handler validates fallback output', async () => {
+      const agent = new Agent({
+        name: 'InvalidStructuredOutputBadFallback',
+        outputType: z.object({ summary: z.string() }),
+        model: new FakeModel([
+          {
+            output: [fakeModelMessage('not valid json')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+
+      await expect(
+        run(agent, 'x', {
+          errorHandlers: {
+            invalidFinalOutput: () => ({
+              finalOutput: { unexpected: 'value' } as any,
+            }),
+          },
+        }),
+      ).rejects.toThrow(UserError);
+    });
+
+    it('default error handler can handle invalid final output', async () => {
+      const agent = new Agent({
+        name: 'DefaultInvalidStructuredOutput',
+        outputType: z.object({ summary: z.string() }),
+        model: new FakeModel([
+          {
+            output: [fakeModelMessage('not valid json')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+
+      const result = await run(agent, 'x', {
+        errorHandlers: {
+          default: ({ error }) => {
+            expect(error).toBeInstanceOf(ModelBehaviorError);
+            return { finalOutput: { summary: 'safe fallback' } };
+          },
+        },
+      });
+
+      expect(result.finalOutput).toEqual({ summary: 'safe fallback' });
+    });
+
+    it.each([
+      { name: 'missing message', output: [] },
+      { name: 'empty text message', output: [fakeModelMessage('')] },
+    ])(
+      'empty structured output handler avoids another model turn for $name',
+      async ({ output }) => {
+        class CountingModel implements Model {
+          public requests: ModelRequest[] = [];
+
+          constructor(private responses: ModelResponse[]) {}
+
+          async getResponse(request: ModelRequest): Promise<ModelResponse> {
+            this.requests.push(request);
+            const response = this.responses.shift();
+            if (!response) {
+              throw new Error('No response found');
+            }
+            return response;
+          }
+
+          getStreamedResponse(_request: ModelRequest): AsyncIterable<any> {
+            throw new Error('Not implemented');
+          }
+        }
+
+        const model = new CountingModel([
+          { output, usage: new Usage() },
+          {
+            output: [fakeModelMessage('{"summary":"unused"}')],
+            usage: new Usage(),
+          },
+        ]);
+        const agent = new Agent({
+          name: 'EmptyStructuredOutputHandler',
+          outputType: z.object({ summary: z.string() }),
+          model,
+        });
+
+        const result = await run(agent, 'x', {
+          errorHandlers: {
+            invalidFinalOutput: ({ error }) => {
+              expect(error).toBeInstanceOf(ModelBehaviorError);
+              expect((error as ModelBehaviorError).message).toBe(
+                'Model returned no final output for the structured output type.',
+              );
+              return { finalOutput: { summary: 'safe fallback' } };
+            },
+          },
+        });
+
+        expect(result.finalOutput).toEqual({ summary: 'safe fallback' });
+        expect(model.requests).toHaveLength(1);
+      },
+    );
+
+    it('invalid final output fallback does not retry or replay tools', async () => {
+      const sideEffects: string[] = [];
+      const recordSideEffect = tool({
+        name: 'record_side_effect',
+        description: 'Records a side effect.',
+        parameters: z.object({ value: z.string() }),
+        execute: async ({ value }) => {
+          sideEffects.push(value);
+          return `recorded:${value}`;
+        },
+      });
+      const agent = new Agent({
+        name: 'InvalidStructuredOutputAfterTool',
+        outputType: z.object({ summary: z.string() }),
+        tools: [recordSideEffect],
+        model: new FakeModel([
+          {
+            output: [
+              {
+                type: 'function_call',
+                id: 'fc_1',
+                callId: 'call_1',
+                name: 'record_side_effect',
+                status: 'completed',
+                arguments: '{"value":"once"}',
+                providerData: {},
+              } as protocol.FunctionCallItem,
+            ],
+            usage: new Usage(),
+          },
+          {
+            output: [fakeModelMessage('not valid json')],
+            usage: new Usage(),
+          },
+          {
+            output: [
+              {
+                type: 'function_call',
+                id: 'fc_2',
+                callId: 'call_2',
+                name: 'record_side_effect',
+                status: 'completed',
+                arguments: '{"value":"replayed"}',
+                providerData: {},
+              } as protocol.FunctionCallItem,
+            ],
+            usage: new Usage(),
+          },
+          {
+            output: [fakeModelMessage('{"summary":"unexpected retry"}')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+
+      const result = await run(agent, 'x', {
+        errorHandlers: {
+          invalidFinalOutput: () => ({
+            finalOutput: { summary: 'safe fallback' },
+          }),
+        },
+      });
+
+      expect(result.finalOutput).toEqual({ summary: 'safe fallback' });
+      expect(sideEffects).toEqual(['once']);
+    });
+
+    it('nested agent tools return invalid final output fallbacks', async () => {
+      const nestedAgent = new Agent({
+        name: 'NestedRecoverer',
+        outputType: z.object({ summary: z.string() }),
+        model: new FakeModel([
+          {
+            output: [fakeModelMessage('not valid json')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+      const nestedTool = nestedAgent.asTool({
+        toolName: 'recover_nested',
+        toolDescription: 'Recovers a structured nested output.',
+        runOptions: {
+          errorHandlers: {
+            invalidFinalOutput: () => ({
+              finalOutput: { summary: 'safe fallback' },
+            }),
+          },
+        },
+      });
+      const parentAgent = new Agent({
+        name: 'ParentAgent',
+        tools: [nestedTool],
+        model: new FakeModel([
+          {
+            output: [
+              {
+                type: 'function_call',
+                id: 'fc_nested',
+                callId: 'call_nested',
+                name: 'recover_nested',
+                status: 'completed',
+                arguments: '{"input":"recover"}',
+                providerData: {},
+              } as protocol.FunctionCallItem,
+            ],
+            usage: new Usage(),
+          },
+          {
+            output: [fakeModelMessage('parent done')],
+            usage: new Usage(),
+          },
+        ]),
+      });
+
+      const result = await run(parentAgent, 'x');
+      const nestedToolOutput = result.newItems.find(
+        (item): item is ToolCallOutputItem =>
+          item instanceof ToolCallOutputItem &&
+          item.rawItem.type === 'function_call_result' &&
+          item.rawItem.callId === 'call_nested',
+      );
+
+      const nestedOutput = nestedToolOutput?.rawItem.output;
+      const nestedOutputText =
+        typeof nestedOutput === 'string'
+          ? nestedOutput
+          : !Array.isArray(nestedOutput) && nestedOutput?.type === 'text'
+            ? nestedOutput.text
+            : undefined;
+      expect(nestedOutputText).toBe('{"summary":"safe fallback"}');
+      expect(result.finalOutput).toBe('parent done');
     });
 
     it('enforces maxTurns across multiple model calls', async () => {
@@ -5041,26 +5460,35 @@ describe('Runner.run', () => {
       expect(requestSettings.text?.verbosity).toBe('medium');
     });
 
-    it('uses model-specific defaults when the RunConfig model is explicit', async () => {
-      const modelResponse: ModelResponse = {
-        output: [fakeModelMessage('Hello explicit runner GPT-5')],
-        usage: new Usage(),
-      };
-      const inspectableModel = new InspectableModel(modelResponse);
-      const runner = new Runner({
-        model: 'gpt-5',
-        modelProvider: new InspectableModelProvider(inspectableModel),
-      });
-      const agent = new Agent({ name: 'RunnerModelAgent' });
+    it.each([
+      ['gpt-5', 'low'],
+      ['gpt-5.6', 'none'],
+    ] as const)(
+      'uses model-specific defaults when the RunConfig model is %s',
+      async (modelName, reasoningEffort) => {
+        const modelResponse: ModelResponse = {
+          output: [fakeModelMessage('Hello explicit runner GPT-5')],
+          usage: new Usage(),
+        };
+        const inspectableModel = new InspectableModel(modelResponse);
+        const runner = new Runner({
+          model: modelName,
+          modelProvider: new InspectableModelProvider(inspectableModel),
+        });
+        const agent = new Agent({ name: 'RunnerModelAgent' });
 
-      const result = await runner.run(agent, 'hello');
+        const result = await runner.run(agent, 'hello');
 
-      expect(result.finalOutput).toBe('Hello explicit runner GPT-5');
-      expect(inspectableModel.lastRequest?.modelSettings).toMatchObject({
-        reasoning: { effort: 'low' },
-        text: { verbosity: 'low' },
-      });
-    });
+        expect(result.finalOutput).toBe('Hello explicit runner GPT-5');
+        expect(inspectableModel.lastRequest?.modelSettings).toMatchObject({
+          reasoning: { effort: reasoningEffort },
+          text: { verbosity: 'low' },
+        });
+        expect(
+          inspectableModel.lastRequest?._internal?.reasoningEffortImplicit,
+        ).toBe(true);
+      },
+    );
 
     it('lets RunConfig modelSettings override implicit model defaults', async () => {
       const modelResponse: ModelResponse = {
@@ -5086,6 +5514,9 @@ describe('Runner.run', () => {
         text: { verbosity: 'low' },
         temperature: 0.7,
       });
+      expect(
+        inspectableModel.lastRequest?._internal?.reasoningEffortImplicit,
+      ).toBe(false);
     });
   });
 
@@ -6217,6 +6648,120 @@ describe('Runner.run', () => {
         type: 'function_call_result',
         callId: 'call-prev',
       });
+    });
+
+    it('does not replay an acknowledged result after serializing consecutive approvals', async () => {
+      const approvalTool = tool({
+        name: 'test',
+        description: 'tool that requires approval',
+        parameters: z.object({ test: z.string() }),
+        needsApproval: async () => true,
+        execute: async ({ test }) => `result:${test}`,
+      });
+      const model = new TrackingModel([
+        buildResponse([buildToolCall('call-serialized-1', 'first')], 'resp-1'),
+        buildResponse([buildToolCall('call-serialized-2', 'second')], 'resp-2'),
+        buildResponse([fakeModelMessage('done')], 'resp-3'),
+      ]);
+      const agent = new Agent({
+        name: 'SerializedConsecutiveApprovalAgent',
+        model,
+        tools: [approvalTool],
+      });
+      const runner = new Runner();
+
+      const firstResult = await runner.run(agent, 'user_message', {
+        previousResponseId: 'initial-response',
+      });
+      expect(firstResult.interruptions).toHaveLength(1);
+      firstResult.state.approve(firstResult.interruptions[0]);
+
+      const secondResult = await runner.run(agent, firstResult.state, {
+        previousResponseId: 'initial-response',
+      });
+      expect(secondResult.interruptions).toHaveLength(1);
+
+      const restoredState = await RunState.fromString(
+        agent,
+        secondResult.state.toString(),
+      );
+      const [restoredApproval] = restoredState.getInterruptions();
+      restoredState.approve(restoredApproval);
+
+      const thirdResult = await runner.run(agent, restoredState, {
+        previousResponseId: 'initial-response',
+      });
+
+      expect(thirdResult.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(3);
+      expect(model.requests[2].input).toEqual([
+        expect.objectContaining({
+          type: 'function_call_result',
+          callId: 'call-serialized-2',
+        }),
+      ]);
+    });
+
+    it('does not replay acknowledged hosted MCP approval responses', async () => {
+      const mcpTool = hostedMcpTool({
+        serverLabel: 'demo_server',
+        serverUrl: 'https://example.com',
+        requireApproval: {
+          always: { toolNames: ['demo_tool'] },
+        },
+      });
+      const buildMcpApproval = (id: string): protocol.HostedToolCallItem => ({
+        type: 'hosted_tool_call',
+        id: `item-${id}`,
+        name: 'mcp_approval_request',
+        status: 'completed',
+        providerData: {
+          type: 'mcp_approval_request',
+          server_label: 'demo_server',
+          name: 'demo_tool',
+          id,
+          arguments: '{}',
+        },
+      });
+      const model = new TrackingModel([
+        buildResponse([buildMcpApproval('approval-1')], 'resp-mcp-1'),
+        buildResponse([buildMcpApproval('approval-2')], 'resp-mcp-2'),
+        buildResponse([fakeModelMessage('done')], 'resp-mcp-3'),
+      ]);
+      const agent = new Agent({
+        name: 'ConsecutiveHostedMcpApprovalAgent',
+        model,
+        tools: [mcpTool],
+      });
+      const runner = new Runner();
+
+      const firstResult = await runner.run(agent, 'user_message', {
+        conversationId: 'conv-mcp-consecutive',
+      });
+      expect(firstResult.interruptions).toHaveLength(1);
+      firstResult.state.approve(firstResult.interruptions[0]);
+
+      const secondResult = await runner.run(agent, firstResult.state, {
+        conversationId: 'conv-mcp-consecutive',
+      });
+      expect(secondResult.interruptions).toHaveLength(1);
+      secondResult.state.approve(secondResult.interruptions[0]);
+
+      const thirdResult = await runner.run(agent, secondResult.state, {
+        conversationId: 'conv-mcp-consecutive',
+      });
+
+      expect(thirdResult.finalOutput).toBe('done');
+      expect(model.requests).toHaveLength(3);
+      expect(model.requests[2].input).toEqual([
+        expect.objectContaining({
+          type: 'hosted_tool_call',
+          name: 'mcp_approval_response',
+          providerData: expect.objectContaining({
+            approval_request_id: 'approval-2',
+          }),
+        }),
+      ]);
     });
 
     it('does not resend items when resuming multiple times without new approvals', async () => {

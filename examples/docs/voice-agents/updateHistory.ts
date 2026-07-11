@@ -5,7 +5,7 @@ const agent = new RealtimeAgent({
 });
 
 const session = new RealtimeSession(agent, {
-  model: 'gpt-realtime-2',
+  model: 'gpt-realtime-2.1',
 });
 
 await session.connect({ apiKey: '<client-api-key>' });
@@ -17,9 +17,7 @@ session.on('history_updated', (history) => {
 });
 
 // Option 1: explicit setting
-session.updateHistory([
-  /* specific history */
-]);
+session.updateHistory([/* specific history */]);
 
 // Option 2: override based on current state like removing all agent messages
 session.updateHistory((currentHistory) => {

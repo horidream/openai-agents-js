@@ -1,5 +1,101 @@
 # @openai/agents
 
+## 0.13.2
+
+### Patch Changes
+
+- Updated dependencies [4c14038]
+- Updated dependencies [e5b75e1]
+- Updated dependencies [48cdb52]
+- Updated dependencies [240b6eb]
+- Updated dependencies [760ef8e]
+  - @openai/agents-core@0.13.2
+  - @openai/agents-openai@0.13.2
+  - @openai/agents-realtime@0.13.2
+
+## 0.13.1
+
+### Patch Changes
+
+- 532ab2b: fix: support openai-node v6.46.0 usage types
+- ec48462: feat: add GPT-5.6 model defaults, reasoning, and sandbox compaction support
+- 1f9af9f: docs: cover sandbox, text, and realtime agents in the package README
+- Updated dependencies [532ab2b]
+- Updated dependencies [ec48462]
+  - @openai/agents-core@0.13.1
+  - @openai/agents-openai@0.13.1
+  - @openai/agents-realtime@0.13.1
+
+## 0.13.0
+
+### Minor Changes
+
+- 00b418e: feat: update realtime model support and default to gpt-realtime-2.1
+
+### Patch Changes
+
+- Updated dependencies [00b418e]
+  - @openai/agents-realtime@0.13.0
+  - @openai/agents-core@0.13.0
+  - @openai/agents-openai@0.13.0
+
+## 0.12.1
+
+### Patch Changes
+
+- Updated dependencies [f064c56]
+- Updated dependencies [b65face]
+- Updated dependencies [59a67c4]
+- Updated dependencies [75bf1df]
+- Updated dependencies [81d654f]
+- Updated dependencies [5f57fe1]
+- Updated dependencies [dc7864a]
+- Updated dependencies [28edf80]
+  - @openai/agents-core@0.12.1
+  - @openai/agents-openai@0.12.1
+  - @openai/agents-realtime@0.12.1
+
+## 0.12.0
+
+### Patch Changes
+
+- 395699e: chore: upgrade openai package to the latest version
+- Updated dependencies [e044d14]
+- Updated dependencies [1a5e2c0]
+- Updated dependencies [a8f81cd]
+- Updated dependencies [90d46ee]
+- Updated dependencies [c450c2b]
+- Updated dependencies [5350aad]
+- Updated dependencies [395699e]
+- Updated dependencies [8f6a84b]
+- Updated dependencies [f990172]
+  - @openai/agents-core@0.12.0
+  - @openai/agents-realtime@0.12.0
+  - @openai/agents-openai@0.12.0
+
+## 0.11.8
+
+### Patch Changes
+
+- b740fb3: feat: add SDK-only custom data for tool outputs
+- Updated dependencies [dd64ba6]
+- Updated dependencies [b740fb3]
+  - @openai/agents-core@0.11.8
+  - @openai/agents-realtime@0.11.8
+  - @openai/agents-openai@0.11.8
+
+## 0.11.7
+
+### Patch Changes
+
+- dfbc3b0: feat(mcp): expose serializable full tool results
+- Updated dependencies [9b54b79]
+- Updated dependencies [edd0a07]
+- Updated dependencies [dfbc3b0]
+  - @openai/agents-openai@0.11.7
+  - @openai/agents-core@0.11.7
+  - @openai/agents-realtime@0.11.7
+
 ## 0.11.6
 
 ### Patch Changes

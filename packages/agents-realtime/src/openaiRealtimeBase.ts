@@ -44,6 +44,8 @@ export type OpenAIRealtimeModels =
   | 'gpt-realtime'
   | 'gpt-realtime-1.5'
   | 'gpt-realtime-2'
+  | 'gpt-realtime-2.1'
+  | 'gpt-realtime-2.1-mini'
   | 'gpt-realtime-2025-08-28'
   | 'gpt-4o-realtime-preview'
   | 'gpt-4o-realtime-preview-2024-10-01'
@@ -60,7 +62,7 @@ export type OpenAIRealtimeModels =
  * The default model that is used during the connection if no model is provided.
  */
 export const DEFAULT_OPENAI_REALTIME_MODEL: OpenAIRealtimeModels =
-  'gpt-realtime-2';
+  'gpt-realtime-2.1';
 
 /**
  * The default session config that gets send over during session connection unless overridden
@@ -175,10 +177,7 @@ export abstract class OpenAIRealtimeBase
   }
 
   abstract get status():
-    | 'connected'
-    | 'disconnected'
-    | 'connecting'
-    | 'disconnecting';
+    'connected' | 'disconnected' | 'connecting' | 'disconnecting';
 
   abstract connect(
     options: RealtimeTransportLayerConnectOptions,
@@ -216,7 +215,7 @@ export abstract class OpenAIRealtimeBase
     return apiKey;
   }
 
-  protected _onMessage(event: MessageEvent | WebSocketMessageEvent) {
+  protected _onMessage(event: MessageEvent | WebSocketMessageEvent): void {
     const { data: parsed, isGeneric } = parseRealtimeEvent(event);
     if (parsed === null) {
       return;
@@ -456,6 +455,7 @@ export abstract class OpenAIRealtimeBase
           callId: item.call_id ?? '',
           arguments: item.arguments ?? '',
           name: item.name ?? '',
+          responseId: parsed.response_id,
         });
         return;
       }
