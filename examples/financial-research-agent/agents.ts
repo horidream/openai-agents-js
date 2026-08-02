@@ -78,16 +78,18 @@ export const searchAgent = new Agent({
 // --- Verification Agent ---
 export const verifierPrompt = `You are a meticulous auditor. You will receive a financial analysis report and the source summaries used to write it.
 Verify the report against those source summaries rather than relying on prior knowledge.
-Do not reject newer information merely because it is unfamiliar, but reject claims that are unsupported, internally inconsistent, or missing clear sourcing.
-When the report is verified, return an empty issues string. Otherwise, point out the specific issues or uncertainties.`;
+Set verified to false only when a material claim remains unsupported, internally inconsistent, misleadingly sourced, or unqualified despite conflicting sources.
+Treat omitted optional context, accurately attributed single-source claims, and uncertainty that the report explicitly labels and handles conservatively as non-blocking.
+Do not reject newer information merely because it is unfamiliar.
+When no blocking issue remains, set verified to true and return an empty issues string. Otherwise, list only the specific blocking issues that the writer must resolve.`;
 
 export const VerificationResult = z.object({
   verified: z
     .boolean()
-    .describe('Whether the report seems coherent and plausible.'),
+    .describe('Whether the report has no blocking source-grounding issues.'),
   issues: z
     .string()
-    .describe('If not verified, describe the main issues or concerns.'),
+    .describe('If not verified, describe only the blocking issues to resolve.'),
 });
 
 export type VerificationResult = z.infer<typeof VerificationResult>;
@@ -104,6 +106,7 @@ export const writerPrompt = `You are a senior financial analyst.
 You will be provided with the original query and a set of raw search summaries.
 Your task is to synthesize these into a long-form markdown report (at least several paragraphs) including a short executive summary and follow-up questions.
 Use only facts supported by the supplied summaries, preserve their source URLs as inline Markdown citations, and clearly label uncertainty or conflicting information.
+When source summaries conflict on a fact, do not choose a version based on how often it appears. Omit the disputed fact from the executive summary and bottom-line conclusions unless a supplied source directly reconciles the conflict.
 If needed, you can call the available analysis tools (e.g. fundamentals_analysis, risk_analysis) to get short specialist write-ups to incorporate.`;
 
 export const FinancialReportData = z.object({

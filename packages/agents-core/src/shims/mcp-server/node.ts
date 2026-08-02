@@ -16,6 +16,7 @@ import type {
   CallToolResultContent,
   DefaultMCPServerStdioOptions,
   InitializeResult,
+  MCPCallToolOptions,
   MCPListResourcesParams,
   MCPListResourcesResult,
   MCPListResourceTemplatesResult,
@@ -24,7 +25,14 @@ import type {
   MCPServerStreamableHttpOptions,
   MCPServerSSEOptions,
 } from '../../mcp';
-import logger from '../../logger';
+import logger, {
+  getSafeErrorType,
+  type Logger,
+  logToolActionError,
+  logToolActionWarning,
+} from '../../logger';
+import { sanitizeMcpTransportError } from '../../mcpLogging';
+import { combineAbortSignals } from '../../utils/abortSignals';
 
 export interface SessionMessage {
   message: any;
@@ -70,6 +78,21 @@ function buildRequestOptions(
   return Object.keys(mergedOptions).length === 0 ? undefined : mergedOptions;
 }
 
+async function callWithMCPRequestSignal<T>(
+  sourceSignal: AbortSignal | undefined,
+  call: (requestSignal: AbortSignal | undefined) => Promise<T>,
+): Promise<T> {
+  const { signal: requestSignal, cleanup } = combineAbortSignals(sourceSignal);
+  try {
+    return await call(requestSignal);
+  } catch (error) {
+    sourceSignal?.throwIfAborted();
+    throw error;
+  } finally {
+    cleanup();
+  }
+}
+
 type MaybeSessionTransport = Transport & {
   terminateSession?: () => Promise<void>;
   sessionId?: string;
@@ -80,9 +103,123 @@ type MaybeProtocolVersionTransport = MaybeSessionTransport & {
   protocolVersion?: string;
 };
 
-type ClientWithToolMetadataCacheReset = {
+type ClientWithToolMetadataCache = {
   cacheToolMetadata?: (tools: unknown[]) => void;
 };
+
+type MCPToolsPage = {
+  tools: MCPTool[];
+  nextCursor?: string;
+};
+
+type MCPToolsResultSchema = Parameters<Client['request']>[1];
+
+function getOptionalClientToolMetadataCache(
+  client: Client,
+): ClientWithToolMetadataCache['cacheToolMetadata'] {
+  const cacheToolMetadata = (client as unknown as ClientWithToolMetadataCache)
+    .cacheToolMetadata;
+  return typeof cacheToolMetadata === 'function'
+    ? cacheToolMetadata
+    : undefined;
+}
+
+function getClientToolMetadataCache(
+  client: Client,
+): NonNullable<ClientWithToolMetadataCache['cacheToolMetadata']> {
+  const cacheToolMetadata = getOptionalClientToolMetadataCache(client);
+  if (typeof cacheToolMetadata !== 'function') {
+    throw new Error(
+      'The installed MCP SDK does not support tool metadata caching required for paginated tool listing.',
+    );
+  }
+  return cacheToolMetadata;
+}
+
+async function requestMcpToolsPage(
+  client: Client,
+  resultSchema: MCPToolsResultSchema,
+  options: RequestOptions | undefined,
+  cursor: string | undefined,
+): Promise<MCPToolsPage> {
+  return (await client.request(
+    {
+      method: 'tools/list',
+      params: cursor === undefined ? undefined : { cursor },
+    },
+    resultSchema,
+    options,
+  )) as MCPToolsPage;
+}
+
+function cacheClientToolMetadata(client: Client, tools: MCPTool[]): void {
+  const cacheToolMetadata = getClientToolMetadataCache(client);
+  cacheToolMetadata.call(client, tools);
+}
+
+function replaceClientToolMetadata(
+  client: Client,
+  tools: MCPTool[],
+  fallbackTools: MCPTool[],
+): void {
+  try {
+    cacheClientToolMetadata(client, tools);
+  } catch (error) {
+    cacheClientToolMetadata(client, fallbackTools);
+    throw error;
+  }
+}
+
+function assertMcpToolListingIsCurrent(args: {
+  listedClient: Client;
+  currentClient: Client | null;
+  listedGeneration: number;
+  currentGeneration: number;
+}): void {
+  if (
+    args.currentClient !== args.listedClient ||
+    args.currentGeneration !== args.listedGeneration
+  ) {
+    throw new Error('MCP tool listing became stale before it completed.');
+  }
+}
+
+async function listAllMcpTools(args: {
+  fetchPage: (cursor: string | undefined) => Promise<MCPToolsPage>;
+  onPage: (response: MCPToolsPage) => void;
+}): Promise<MCPTool[]> {
+  const tools: MCPTool[] = [];
+  const seenCursors = new Set<string>();
+  let cursor: string | undefined;
+
+  while (true) {
+    let page: MCPToolsPage;
+    try {
+      page = await args.fetchPage(cursor);
+      args.onPage(page);
+    } catch (error) {
+      if (cursor === undefined) {
+        throw error;
+      }
+      throw new Error(
+        'MCP tool listing failed while fetching a continuation page.',
+      );
+    }
+    tools.push(...page.tools);
+
+    const nextCursor = page.nextCursor;
+    if (nextCursor === undefined) {
+      return tools;
+    }
+    if (seenCursors.has(nextCursor)) {
+      throw new Error(
+        'MCP server returned a repeated cursor while listing tools.',
+      );
+    }
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+}
 
 type StreamableHttpToolRecoveryStrategy =
   'none' | 'reconnect-only' | 'reconnect-and-retry';
@@ -179,10 +316,48 @@ function withTimeout<T>(
   });
 }
 
+async function runMcpTransportOperation<T>(
+  endpoint: string,
+  operation: string,
+  action: () => Promise<T>,
+  sourceSignal?: AbortSignal,
+): Promise<T> {
+  try {
+    return await action();
+  } catch (error) {
+    if (isCallerAbortReason(error, sourceSignal)) {
+      throw error;
+    }
+    throw sanitizeMcpTransportError(error, endpoint, operation);
+  }
+}
+
+function isCallerAbortReason(
+  error: unknown,
+  sourceSignal: AbortSignal | undefined,
+): boolean {
+  return sourceSignal?.aborted === true && error === sourceSignal.reason;
+}
+
+function logMcpTransportWarning(
+  targetLogger: Logger,
+  endpoint: string,
+  operation: string,
+  message: string,
+  error: unknown,
+): void {
+  const redact = targetLogger.dontLogToolData;
+  const logError = redact
+    ? getSafeErrorType(error)
+    : sanitizeMcpTransportError(error, endpoint, operation);
+  targetLogger.warn(message, logError);
+}
+
 export class NodeMCPServerStdio extends BaseMCPServerStdio {
   protected session: Client | null = null;
   protected _cacheDirty = true;
   protected _toolsList: any[] = [];
+  protected _toolsCacheGeneration = 0;
   protected serverInitializeResult: InitializeResult | null = null;
   protected clientSessionTimeoutSeconds?: number;
   protected timeout: number;
@@ -215,6 +390,9 @@ export class NodeMCPServerStdio extends BaseMCPServerStdio {
   }
 
   async connect(): Promise<void> {
+    this._toolsCacheGeneration += 1;
+    this._cacheDirty = true;
+    this._toolsList = [];
     try {
       const { StdioClientTransport } =
         await import('@modelcontextprotocol/sdk/client/stdio.js').catch(
@@ -242,7 +420,7 @@ export class NodeMCPServerStdio extends BaseMCPServerStdio {
         serverInfo: { name: this._name, version: '1.0.0' },
       } as InitializeResult;
     } catch (e) {
-      this.logger.error('Error initializing MCP server:', e);
+      logToolActionError(this.logger, 'Error initializing MCP server:', e);
       await this.close();
       throw e;
     }
@@ -250,6 +428,7 @@ export class NodeMCPServerStdio extends BaseMCPServerStdio {
   }
 
   async invalidateToolsCache(): Promise<void> {
+    this._toolsCacheGeneration += 1;
     await invalidateServerToolsCache(this.name);
     this._cacheDirty = true;
   }
@@ -266,28 +445,49 @@ export class NodeMCPServerStdio extends BaseMCPServerStdio {
       return this._toolsList;
     }
 
-    this._cacheDirty = false;
     const requestOptions = buildRequestOptions(
       this.clientSessionTimeoutSeconds,
     );
-    const response = await this.session.listTools(undefined, requestOptions);
-    this.debugLog(() => `Listed tools: ${JSON.stringify(response)}`);
-    this._toolsList = ListToolsResultSchema.parse(response).tools;
-    return this._toolsList;
+    const session = this.session;
+    getClientToolMetadataCache(session);
+    const cacheGeneration = this._toolsCacheGeneration;
+    const tools = await listAllMcpTools({
+      fetchPage: (cursor) =>
+        requestMcpToolsPage(
+          session,
+          ListToolsResultSchema,
+          requestOptions,
+          cursor,
+        ),
+      onPage: (response) =>
+        this.debugLog(() => `Listed tools: ${JSON.stringify(response)}`),
+    });
+    assertMcpToolListingIsCurrent({
+      listedClient: session,
+      currentClient: this.session,
+      listedGeneration: cacheGeneration,
+      currentGeneration: this._toolsCacheGeneration,
+    });
+    replaceClientToolMetadata(session, tools, this._toolsList);
+    this._toolsList = tools;
+    this._cacheDirty = false;
+    return tools;
   }
 
   async callTool(
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResultContent> {
-    return (await this.callToolResult(toolName, args, meta)).content;
+    return (await this.callToolResult(toolName, args, meta, options)).content;
   }
 
   async callToolResult(
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResult> {
     const { CallToolResultSchema } =
       await import('@modelcontextprotocol/sdk/types.js').catch(failedToImport);
@@ -296,19 +496,23 @@ export class NodeMCPServerStdio extends BaseMCPServerStdio {
         'Server not initialized. Make sure you call connect() first.',
       );
     }
-    const requestOptions = buildRequestOptions(
-      this.clientSessionTimeoutSeconds,
-      { timeout: this.timeout },
-    );
+    const session = this.session;
     const params = {
       name: toolName,
       arguments: args ?? {},
       ...(meta != null ? { _meta: meta } : {}),
     };
-    const response = await this.session.callTool(
-      params,
-      undefined,
-      requestOptions,
+    const response = await callWithMCPRequestSignal(
+      options?.signal,
+      (requestSignal) =>
+        session.callTool(
+          params,
+          undefined,
+          buildRequestOptions(this.clientSessionTimeoutSeconds, {
+            timeout: this.timeout,
+            signal: requestSignal,
+          }),
+        ),
     );
     const parsed = CallToolResultSchema.parse(response);
     const result = attachParsedCallToolResultMetadata(parsed as CallToolResult);
@@ -383,6 +587,9 @@ export class NodeMCPServerStdio extends BaseMCPServerStdio {
   }
 
   async close(): Promise<void> {
+    this._toolsCacheGeneration += 1;
+    this._cacheDirty = true;
+    this._toolsList = [];
     const transport: any = this.transport;
 
     if (transport && typeof transport.terminateSession === 'function') {
@@ -391,7 +598,11 @@ export class NodeMCPServerStdio extends BaseMCPServerStdio {
         // but if the server supports sessions we terminate to avoid leaks.
         await transport.terminateSession();
       } catch (error) {
-        this.logger.warn('Failed to terminate MCP session:', error);
+        logToolActionWarning(
+          this.logger,
+          'Failed to terminate MCP session:',
+          error,
+        );
       }
     }
     if (transport) {
@@ -409,6 +620,7 @@ export class NodeMCPServerSSE extends BaseMCPServerSSE {
   protected session: Client | null = null;
   protected _cacheDirty = true;
   protected _toolsList: any[] = [];
+  protected _toolsCacheGeneration = 0;
   protected serverInitializeResult: InitializeResult | null = null;
   protected clientSessionTimeoutSeconds?: number;
   protected timeout: number;
@@ -426,6 +638,9 @@ export class NodeMCPServerSSE extends BaseMCPServerSSE {
   }
 
   async connect(): Promise<void> {
+    this._toolsCacheGeneration += 1;
+    this._cacheDirty = true;
+    this._toolsList = [];
     try {
       const { SSEClientTransport } =
         await import('@modelcontextprotocol/sdk/client/sse.js').catch(
@@ -453,14 +668,20 @@ export class NodeMCPServerSSE extends BaseMCPServerSSE {
         serverInfo: { name: this._name, version: '1.0.0' },
       } as InitializeResult;
     } catch (e) {
-      this.logger.error('Error initializing MCP server:', e);
+      const error = sanitizeMcpTransportError(
+        e,
+        this.params.url,
+        'SSE connect',
+      );
+      logToolActionError(this.logger, 'Error initializing MCP server:', error);
       await this.close();
-      throw e;
+      throw error;
     }
     this.debugLog(() => `Connected to MCP server: ${this._name}`);
   }
 
   async invalidateToolsCache(): Promise<void> {
+    this._toolsCacheGeneration += 1;
     await invalidateServerToolsCache(this.name);
     this._cacheDirty = true;
   }
@@ -477,28 +698,51 @@ export class NodeMCPServerSSE extends BaseMCPServerSSE {
       return this._toolsList;
     }
 
-    this._cacheDirty = false;
     const requestOptions = buildRequestOptions(
       this.clientSessionTimeoutSeconds,
     );
-    const response = await this.session.listTools(undefined, requestOptions);
-    this.debugLog(() => `Listed tools: ${JSON.stringify(response)}`);
-    this._toolsList = ListToolsResultSchema.parse(response).tools;
-    return this._toolsList;
+    const session = this.session;
+    getClientToolMetadataCache(session);
+    const cacheGeneration = this._toolsCacheGeneration;
+    const tools = await listAllMcpTools({
+      fetchPage: (cursor) =>
+        runMcpTransportOperation(this.params.url, 'SSE list tools', () =>
+          requestMcpToolsPage(
+            session,
+            ListToolsResultSchema,
+            requestOptions,
+            cursor,
+          ),
+        ),
+      onPage: (response) =>
+        this.debugLog(() => `Listed tools: ${JSON.stringify(response)}`),
+    });
+    assertMcpToolListingIsCurrent({
+      listedClient: session,
+      currentClient: this.session,
+      listedGeneration: cacheGeneration,
+      currentGeneration: this._toolsCacheGeneration,
+    });
+    replaceClientToolMetadata(session, tools, this._toolsList);
+    this._toolsList = tools;
+    this._cacheDirty = false;
+    return tools;
   }
 
   async callTool(
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResultContent> {
-    return (await this.callToolResult(toolName, args, meta)).content;
+    return (await this.callToolResult(toolName, args, meta, options)).content;
   }
 
   async callToolResult(
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResult> {
     const { CallToolResultSchema } =
       await import('@modelcontextprotocol/sdk/types.js').catch(failedToImport);
@@ -507,19 +751,27 @@ export class NodeMCPServerSSE extends BaseMCPServerSSE {
         'Server not initialized. Make sure you call connect() first.',
       );
     }
-    const requestOptions = buildRequestOptions(
-      this.clientSessionTimeoutSeconds,
-      { timeout: this.timeout },
-    );
+    const session = this.session;
     const params = {
       name: toolName,
       arguments: args ?? {},
       ...(meta != null ? { _meta: meta } : {}),
     };
-    const response = await this.session.callTool(
-      params,
-      undefined,
-      requestOptions,
+    const response = await runMcpTransportOperation(
+      this.params.url,
+      'SSE tool call',
+      () =>
+        callWithMCPRequestSignal(options?.signal, (requestSignal) =>
+          session.callTool(
+            params,
+            undefined,
+            buildRequestOptions(this.clientSessionTimeoutSeconds, {
+              timeout: this.timeout,
+              signal: requestSignal,
+            }),
+          ),
+        ),
+      options?.signal,
     );
     const parsed = CallToolResultSchema.parse(response);
     const result = attachParsedCallToolResultMetadata(parsed as CallToolResult);
@@ -543,7 +795,11 @@ export class NodeMCPServerSSE extends BaseMCPServerSSE {
     const requestOptions = buildRequestOptions(
       this.clientSessionTimeoutSeconds,
     );
-    const response = await this.session.listResources(params, requestOptions);
+    const response = await runMcpTransportOperation(
+      this.params.url,
+      'SSE list resources',
+      () => this.session!.listResources(params, requestOptions),
+    );
     this.debugLog(() => `Listed resources: ${JSON.stringify(response)}`);
     return ListResourcesResultSchema.parse(response) as MCPListResourcesResult;
   }
@@ -561,9 +817,10 @@ export class NodeMCPServerSSE extends BaseMCPServerSSE {
     const requestOptions = buildRequestOptions(
       this.clientSessionTimeoutSeconds,
     );
-    const response = await this.session.listResourceTemplates(
-      params,
-      requestOptions,
+    const response = await runMcpTransportOperation(
+      this.params.url,
+      'SSE list resource templates',
+      () => this.session!.listResourceTemplates(params, requestOptions),
     );
     this.debugLog(
       () => `Listed resource templates: ${JSON.stringify(response)}`,
@@ -584,7 +841,11 @@ export class NodeMCPServerSSE extends BaseMCPServerSSE {
     const requestOptions = buildRequestOptions(
       this.clientSessionTimeoutSeconds,
     );
-    const response = await this.session.readResource({ uri }, requestOptions);
+    const response = await runMcpTransportOperation(
+      this.params.url,
+      'SSE read resource',
+      () => this.session!.readResource({ uri }, requestOptions),
+    );
     this.debugLog(() => `Read resource ${uri}: ${JSON.stringify(response)}`);
     return ReadResourceResultSchema.parse(response) as MCPReadResourceResult;
   }
@@ -594,30 +855,41 @@ export class NodeMCPServerSSE extends BaseMCPServerSSE {
   }
 
   async close(): Promise<void> {
-    const transport = this.transport;
+    this._toolsCacheGeneration += 1;
+    this._cacheDirty = true;
+    this._toolsList = [];
+    await runMcpTransportOperation(this.params.url, 'SSE cleanup', async () => {
+      const transport = this.transport;
 
-    if (hasSessionTransport(transport)) {
-      const sessionId = transport.sessionId;
+      if (hasSessionTransport(transport)) {
+        const sessionId = transport.sessionId;
 
-      if (sessionId && typeof transport.terminateSession === 'function') {
-        try {
-          // Best-effort cleanup: we do not actively manage session lifecycles,
-          // but if the server supports sessions we terminate to avoid leaks.
-          await transport.terminateSession();
-        } catch (error) {
-          this.logger.warn('Failed to terminate MCP session:', error);
+        if (sessionId && typeof transport.terminateSession === 'function') {
+          try {
+            // Best-effort cleanup: we do not actively manage session lifecycles,
+            // but if the server supports sessions we terminate to avoid leaks.
+            await transport.terminateSession();
+          } catch (error) {
+            logMcpTransportWarning(
+              this.logger,
+              this.params.url,
+              'SSE session termination',
+              'Failed to terminate MCP session:',
+              error,
+            );
+          }
         }
       }
-    }
 
-    if (transport) {
-      await transport.close();
-      this.transport = null;
-    }
-    if (this.session) {
-      await this.session.close();
-      this.session = null;
-    }
+      if (transport) {
+        await transport.close();
+        this.transport = null;
+      }
+      if (this.session) {
+        await this.session.close();
+        this.session = null;
+      }
+    });
   }
 }
 
@@ -625,6 +897,7 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
   protected session: Client | null = null;
   protected _cacheDirty = true;
   protected _toolsList: any[] = [];
+  protected _toolsCacheGeneration = 0;
   protected serverInitializeResult: InitializeResult | null = null;
   protected clientSessionTimeoutSeconds?: number;
   protected timeout: number;
@@ -723,7 +996,6 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
       name: this._name,
       version: '1.0.0',
     });
-
     try {
       const requestOptions = buildRequestOptions(
         this.clientSessionTimeoutSeconds,
@@ -752,9 +1024,7 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
   }
 
   private resetClientToolMetadataCache(client: Client): void {
-    (client as unknown as ClientWithToolMetadataCacheReset).cacheToolMetadata?.(
-      [],
-    );
+    getOptionalClientToolMetadataCache(client)?.call(client, []);
   }
 
   private async publishConnectedStreamableHttpClient(args: {
@@ -762,20 +1032,25 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
     transport: MaybeSessionTransport;
     previousTransport?: MaybeSessionTransport | null;
   }): Promise<void> {
+    const previousClient = this.session;
+    const previousSessionId = getSessionId(args.previousTransport);
+    const nextSessionId = getSessionId(args.transport);
+    const preservesCommittedToolState =
+      previousClient === args.client &&
+      previousSessionId !== undefined &&
+      previousSessionId === nextSessionId;
+
+    if (!preservesCommittedToolState) {
+      this.resetClientToolMetadataCache(args.client);
+    }
+
     this.transport = args.transport;
     this.session = args.client;
     this.connectionStateVersion += 1;
+    this._toolsCacheGeneration += 1;
     this._cacheDirty = true;
-    this._toolsList = [];
-
-    const previousSessionId = getSessionId(args.previousTransport);
-    const nextSessionId = getSessionId(args.transport);
-    if (
-      previousSessionId === undefined ||
-      nextSessionId === undefined ||
-      previousSessionId !== nextSessionId
-    ) {
-      this.resetClientToolMetadataCache(args.client);
+    if (!preservesCommittedToolState) {
+      this._toolsList = [];
     }
 
     await invalidateServerToolsCache(this.name);
@@ -839,7 +1114,13 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
         await detachedTransport.close().catch(() => {});
       }
     } catch (error) {
-      this.logger.warn(warningMessage, error);
+      logMcpTransportWarning(
+        this.logger,
+        this.params.url,
+        'streamable HTTP session termination',
+        warningMessage,
+        error,
+      );
     }
   }
 
@@ -872,11 +1153,23 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
       );
     } else if (transport) {
       await transport.close().catch((error) => {
-        this.logger.warn(closeWarningMessage, error);
+        logMcpTransportWarning(
+          this.logger,
+          this.params.url,
+          'streamable HTTP cleanup',
+          closeWarningMessage,
+          error,
+        );
       });
     } else if (client) {
       await client.close().catch((error) => {
-        this.logger.warn(closeWarningMessage, error);
+        logMcpTransportWarning(
+          this.logger,
+          this.params.url,
+          'streamable HTTP cleanup',
+          closeWarningMessage,
+          error,
+        );
       });
     }
 
@@ -900,21 +1193,27 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResult> {
     const { CallToolResultSchema } =
       await import('@modelcontextprotocol/sdk/types.js').catch(failedToImport);
-    const requestOptions = buildRequestOptions(
-      this.clientSessionTimeoutSeconds,
-      {
-        timeout: this.timeout,
-      },
-    );
     const params = {
       name: toolName,
       arguments: args ?? {},
       ...(meta != null ? { _meta: meta } : {}),
     };
-    const response = await client.callTool(params, undefined, requestOptions);
+    const response = await callWithMCPRequestSignal(
+      options?.signal,
+      (requestSignal) =>
+        client.callTool(
+          params,
+          undefined,
+          buildRequestOptions(this.clientSessionTimeoutSeconds, {
+            timeout: this.timeout,
+            signal: requestSignal,
+          }),
+        ),
+    );
     const parsed = CallToolResultSchema.parse(response);
     return attachParsedCallToolResultMetadata(parsed as CallToolResult);
   }
@@ -941,16 +1240,34 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
 
     if (client.transport === transport) {
       await client.close().catch((error) => {
-        this.logger.warn(options.closeWarningMessage, error);
+        logMcpTransportWarning(
+          this.logger,
+          this.params.url,
+          'streamable HTTP cleanup',
+          options.closeWarningMessage,
+          error,
+        );
       });
       return;
     }
 
     await transport.close().catch((error) => {
-      this.logger.warn(options.closeWarningMessage, error);
+      logMcpTransportWarning(
+        this.logger,
+        this.params.url,
+        'streamable HTTP cleanup',
+        options.closeWarningMessage,
+        error,
+      );
     });
     await client.close().catch((error) => {
-      this.logger.warn(options.closeWarningMessage, error);
+      logMcpTransportWarning(
+        this.logger,
+        this.params.url,
+        'streamable HTTP cleanup',
+        options.closeWarningMessage,
+        error,
+      );
     });
   }
 
@@ -1243,13 +1560,19 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
     } catch (e) {
       // A losing concurrent connect can fail after another connect already
       // published a healthy shared session, so avoid closing shared state here.
-      this.logger.error('Error initializing MCP server:', e);
-      throw e;
+      const error = sanitizeMcpTransportError(
+        e,
+        this.params.url,
+        'streamable HTTP connect',
+      );
+      logToolActionError(this.logger, 'Error initializing MCP server:', error);
+      throw error;
     }
     this.debugLog(() => `Connected to MCP server: ${this._name}`);
   }
 
   async invalidateToolsCache(): Promise<void> {
+    this._toolsCacheGeneration += 1;
     await invalidateServerToolsCache(this.name);
     this._cacheDirty = true;
   }
@@ -1266,28 +1589,54 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
       return this._toolsList;
     }
 
-    this._cacheDirty = false;
     const requestOptions = buildRequestOptions(
       this.clientSessionTimeoutSeconds,
     );
-    const response = await this.session.listTools(undefined, requestOptions);
-    this.debugLog(() => `Listed tools: ${JSON.stringify(response)}`);
-    this._toolsList = ListToolsResultSchema.parse(response).tools;
-    return this._toolsList;
+    const session = this.session;
+    getClientToolMetadataCache(session);
+    const cacheGeneration = this._toolsCacheGeneration;
+    const tools = await listAllMcpTools({
+      fetchPage: (cursor) =>
+        runMcpTransportOperation(
+          this.params.url,
+          'streamable HTTP list tools',
+          () =>
+            requestMcpToolsPage(
+              session,
+              ListToolsResultSchema,
+              requestOptions,
+              cursor,
+            ),
+        ),
+      onPage: (response) =>
+        this.debugLog(() => `Listed tools: ${JSON.stringify(response)}`),
+    });
+    assertMcpToolListingIsCurrent({
+      listedClient: session,
+      currentClient: this.session,
+      listedGeneration: cacheGeneration,
+      currentGeneration: this._toolsCacheGeneration,
+    });
+    replaceClientToolMetadata(session, tools, this._toolsList);
+    this._toolsList = tools;
+    this._cacheDirty = false;
+    return tools;
   }
 
   async callTool(
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResultContent> {
-    return (await this.callToolResult(toolName, args, meta)).content;
+    return (await this.callToolResult(toolName, args, meta, options)).content;
   }
 
   async callToolResult(
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResult> {
     const client = this.session;
     if (!client) {
@@ -1299,12 +1648,28 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
     let result: CallToolResult;
 
     try {
-      result = await this.callToolWithClient(client, toolName, args, meta);
+      result = await this.callToolWithClient(
+        client,
+        toolName,
+        args,
+        meta,
+        options,
+      );
     } catch (error) {
-      const recoveryStrategy =
-        await this.shouldReconnectClosedStreamableHttpClient(error, client);
-      if (recoveryStrategy === 'none') {
+      if (isCallerAbortReason(error, options?.signal)) {
         throw error;
+      }
+      const recoveryStrategy = await runMcpTransportOperation(
+        this.params.url,
+        'streamable HTTP tool call recovery classification',
+        () => this.shouldReconnectClosedStreamableHttpClient(error, client),
+      );
+      if (recoveryStrategy === 'none') {
+        throw sanitizeMcpTransportError(
+          error,
+          this.params.url,
+          'streamable HTTP tool call',
+        );
       }
 
       this.debugLog(
@@ -1312,14 +1677,23 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
           `Reconnecting closed streamable HTTP MCP session for ${toolName}.`,
       );
 
-      const recoveredClient = await this.reconnectClosedStreamableHttpClient({
-        cause: error,
-        failedClient: client,
-        failedStateVersion: callToolStateVersion,
-      });
+      const recoveredClient = await runMcpTransportOperation(
+        this.params.url,
+        'streamable HTTP reconnect',
+        () =>
+          this.reconnectClosedStreamableHttpClient({
+            cause: error,
+            failedClient: client,
+            failedStateVersion: callToolStateVersion,
+          }),
+      );
 
       if (recoveryStrategy === 'reconnect-only') {
-        throw error;
+        throw sanitizeMcpTransportError(
+          error,
+          this.params.url,
+          'streamable HTTP tool call',
+        );
       }
 
       try {
@@ -1328,9 +1702,17 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
           toolName,
           args,
           meta,
+          options,
         );
       } catch (retryError) {
-        throw attachCause(retryError, error);
+        if (isCallerAbortReason(retryError, options?.signal)) {
+          throw retryError;
+        }
+        throw sanitizeMcpTransportError(
+          attachCause(retryError, error),
+          this.params.url,
+          'streamable HTTP tool call retry',
+        );
       }
     }
 
@@ -1354,7 +1736,11 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
     const requestOptions = buildRequestOptions(
       this.clientSessionTimeoutSeconds,
     );
-    const response = await this.session.listResources(params, requestOptions);
+    const response = await runMcpTransportOperation(
+      this.params.url,
+      'streamable HTTP list resources',
+      () => this.session!.listResources(params, requestOptions),
+    );
     this.debugLog(() => `Listed resources: ${JSON.stringify(response)}`);
     return ListResourcesResultSchema.parse(response) as MCPListResourcesResult;
   }
@@ -1372,9 +1758,10 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
     const requestOptions = buildRequestOptions(
       this.clientSessionTimeoutSeconds,
     );
-    const response = await this.session.listResourceTemplates(
-      params,
-      requestOptions,
+    const response = await runMcpTransportOperation(
+      this.params.url,
+      'streamable HTTP list resource templates',
+      () => this.session!.listResourceTemplates(params, requestOptions),
     );
     this.debugLog(
       () => `Listed resource templates: ${JSON.stringify(response)}`,
@@ -1395,7 +1782,11 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
     const requestOptions = buildRequestOptions(
       this.clientSessionTimeoutSeconds,
     );
-    const response = await this.session.readResource({ uri }, requestOptions);
+    const response = await runMcpTransportOperation(
+      this.params.url,
+      'streamable HTTP read resource',
+      () => this.session!.readResource({ uri }, requestOptions),
+    );
     this.debugLog(() => `Read resource ${uri}: ${JSON.stringify(response)}`);
     return ReadResourceResultSchema.parse(response) as MCPReadResourceResult;
   }
@@ -1412,6 +1803,9 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
   async close(): Promise<void> {
     this.isClosed = true;
     this.connectionStateVersion += 1;
+    this._toolsCacheGeneration += 1;
+    this._cacheDirty = true;
+    this._toolsList = [];
     const closeStateVersion = this.connectionStateVersion;
 
     const reconnectPromise = this.reconnectingClientPromise;

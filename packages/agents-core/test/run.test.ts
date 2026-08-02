@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { setTimeout as setTimeoutPromise } from 'node:timers/promises';
 import {
   beforeAll,
   beforeEach,
@@ -60,6 +61,8 @@ import {
   hostedMcpTool,
   computerTool,
   shellTool,
+  applyPatchTool,
+  type HostedTool,
 } from '../src/tool';
 import logger from '../src/logger';
 import { getGlobalTraceProvider } from '../src/tracing/provider';
@@ -75,6 +78,8 @@ import {
   TEST_MODEL_FUNCTION_CALL,
   TEST_TOOL,
   FakeComputer,
+  FakeEditor,
+  FakeShell,
 } from './stubs';
 import {
   Model,
@@ -82,6 +87,12 @@ import {
   ModelRequest,
   ModelSettings,
 } from '../src/model';
+
+const PROGRAMMATIC_TOOL_CALLING_TOOL: HostedTool = {
+  type: 'hosted_tool',
+  name: 'programmatic_tool_calling',
+  providerData: { type: 'programmatic_tool_calling' },
+};
 
 function getFirstTextContent(item: AgentInputItem): string | undefined {
   if (item.type !== 'message') {
@@ -120,6 +131,726 @@ describe('Runner.run', () => {
       });
 
       expect(runner.config.toolExecution).toBe(toolExecution);
+    });
+
+    it('propagates run cancellation to a direct function tool', async () => {
+      const controller = new AbortController();
+      const abortReason = new Error('stop direct tool');
+      let toolSignal: AbortSignal | undefined;
+      let markToolStarted: (() => void) | undefined;
+      const toolStarted = new Promise<void>((resolve) => {
+        markToolStarted = resolve;
+      });
+      let releaseTool: (() => void) | undefined;
+      const toolCanFinish = new Promise<void>((resolve) => {
+        releaseTool = resolve;
+      });
+      const abortableTool = tool({
+        name: 'test',
+        description: 'finishes cleanup after the run is cancelled',
+        parameters: z.object({ test: z.string() }),
+        execute: async (_input, _context, details) => {
+          toolSignal = details?.signal;
+          markToolStarted?.();
+          await toolCanFinish;
+          return 'cancelled after cleanup';
+        },
+      });
+      const model = new FakeModel([
+        {
+          output: [{ ...TEST_MODEL_FUNCTION_CALL }],
+          usage: new Usage(),
+        },
+        {
+          output: [fakeModelMessage('unexpected second response')],
+          usage: new Usage(),
+        },
+      ]);
+      const getResponseSpy = vi.spyOn(model, 'getResponse');
+      const agent = new Agent({
+        name: 'DirectCancellationAgent',
+        model,
+        tools: [abortableTool],
+      });
+      const state = new RunState(new RunContext(), 'start', agent, 10);
+
+      const runPromise = run(agent, state, { signal: controller.signal });
+      const rejection = expect(runPromise).rejects.toBe(abortReason);
+      await toolStarted;
+
+      expect(toolSignal).toBe(controller.signal);
+      controller.abort(abortReason);
+      releaseTool?.();
+
+      await rejection;
+      expect(getResponseSpy).toHaveBeenCalledTimes(1);
+      expect(
+        state._generatedItems.filter(
+          (item) => item.rawItem.type === 'function_call_result',
+        ),
+      ).toHaveLength(1);
+    });
+
+    it('preserves a function tool abort reason without wrapping it', async () => {
+      const controller = new AbortController();
+      const abortReason = new Error('stop failed tool');
+      let markToolStarted: (() => void) | undefined;
+      const toolStarted = new Promise<void>((resolve) => {
+        markToolStarted = resolve;
+      });
+      const abortableTool = tool({
+        name: 'test',
+        description: 'throws the run abort reason',
+        parameters: z.object({ test: z.string() }),
+        execute: async (_input, _context, details) => {
+          markToolStarted?.();
+          if (!details?.signal) {
+            throw new Error('Expected the run abort signal');
+          }
+          await setTimeoutPromise(60_000, undefined, {
+            signal: details.signal,
+          });
+          return 'unexpected tool output';
+        },
+      });
+      const model = new FakeModel([
+        {
+          output: [{ ...TEST_MODEL_FUNCTION_CALL }],
+          usage: new Usage(),
+        },
+      ]);
+      const agent = new Agent({
+        name: 'AbortReasonAgent',
+        model,
+        tools: [abortableTool],
+      });
+      const state = new RunState(new RunContext(), 'start', agent, 10);
+
+      const runPromise = run(agent, state, { signal: controller.signal });
+      const rejection = expect(runPromise).rejects.toBe(abortReason);
+      await toolStarted;
+
+      controller.abort(abortReason);
+
+      await rejection;
+      expect(
+        state._generatedItems.filter(
+          (item) =>
+            item.rawItem.type === 'function_call_result' &&
+            item.rawItem.callId === TEST_MODEL_FUNCTION_CALL.callId &&
+            item.rawItem.status === 'incomplete',
+        ),
+      ).toHaveLength(1);
+    });
+
+    it('waits for sibling function tools before surfacing cancellation', async () => {
+      const controller = new AbortController();
+      const abortReason = new Error('stop parallel tools');
+      let markAbortToolStarted: (() => void) | undefined;
+      const abortToolStarted = new Promise<void>((resolve) => {
+        markAbortToolStarted = resolve;
+      });
+      let markAbortObserved: (() => void) | undefined;
+      const abortObserved = new Promise<void>((resolve) => {
+        markAbortObserved = resolve;
+      });
+      let markSiblingStarted: (() => void) | undefined;
+      const siblingStarted = new Promise<void>((resolve) => {
+        markSiblingStarted = resolve;
+      });
+      let releaseSibling: (() => void) | undefined;
+      const siblingCanFinish = new Promise<void>((resolve) => {
+        releaseSibling = resolve;
+      });
+      let siblingFinished = false;
+
+      const abortableTool = tool({
+        name: 'abortable_tool',
+        description: 'throws the run abort reason',
+        parameters: z.object({ test: z.string() }),
+        errorFunction: null,
+        execute: async (_input, _context, details) => {
+          markAbortToolStarted?.();
+          if (!details?.signal) {
+            throw new Error('Expected the run abort signal');
+          }
+          try {
+            await setTimeoutPromise(60_000, undefined, {
+              signal: details.signal,
+            });
+          } catch (error) {
+            markAbortObserved?.();
+            throw error;
+          }
+          return 'unexpected tool output';
+        },
+      });
+      const siblingTool = tool({
+        name: 'sibling_tool',
+        description: 'finishes independently of run cancellation',
+        parameters: z.object({ test: z.string() }),
+        execute: async () => {
+          markSiblingStarted?.();
+          await siblingCanFinish;
+          siblingFinished = true;
+          return 'sibling complete';
+        },
+      });
+      const model = new FakeModel([
+        {
+          output: [
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              id: 'abortable-call',
+              callId: 'abortable-call',
+              name: 'abortable_tool',
+            },
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              id: 'sibling-call',
+              callId: 'sibling-call',
+              name: 'sibling_tool',
+            },
+          ],
+          usage: new Usage(),
+        },
+      ]);
+      const agent = new Agent({
+        name: 'ParallelCancellationAgent',
+        model,
+        tools: [abortableTool, siblingTool],
+      });
+      const state = new RunState(new RunContext(), 'start', agent, 10);
+
+      const runPromise = run(agent, state, { signal: controller.signal });
+      let runSettled = false;
+      const runOutcome = runPromise.then(
+        () => {
+          runSettled = true;
+          return { error: undefined };
+        },
+        (error: unknown) => {
+          runSettled = true;
+          return { error };
+        },
+      );
+      await Promise.all([abortToolStarted, siblingStarted]);
+
+      controller.abort(abortReason);
+      await abortObserved;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      const settledBeforeSibling = runSettled;
+
+      releaseSibling?.();
+      const outcome = await runOutcome;
+
+      expect(settledBeforeSibling).toBe(false);
+      expect(siblingFinished).toBe(true);
+      expect(outcome.error).toBe(abortReason);
+      expect(
+        state._generatedItems.filter(
+          (item) =>
+            item.rawItem.type === 'function_call_result' &&
+            item.rawItem.callId === 'sibling-call',
+        ),
+      ).toHaveLength(1);
+    });
+
+    it('waits for a concurrent computer action before surfacing cancellation', async () => {
+      const controller = new AbortController();
+      const abortReason = new Error('stop parallel actions');
+      let markAbortToolStarted: (() => void) | undefined;
+      const abortToolStarted = new Promise<void>((resolve) => {
+        markAbortToolStarted = resolve;
+      });
+      let markAbortObserved: (() => void) | undefined;
+      const abortObserved = new Promise<void>((resolve) => {
+        markAbortObserved = resolve;
+      });
+      let markComputerStarted: (() => void) | undefined;
+      const computerStarted = new Promise<void>((resolve) => {
+        markComputerStarted = resolve;
+      });
+      let releaseComputer: (() => void) | undefined;
+      const computerCanFinish = new Promise<void>((resolve) => {
+        releaseComputer = resolve;
+      });
+      let computerFinished = false;
+
+      const abortableTool = tool({
+        name: 'abortable_tool',
+        description: 'throws the run abort reason',
+        parameters: z.object({ test: z.string() }),
+        errorFunction: null,
+        execute: async (_input, _context, details) => {
+          markAbortToolStarted?.();
+          if (!details?.signal) {
+            throw new Error('Expected the run abort signal');
+          }
+          if (!details.signal.aborted) {
+            await new Promise<void>((resolve) => {
+              details.signal?.addEventListener('abort', () => resolve(), {
+                once: true,
+              });
+            });
+          }
+          markAbortObserved?.();
+          details.signal.throwIfAborted();
+          return 'unexpected tool output';
+        },
+      });
+      const computer = new FakeComputer();
+      const computerClick = vi.fn(async () => {
+        markComputerStarted?.();
+        await computerCanFinish;
+        computerFinished = true;
+      });
+      computer.click = computerClick;
+      const computerCall: protocol.ComputerUseCallItem = {
+        type: 'computer_call',
+        id: 'computer-call',
+        callId: 'computer-call',
+        status: 'completed',
+        action: {
+          type: 'click',
+          x: 1,
+          y: 1,
+          button: 'left',
+        },
+      };
+      const model = new FakeModel([
+        {
+          output: [
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              id: 'abortable-call',
+              callId: 'abortable-call',
+              name: 'abortable_tool',
+            },
+            computerCall,
+          ],
+          usage: new Usage(),
+        },
+      ]);
+      const agent = new Agent({
+        name: 'ParallelActionCancellationAgent',
+        model,
+        tools: [abortableTool, computerTool({ computer })],
+      });
+      const state = new RunState(new RunContext(), 'start', agent, 10);
+
+      const runPromise = run(agent, state, { signal: controller.signal });
+      let runSettled = false;
+      const runOutcome = runPromise.then(
+        () => {
+          runSettled = true;
+          return { error: undefined };
+        },
+        (error: unknown) => {
+          runSettled = true;
+          return { error };
+        },
+      );
+      await Promise.all([abortToolStarted, computerStarted]);
+
+      controller.abort(abortReason);
+      await abortObserved;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      const settledBeforeComputer = runSettled;
+
+      releaseComputer?.();
+      const outcome = await runOutcome;
+
+      expect(settledBeforeComputer).toBe(false);
+      expect(computerFinished).toBe(true);
+      expect(outcome.error).toBe(abortReason);
+      expect(computerClick).toHaveBeenCalledTimes(1);
+      expect(
+        state._generatedItems.filter(
+          (item) => item.rawItem.type === 'computer_call_result',
+        ),
+      ).toHaveLength(1);
+    });
+
+    it('reconciles later actions without starting them after cancellation', async () => {
+      const controller = new AbortController();
+      const abortReason = new Error('stop mixed actions');
+      let markToolStarted: (() => void) | undefined;
+      const toolStarted = new Promise<void>((resolve) => {
+        markToolStarted = resolve;
+      });
+      const abortableTool = tool({
+        name: 'abortable_tool',
+        description: 'throws the run abort reason',
+        parameters: z.object({ test: z.string() }),
+        errorFunction: null,
+        execute: async (_input, _context, details) => {
+          markToolStarted?.();
+          if (!details?.signal) {
+            throw new Error('Expected the run abort signal');
+          }
+          if (!details.signal.aborted) {
+            await new Promise<void>((resolve) => {
+              details.signal?.addEventListener('abort', () => resolve(), {
+                once: true,
+              });
+            });
+          }
+          details.signal.throwIfAborted();
+          return 'unexpected tool output';
+        },
+      });
+      const approvalToolExecute = vi.fn(async () => 'approved');
+      const approvalTool = tool({
+        name: 'approval_tool',
+        description: 'requires approval',
+        parameters: z.object({ test: z.string() }),
+        needsApproval: true,
+        execute: approvalToolExecute,
+      });
+      const shell = new FakeShell();
+      const editor = new FakeEditor();
+      const model = new FakeModel([
+        {
+          output: [
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              id: 'abortable-call',
+              callId: 'abortable-call',
+              name: 'abortable_tool',
+            },
+            {
+              type: 'shell_call',
+              callId: 'shell-call',
+              status: 'completed',
+              action: { commands: ['echo completed'] },
+            },
+            {
+              type: 'apply_patch_call',
+              callId: 'apply-patch-call',
+              status: 'completed',
+              operation: {
+                type: 'update_file',
+                path: 'README.md',
+                diff: 'diff --git',
+              },
+            },
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              id: 'approval-call',
+              callId: 'approval-call',
+              name: 'approval_tool',
+            },
+          ],
+          usage: new Usage(),
+        },
+      ]);
+      const agent = new Agent({
+        name: 'MixedActionCancellationAgent',
+        model,
+        tools: [
+          abortableTool,
+          approvalTool,
+          shellTool({ shell }),
+          applyPatchTool({ editor }),
+        ],
+      });
+      const state = new RunState(new RunContext(), 'start', agent, 10);
+
+      const runPromise = run(agent, state, { signal: controller.signal });
+      const rejection = expect(runPromise).rejects.toBe(abortReason);
+      await toolStarted;
+
+      controller.abort(abortReason);
+
+      await rejection;
+      expect(shell.calls).toHaveLength(0);
+      expect(editor.operations).toHaveLength(0);
+      expect(approvalToolExecute).not.toHaveBeenCalled();
+      expect(state.getInterruptions()).toHaveLength(1);
+      expect(state.getInterruptions()[0].rawItem).toMatchObject({
+        type: 'function_call',
+        callId: 'approval-call',
+      });
+      expect(
+        state._generatedItems.filter(
+          (item) =>
+            item.rawItem.type === 'function_call_result' &&
+            item.rawItem.callId === 'abortable-call' &&
+            item.rawItem.status === 'incomplete',
+        ),
+      ).toHaveLength(1);
+      expect(
+        state._generatedItems.filter(
+          (item) =>
+            item.rawItem.type === 'shell_call_output' &&
+            item.rawItem.callId === 'shell-call' &&
+            item.rawItem.status === 'incomplete',
+        ),
+      ).toHaveLength(1);
+      expect(
+        state._generatedItems.filter(
+          (item) =>
+            item.rawItem.type === 'apply_patch_call_output' &&
+            item.rawItem.callId === 'apply-patch-call' &&
+            item.rawItem.status === 'failed',
+        ),
+      ).toHaveLength(1);
+    });
+
+    it('does not start queued function tools after cancellation', async () => {
+      const controller = new AbortController();
+      const abortReason = new Error('stop queued tools');
+      let markToolStarted: (() => void) | undefined;
+      const toolStarted = new Promise<void>((resolve) => {
+        markToolStarted = resolve;
+      });
+      const abortableTool = tool({
+        name: 'abortable_tool',
+        description: 'throws the run abort reason',
+        parameters: z.object({ test: z.string() }),
+        errorFunction: null,
+        execute: async (_input, _context, details) => {
+          markToolStarted?.();
+          if (!details?.signal) {
+            throw new Error('Expected the run abort signal');
+          }
+          if (!details.signal.aborted) {
+            await new Promise<void>((resolve) => {
+              details.signal?.addEventListener('abort', () => resolve(), {
+                once: true,
+              });
+            });
+          }
+          details.signal.throwIfAborted();
+          return 'unexpected tool output';
+        },
+      });
+      const queuedExecute = vi.fn(async () => 'unexpected queued output');
+      const queuedTool = tool({
+        name: 'queued_tool',
+        description: 'must not start after cancellation',
+        parameters: z.object({ test: z.string() }),
+        execute: queuedExecute,
+      });
+      const model = new FakeModel([
+        {
+          output: [
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              id: 'abortable-call',
+              callId: 'abortable-call',
+              name: 'abortable_tool',
+            },
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              id: 'queued-call',
+              callId: 'queued-call',
+              name: 'queued_tool',
+            },
+          ],
+          usage: new Usage(),
+        },
+      ]);
+      const agent = new Agent({
+        name: 'QueuedCancellationAgent',
+        model,
+        tools: [abortableTool, queuedTool],
+      });
+      const state = new RunState(new RunContext(), 'start', agent, 10);
+      const runner = new Runner({
+        toolExecution: { maxFunctionToolConcurrency: 1 },
+      });
+
+      const runPromise = runner.run(agent, state, {
+        signal: controller.signal,
+      });
+      const rejection = expect(runPromise).rejects.toBe(abortReason);
+      await toolStarted;
+
+      controller.abort(abortReason);
+
+      await rejection;
+      expect(queuedExecute).not.toHaveBeenCalled();
+      expect(
+        state._generatedItems.filter(
+          (item) =>
+            item.rawItem.type === 'function_call_result' &&
+            item.rawItem.status === 'incomplete',
+        ),
+      ).toHaveLength(2);
+    });
+
+    it('propagates run cancellation to an approved function tool', async () => {
+      const controller = new AbortController();
+      const abortReason = new Error('stop approved tool');
+      let toolSignal: AbortSignal | undefined;
+      let markToolStarted: (() => void) | undefined;
+      const toolStarted = new Promise<void>((resolve) => {
+        markToolStarted = resolve;
+      });
+      let releaseTool: (() => void) | undefined;
+      const toolCanFinish = new Promise<void>((resolve) => {
+        releaseTool = resolve;
+      });
+      const approvalTool = tool({
+        name: 'test',
+        description: 'requires approval before waiting for cancellation',
+        parameters: z.object({ test: z.string() }),
+        needsApproval: true,
+        execute: async (_input, _context, details) => {
+          toolSignal = details?.signal;
+          markToolStarted?.();
+          await toolCanFinish;
+          return 'approved tool cleanup complete';
+        },
+      });
+      const model = new FakeModel([
+        {
+          output: [{ ...TEST_MODEL_FUNCTION_CALL }],
+          usage: new Usage(),
+        },
+        {
+          output: [fakeModelMessage('unexpected second response')],
+          usage: new Usage(),
+        },
+      ]);
+      const getResponseSpy = vi.spyOn(model, 'getResponse');
+      const agent = new Agent({
+        name: 'ApprovedCancellationAgent',
+        model,
+        tools: [approvalTool],
+      });
+
+      const interruptedResult = await run(agent, 'start');
+      expect(interruptedResult.interruptions).toHaveLength(1);
+      interruptedResult.state.approve(interruptedResult.interruptions[0]);
+
+      const runPromise = run(agent, interruptedResult.state, {
+        signal: controller.signal,
+      });
+      const rejection = expect(runPromise).rejects.toBe(abortReason);
+      await toolStarted;
+
+      expect(toolSignal).toBe(controller.signal);
+      controller.abort(abortReason);
+      releaseTool?.();
+
+      await rejection;
+      expect(getResponseSpy).toHaveBeenCalledTimes(1);
+      expect(
+        interruptedResult.state._generatedItems.filter(
+          (item) => item.rawItem.type === 'function_call_result',
+        ),
+      ).toHaveLength(1);
+    });
+
+    it('preserves approved sibling results when cancellation is surfaced', async () => {
+      const controller = new AbortController();
+      const abortReason = new Error('stop approved siblings');
+      let markAbortToolStarted: (() => void) | undefined;
+      const abortToolStarted = new Promise<void>((resolve) => {
+        markAbortToolStarted = resolve;
+      });
+      let markSiblingStarted: (() => void) | undefined;
+      const siblingStarted = new Promise<void>((resolve) => {
+        markSiblingStarted = resolve;
+      });
+      let releaseSibling: (() => void) | undefined;
+      const siblingCanFinish = new Promise<void>((resolve) => {
+        releaseSibling = resolve;
+      });
+      const abortableTool = tool({
+        name: 'approved_abortable_tool',
+        description: 'throws the run abort reason after approval',
+        parameters: z.object({ test: z.string() }),
+        needsApproval: true,
+        errorFunction: null,
+        execute: async (_input, _context, details) => {
+          markAbortToolStarted?.();
+          if (!details?.signal) {
+            throw new Error('Expected the run abort signal');
+          }
+          if (!details.signal.aborted) {
+            await new Promise<void>((resolve) => {
+              details.signal?.addEventListener('abort', () => resolve(), {
+                once: true,
+              });
+            });
+          }
+          details.signal.throwIfAborted();
+          return 'unexpected tool output';
+        },
+      });
+      const siblingTool = tool({
+        name: 'approved_sibling_tool',
+        description: 'finishes independently after approval',
+        parameters: z.object({ test: z.string() }),
+        needsApproval: true,
+        execute: async () => {
+          markSiblingStarted?.();
+          await siblingCanFinish;
+          return 'approved sibling complete';
+        },
+      });
+      const model = new FakeModel([
+        {
+          output: [
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              id: 'approved-abortable-call',
+              callId: 'approved-abortable-call',
+              name: 'approved_abortable_tool',
+            },
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              id: 'approved-sibling-call',
+              callId: 'approved-sibling-call',
+              name: 'approved_sibling_tool',
+            },
+          ],
+          usage: new Usage(),
+        },
+      ]);
+      const agent = new Agent({
+        name: 'ApprovedSiblingCancellationAgent',
+        model,
+        tools: [abortableTool, siblingTool],
+      });
+
+      const interruptedResult = await run(agent, 'start');
+      expect(interruptedResult.interruptions).toHaveLength(2);
+      for (const interruption of interruptedResult.interruptions) {
+        interruptedResult.state.approve(interruption);
+      }
+
+      const runPromise = run(agent, interruptedResult.state, {
+        signal: controller.signal,
+      });
+      const rejection = expect(runPromise).rejects.toBe(abortReason);
+      await Promise.all([abortToolStarted, siblingStarted]);
+
+      controller.abort(abortReason);
+      releaseSibling?.();
+
+      await rejection;
+      expect(interruptedResult.state.getInterruptions()).toHaveLength(0);
+      expect(
+        interruptedResult.state._generatedItems.filter(
+          (item) =>
+            item.rawItem.type === 'function_call_result' &&
+            item.rawItem.callId === 'approved-abortable-call' &&
+            item.rawItem.status === 'incomplete',
+        ),
+      ).toHaveLength(1);
+      expect(
+        interruptedResult.state._generatedItems.filter(
+          (item) =>
+            item.rawItem.type === 'function_call_result' &&
+            item.rawItem.callId === 'approved-sibling-call' &&
+            item.rawItem.status === 'completed',
+        ),
+      ).toHaveLength(1);
     });
 
     it('accepts public tool not found behavior config', () => {
@@ -352,6 +1083,77 @@ describe('Runner.run', () => {
         output: {
           type: 'text',
           text: 'missing_tool unavailable for call_missing',
+        },
+      });
+    });
+
+    it('redacts hostile tool-not-found formatter errors and keeps the fallback result', async () => {
+      class RecordingModel extends FakeModel {
+        readonly requests: ModelRequest[] = [];
+
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          this.requests.push(request);
+          return super.getResponse(request);
+        }
+      }
+
+      const model = new RecordingModel([
+        {
+          output: [
+            {
+              ...TEST_MODEL_FUNCTION_CALL,
+              name: 'missing_tool',
+              callId: 'call_missing',
+              arguments: '{}',
+            },
+          ],
+          usage: new Usage(),
+        },
+        {
+          output: [fakeModelMessage('formatter fallback recovered')],
+          usage: new Usage(),
+        },
+      ]);
+      const agent = new Agent({
+        name: 'MissingToolFormatterFallbackAgent',
+        model,
+        toolUseBehavior: 'run_llm_again',
+      });
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+      vi.spyOn(logger, 'dontLogToolData', 'get').mockReturnValue(true);
+      const hostileError = new Proxy(
+        {},
+        {
+          getPrototypeOf() {
+            throw new Error('SECRET_TOOL_NOT_FOUND_FORMATTER_123');
+          },
+        },
+      );
+
+      const result = await run(agent, 'start', {
+        toolNotFoundBehavior: 'return_error_to_model',
+        toolErrorFormatter: () => {
+          throw hostileError;
+        },
+      });
+
+      expect(result.finalOutput).toBe('formatter fallback recovered');
+      expect(warnSpy).toHaveBeenCalledWith(
+        'toolErrorFormatter threw while formatting tool not found:',
+        'object',
+      );
+      expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(
+        'SECRET_TOOL_NOT_FOUND_FORMATTER_123',
+      );
+      const secondInput = model.requests[1].input as AgentInputItem[];
+      expect(secondInput).toContainEqual({
+        type: 'function_call_result',
+        name: 'missing_tool',
+        callId: 'call_missing',
+        status: 'completed',
+        output: {
+          type: 'text',
+          text: "Tool 'missing_tool' not found.",
         },
       });
     });
@@ -1035,6 +1837,219 @@ describe('Runner.run', () => {
       expect(model.requests).toHaveLength(2);
       expect(model.requests[0]?.modelSettings.toolChoice).toBe('required');
       expect(model.requests[1]?.modelSettings.toolChoice).toBe('none');
+    });
+
+    it('continues Programmatic Tool Calling through nested calls and program output', async () => {
+      class ProgrammaticToolCallingModel implements Model {
+        requests: ModelRequest[] = [];
+
+        async getResponse(request: ModelRequest): Promise<ModelResponse> {
+          this.requests.push(request);
+          if (this.requests.length === 1) {
+            return {
+              output: [
+                {
+                  type: 'program',
+                  id: 'prog_1',
+                  callId: 'call_prog_1',
+                  code: 'const values = await Promise.all([tools.lookup({key:"a"}), tools.lookup({key:"b"})]); text(JSON.stringify(values));',
+                  fingerprint: 'fp_1',
+                },
+                {
+                  type: 'function_call',
+                  id: 'fc_1',
+                  callId: 'call_1',
+                  name: 'lookup',
+                  arguments: '{"key":"a"}',
+                  caller: { type: 'program', callerId: 'call_prog_1' },
+                },
+                {
+                  type: 'function_call',
+                  id: 'fc_2',
+                  callId: 'call_2',
+                  name: 'lookup',
+                  arguments: '{"key":"b"}',
+                  caller: { type: 'program', callerId: 'call_prog_1' },
+                },
+              ],
+              usage: new Usage(),
+            };
+          }
+          if (this.requests.length === 2) {
+            return {
+              output: [
+                {
+                  type: 'program_output',
+                  id: 'prog_out_1',
+                  callId: 'call_prog_1',
+                  output: '[{"key":"a"},{"key":"b"}]',
+                  status: 'completed',
+                },
+              ],
+              usage: new Usage(),
+            };
+          }
+          return {
+            output: [fakeModelMessage('Program completed.')],
+            usage: new Usage(),
+          };
+        }
+
+        async *getStreamedResponse(): AsyncIterable<protocol.StreamEvent> {
+          yield* [];
+          throw new Error('Not implemented');
+        }
+      }
+
+      const model = new ProgrammaticToolCallingModel();
+      const lookup = tool({
+        name: 'lookup',
+        description: 'Return the requested key.',
+        parameters: z.object({ key: z.string() }),
+        allowedCallers: ['programmatic'],
+        outputSchema: {
+          type: 'object',
+          properties: { key: { type: 'string' } },
+          required: ['key'],
+          additionalProperties: false,
+        },
+        execute: async ({ key }) => ({ key }),
+      });
+      const agent = new Agent({
+        name: 'ProgramAgent',
+        model,
+        tools: [lookup, PROGRAMMATIC_TOOL_CALLING_TOOL],
+        toolUseBehavior: 'stop_on_first_tool',
+        modelSettings: { toolChoice: 'programmatic_tool_calling' },
+      });
+
+      const result = await run(agent, 'Run the program.');
+
+      expect(result.finalOutput).toBe('Program completed.');
+      expect(model.requests).toHaveLength(3);
+      expect(model.requests[0]?.modelSettings.toolChoice).toBe(
+        'programmatic_tool_calling',
+      );
+      expect(model.requests[1]?.modelSettings.toolChoice).toBeUndefined();
+      const secondInput = model.requests[1]?.input as AgentInputItem[];
+      expect(secondInput.map((item) => item.type)).toEqual([
+        'message',
+        'program',
+        'function_call',
+        'function_call',
+        'function_call_result',
+        'function_call_result',
+      ]);
+      expect(
+        secondInput
+          .filter((item) => item.type === 'function_call_result')
+          .map((item) => item.caller),
+      ).toEqual([
+        { type: 'program', callerId: 'call_prog_1' },
+        { type: 'program', callerId: 'call_prog_1' },
+      ]);
+      const thirdInput = model.requests[2]?.input as AgentInputItem[];
+      expect(thirdInput.at(-1)).toMatchObject({
+        type: 'program_output',
+        callId: 'call_prog_1',
+        output: '[{"key":"a"},{"key":"b"}]',
+      });
+    });
+
+    it('accepts Programmatic Tool Calling supplied by a prompt template', async () => {
+      const lookup = tool({
+        name: 'prompt_lookup',
+        description: 'Return the requested key.',
+        parameters: z.object({ key: z.string() }),
+        allowedCallers: ['programmatic'],
+        outputSchema: {
+          type: 'object',
+          properties: { key: { type: 'string' } },
+          required: ['key'],
+          additionalProperties: false,
+        },
+        execute: async ({ key }) => ({ key }),
+      });
+      const agent = new Agent({
+        name: 'PromptProgramAgent',
+        model: new FakeModel([
+          {
+            output: [
+              {
+                type: 'program',
+                id: 'prog_prompt_supplied',
+                callId: 'call_prog_prompt_supplied',
+                code: 'text(await tools.prompt_lookup({key:"prompt"}))',
+                fingerprint: 'fp_prompt_supplied',
+              },
+              {
+                type: 'function_call',
+                id: 'fc_prompt_supplied',
+                callId: 'call_prompt_lookup',
+                name: 'prompt_lookup',
+                arguments: '{"key":"prompt"}',
+                caller: {
+                  type: 'program',
+                  callerId: 'call_prog_prompt_supplied',
+                },
+              },
+            ],
+            usage: new Usage(),
+          },
+          {
+            output: [
+              {
+                type: 'program_output',
+                id: 'prog_out_prompt_supplied',
+                callId: 'call_prog_prompt_supplied',
+                output: '{"key":"prompt"}',
+                status: 'completed',
+              },
+              fakeModelMessage('Prompt program completed.'),
+            ],
+            usage: new Usage(),
+          },
+        ]),
+        prompt: { promptId: 'pmpt_programmatic_tool_calling' },
+        tools: [lookup],
+      });
+
+      const result = await run(agent, 'Run the prompt program.');
+
+      expect(result.finalOutput).toBe('Prompt program completed.');
+      expect(result.newItems.map((item) => item.rawItem.type)).toEqual([
+        'program',
+        'function_call',
+        'function_call_result',
+        'program_output',
+        'message',
+      ]);
+    });
+
+    it('rejects prompt-supplied Programmatic Tool Calling when tools are explicitly disabled', async () => {
+      const agent = new Agent({
+        name: 'PromptProgramAgent',
+        model: new FakeModel([
+          {
+            output: [
+              {
+                type: 'program',
+                id: 'prog_prompt_disabled',
+                callId: 'call_prog_prompt_disabled',
+                code: 'text("blocked")',
+                fingerprint: 'fp_prompt_disabled',
+              },
+            ],
+            usage: new Usage(),
+          },
+        ]),
+        prompt: { promptId: 'pmpt_programmatic_tool_calling' },
+        tools: [],
+      });
+
+      await expect(run(agent, 'Run the prompt program.')).rejects.toThrow(
+        /without programmaticToolCallingTool\(\)/,
+      );
     });
 
     it('sholuld handle structured output', async () => {
@@ -3466,6 +4481,230 @@ describe('Runner.run', () => {
           ? (savedAssistant.content[0] as { providerData?: unknown })
           : undefined;
         expect(firstPart?.providerData).toEqual({ annotations: [] });
+      });
+
+      it('persists accepted tool results before surfacing cancellation', async () => {
+        const controller = new AbortController();
+        const abortReason = new Error('stop after tool result');
+        let markToolStarted: (() => void) | undefined;
+        const toolStarted = new Promise<void>((resolve) => {
+          markToolStarted = resolve;
+        });
+        let releaseTool: (() => void) | undefined;
+        const toolCanFinish = new Promise<void>((resolve) => {
+          releaseTool = resolve;
+        });
+        const abortableTool = tool({
+          name: 'test',
+          description: 'finishes after cancellation',
+          parameters: z.object({ test: z.string() }),
+          execute: async () => {
+            markToolStarted?.();
+            await toolCanFinish;
+            return 'completed tool result';
+          },
+        });
+        const model = new FakeModel([
+          {
+            output: [{ ...TEST_MODEL_FUNCTION_CALL }],
+            usage: new Usage(),
+          },
+        ]);
+        const agent = new Agent({
+          name: 'SessionCancellationAgent',
+          model,
+          tools: [abortableTool],
+        });
+        const session = new MemorySession();
+
+        const runPromise = run(agent, 'start', {
+          session,
+          signal: controller.signal,
+        });
+        const rejection = expect(runPromise).rejects.toBe(abortReason);
+        await toolStarted;
+
+        controller.abort(abortReason);
+        releaseTool?.();
+
+        await rejection;
+        expect(session.added).toHaveLength(1);
+        expect(session.added[0].map((item) => item.type)).toEqual([
+          'message',
+          'function_call',
+          'function_call_result',
+        ]);
+      });
+
+      it('does not persist a cancelled tool turn again when its state resumes', async () => {
+        const controller = new AbortController();
+        const abortReason = new Error('stop before the next model turn');
+        let markToolStarted: (() => void) | undefined;
+        const toolStarted = new Promise<void>((resolve) => {
+          markToolStarted = resolve;
+        });
+        let releaseTool: (() => void) | undefined;
+        const toolCanFinish = new Promise<void>((resolve) => {
+          releaseTool = resolve;
+        });
+        const abortableTool = tool({
+          name: 'test',
+          description: 'finishes after cancellation',
+          parameters: z.object({ test: z.string() }),
+          execute: async () => {
+            markToolStarted?.();
+            await toolCanFinish;
+            return 'completed tool result';
+          },
+        });
+        const model = new FakeModel([
+          {
+            output: [{ ...TEST_MODEL_FUNCTION_CALL }],
+            usage: new Usage(),
+          },
+          {
+            output: [fakeModelMessage('resumed response')],
+            usage: new Usage(),
+          },
+        ]);
+        const agent = new Agent({
+          name: 'SessionCancellationResumeAgent',
+          model,
+          tools: [abortableTool],
+        });
+        const state = new RunState(new RunContext(), 'start', agent, 10);
+        const session = new MemorySession([user('start')]);
+
+        const runPromise = run(agent, state, {
+          session,
+          signal: controller.signal,
+        });
+        const rejection = expect(runPromise).rejects.toBe(abortReason);
+        await toolStarted;
+
+        controller.abort(abortReason);
+        releaseTool?.();
+
+        await rejection;
+        expect(session.added).toHaveLength(1);
+        expect(session.added[0].map((item) => item.type)).toEqual([
+          'function_call',
+          'function_call_result',
+        ]);
+
+        await run(agent, state, { session });
+
+        expect(session.added).toHaveLength(2);
+        expect(session.added[1].map((item) => item.type)).toEqual(['message']);
+        expect(
+          session.added
+            .flat()
+            .filter(
+              (item) =>
+                item.type === 'function_call' &&
+                item.callId === TEST_MODEL_FUNCTION_CALL.callId,
+            ),
+        ).toHaveLength(1);
+      });
+
+      it('does not execute or repersist a handoff skipped by cancellation', async () => {
+        const controller = new AbortController();
+        const abortReason = new Error('stop before the handoff');
+        let markToolStarted: (() => void) | undefined;
+        const toolStarted = new Promise<void>((resolve) => {
+          markToolStarted = resolve;
+        });
+        let releaseTool: (() => void) | undefined;
+        const toolCanFinish = new Promise<void>((resolve) => {
+          releaseTool = resolve;
+        });
+        const abortableTool = tool({
+          name: 'test',
+          description: 'finishes after cancellation',
+          parameters: z.object({ test: z.string() }),
+          execute: async () => {
+            markToolStarted?.();
+            await toolCanFinish;
+            return 'completed tool result';
+          },
+        });
+        const agentB = new Agent({
+          name: 'SessionCancellationHandoffTarget',
+          model: new FakeModel([
+            {
+              output: [fakeModelMessage('handoff response')],
+              usage: new Usage(),
+            },
+          ]),
+        });
+        const onHandoff = vi.fn();
+        const handoffToB = handoff(agentB, { onHandoff });
+        const handoffCall: protocol.FunctionCallItem = {
+          id: 'handoff-call',
+          type: 'function_call',
+          name: handoffToB.toolName,
+          callId: 'handoff-call',
+          status: 'completed',
+          arguments: '{}',
+        };
+        const agentA = new Agent({
+          name: 'SessionCancellationHandoffSource',
+          model: new FakeModel([
+            {
+              output: [{ ...TEST_MODEL_FUNCTION_CALL }, handoffCall],
+              usage: new Usage(),
+            },
+            {
+              output: [fakeModelMessage('resumed source response')],
+              usage: new Usage(),
+            },
+          ]),
+          tools: [abortableTool],
+          handoffs: [handoffToB],
+        });
+        const state = new RunState(new RunContext(), 'start', agentA, 10);
+        const session = new MemorySession([user('start')]);
+
+        const runPromise = run(agentA, state, {
+          session,
+          signal: controller.signal,
+        });
+        const rejection = expect(runPromise).rejects.toBe(abortReason);
+        await toolStarted;
+
+        controller.abort(abortReason);
+        releaseTool?.();
+
+        await rejection;
+        expect(state._currentStep?.type).toBe('next_step_run_again');
+        expect(onHandoff).not.toHaveBeenCalled();
+        expect(session.added).toHaveLength(1);
+
+        const result = await run(agentA, state, { session });
+
+        expect(result.finalOutput).toBe('resumed source response');
+        expect(onHandoff).not.toHaveBeenCalled();
+        expect(session.added).toHaveLength(2);
+        expect(session.added[1].map((item) => item.type)).toEqual(['message']);
+        expect(
+          session.added
+            .flat()
+            .filter(
+              (item) =>
+                item.type === 'function_call' &&
+                item.callId === TEST_MODEL_FUNCTION_CALL.callId,
+            ),
+        ).toHaveLength(1);
+        expect(
+          session.added
+            .flat()
+            .filter(
+              (item) =>
+                item.type === 'function_call_result' &&
+                item.callId === handoffCall.callId &&
+                item.status === 'incomplete',
+            ),
+        ).toHaveLength(1);
       });
 
       it('applies runner-level reasoningItemIdPolicy to replayed session history', async () => {

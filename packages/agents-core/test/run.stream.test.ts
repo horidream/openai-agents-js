@@ -62,6 +62,36 @@ function getRequestInputItems(request: ModelRequest): AgentInputItem[] {
   return Array.isArray(request.input) ? request.input : [];
 }
 
+class CountingFunctionToolStreamModel implements Model {
+  callCount = 0;
+
+  async getResponse(_request: ModelRequest): Promise<ModelResponse> {
+    throw new Error('Unexpected non-streaming model request');
+  }
+
+  async *getStreamedResponse(
+    _request: ModelRequest,
+  ): AsyncIterable<StreamEvent> {
+    const output =
+      this.callCount++ === 0
+        ? [{ ...TEST_MODEL_FUNCTION_CALL }]
+        : [fakeModelMessage('done')];
+    yield {
+      type: 'response_done',
+      response: {
+        id: `resp-${this.callCount}`,
+        usage: {
+          requests: 1,
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+        },
+        output,
+      },
+    } as StreamEvent;
+  }
+}
+
 class AbortAfterStreamedFunctionCallModel implements Model {
   public requests: ModelRequest[] = [];
 
@@ -103,6 +133,121 @@ class AbortAfterStreamedFunctionCallModel implements Model {
         },
       },
     };
+    const error = new Error('aborted');
+    error.name = 'AbortError';
+    throw error;
+  }
+}
+
+class FailingAbortReconciliationModel extends AbortAfterStreamedFunctionCallModel {
+  constructor(
+    responseId: string,
+    private readonly reconciliationError: unknown,
+  ) {
+    super(responseId);
+  }
+
+  override async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(request);
+    throw this.reconciliationError;
+  }
+}
+
+class AbortAfterStreamedProgramModel implements Model {
+  public requests: ModelRequest[] = [];
+
+  constructor(private readonly responseId: string) {}
+
+  async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(request);
+    return {
+      output: [fakeModelMessage('reconciled')],
+      usage: new Usage(),
+      responseId: 'resp-reconciled',
+    };
+  }
+
+  async *getStreamedResponse(
+    request: ModelRequest,
+  ): AsyncIterable<StreamEvent> {
+    this.requests.push(request);
+    yield {
+      type: 'model',
+      event: {
+        type: 'response.created',
+        response: {
+          id: this.responseId,
+        },
+      },
+    };
+    yield {
+      type: 'model',
+      event: {
+        type: 'response.output_item.done',
+        item: {
+          type: 'program',
+          id: 'prog_abort',
+          call_id: 'call_prog_abort',
+          code: 'text("done");',
+          fingerprint: 'fingerprint:abort',
+        },
+      },
+    };
+    const error = new Error('aborted');
+    error.name = 'AbortError';
+    throw error;
+  }
+}
+
+class AbortAfterStreamedProgramToolCallsModel implements Model {
+  public requests: ModelRequest[] = [];
+
+  async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(request);
+    return {
+      output: [fakeModelMessage('reconciled')],
+      usage: new Usage(),
+      responseId: 'resp-reconciled',
+    };
+  }
+
+  async *getStreamedResponse(
+    request: ModelRequest,
+  ): AsyncIterable<StreamEvent> {
+    this.requests.push(request);
+    for (const item of [
+      {
+        type: 'program',
+        id: 'prog_abort',
+        call_id: 'call_prog_abort',
+        code: 'await tools.shell();',
+        fingerprint: 'fingerprint:abort',
+      },
+      {
+        type: 'shell_call',
+        id: 'shell_abort',
+        call_id: 'call_shell_abort',
+        status: 'completed',
+        action: { commands: ['sleep 10'] },
+        caller: { type: 'program', caller_id: 'call_prog_abort' },
+      },
+      {
+        type: 'apply_patch_call',
+        id: 'patch_abort',
+        call_id: 'call_patch_abort',
+        status: 'completed',
+        operation: { type: 'delete_file', path: 'temporary.txt' },
+        caller: { type: 'program', caller_id: 'call_prog_abort' },
+      },
+    ]) {
+      yield {
+        type: 'model',
+        event: {
+          type: 'response.output_item.done',
+          item,
+        },
+      };
+    }
     const error = new Error('aborted');
     error.name = 'AbortError';
     throw error;
@@ -367,6 +512,42 @@ describe('Runner.run (streaming)', () => {
     ]);
   });
 
+  it.each([
+    [true, false],
+    [false, true],
+    [true, true],
+  ])(
+    'redacts abort reconciliation failures when model=%s or tool=%s logging is disabled',
+    async (dontLogModelData, dontLogToolData) => {
+      const secret = 'SECRET_ABORT_RECONCILIATION_123';
+      const model = new FailingAbortReconciliationModel(
+        'resp-aborted',
+        new Error(secret),
+      );
+      const agent = new Agent({ name: 'AbortReconcileFailure', model });
+      const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+      vi.spyOn(logger, 'dontLogModelData', 'get').mockReturnValue(
+        dontLogModelData,
+      );
+      vi.spyOn(logger, 'dontLogToolData', 'get').mockReturnValue(
+        dontLogToolData,
+      );
+
+      const result = await run(agent, 'hi', {
+        stream: true,
+        conversationId: 'conv-abort-failure',
+      });
+
+      await expect(result.completed).resolves.toBeUndefined();
+      expect(model.requests).toHaveLength(2);
+      expect(debugSpy).toHaveBeenCalledWith(
+        'Failed to reconcile streamed tool calls after abort.',
+        'object',
+      );
+      expect(JSON.stringify(debugSpy.mock.calls)).not.toContain(secret);
+    },
+  );
+
   it('uses the streamed response id when reconciling previousResponseId-only aborts', async () => {
     const model = new AbortAfterStreamedFunctionCallModel('resp-aborted');
     const agent = new Agent({ name: 'AbortPreviousResponse', model });
@@ -386,6 +567,73 @@ describe('Runner.run (streaming)', () => {
       callId: 'call_abort',
       status: 'incomplete',
     });
+  });
+
+  it('reconciles streamed programs without outputs on abort', async () => {
+    const model = new AbortAfterStreamedProgramModel('resp-aborted');
+    const agent = new Agent({ name: 'AbortProgram', model });
+
+    const result = await run(agent, 'hi', {
+      stream: true,
+      conversationId: 'conv-program-abort',
+    });
+
+    await result.completed;
+
+    expect(model.requests).toHaveLength(2);
+    expect(model.requests[1].conversationId).toBe('conv-program-abort');
+    expect(getRequestInputItems(model.requests[1])).toEqual([
+      expect.objectContaining({
+        type: 'program_output',
+        id: expect.stringMatching(/^prog_out_[0-9a-f]{32}$/),
+        callId: 'call_prog_abort',
+        status: 'incomplete',
+        output: 'aborted',
+      }),
+    ]);
+  });
+
+  it('reconciles program-owned shell and apply_patch calls on abort', async () => {
+    const model = new AbortAfterStreamedProgramToolCallsModel();
+    const agent = new Agent({ name: 'AbortProgramTools', model });
+
+    const result = await run(agent, 'hi', {
+      stream: true,
+      conversationId: 'conv-program-tools-abort',
+    });
+
+    await result.completed;
+
+    expect(model.requests).toHaveLength(2);
+    expect(model.requests[1].conversationId).toBe('conv-program-tools-abort');
+    expect(getRequestInputItems(model.requests[1])).toEqual([
+      {
+        type: 'shell_call_output',
+        callId: 'call_shell_abort',
+        status: 'incomplete',
+        output: [
+          {
+            stdout: '',
+            stderr: 'aborted',
+            outcome: { type: 'timeout' },
+          },
+        ],
+        caller: { type: 'program', callerId: 'call_prog_abort' },
+      },
+      {
+        type: 'apply_patch_call_output',
+        callId: 'call_patch_abort',
+        status: 'failed',
+        output: 'aborted',
+        caller: { type: 'program', callerId: 'call_prog_abort' },
+      },
+      expect.objectContaining({
+        type: 'program_output',
+        callId: 'call_prog_abort',
+        status: 'incomplete',
+        output: 'aborted',
+      }),
+    ]);
   });
 
   it('emits agent_updated_stream_event with new agent on handoff', async () => {
@@ -1018,6 +1266,68 @@ describe('Runner.run (streaming)', () => {
     expect(result.error).toBe(null);
   });
 
+  it('waits for the background run loop after cancellation', async () => {
+    let markAbortObserved: (() => void) | undefined;
+    const abortObserved = new Promise<void>((resolve) => {
+      markAbortObserved = resolve;
+    });
+    let releaseModel: (() => void) | undefined;
+    const modelReleased = new Promise<void>((resolve) => {
+      releaseModel = resolve;
+    });
+
+    class SettlingStreamingModel implements Model {
+      async getResponse(): Promise<ModelResponse> {
+        throw new Error('Unexpected non-streaming model request');
+      }
+
+      async *getStreamedResponse(
+        request: ModelRequest,
+      ): AsyncIterable<StreamEvent> {
+        yield { type: 'output_text_delta', delta: 'hello' } as StreamEvent;
+        if (!request.signal) {
+          throw new Error('Expected an abort signal');
+        }
+        if (!request.signal.aborted) {
+          await new Promise<void>((resolve) => {
+            request.signal?.addEventListener('abort', () => resolve(), {
+              once: true,
+            });
+          });
+        }
+        markAbortObserved?.();
+        await modelReleased;
+        const error = new Error('Aborted');
+        error.name = 'AbortError';
+        throw error;
+      }
+    }
+
+    const agent = new Agent({
+      name: 'SettlingStream',
+      model: new SettlingStreamingModel(),
+    });
+    const result = await run(agent, 'go', { stream: true });
+    const reader = (result.toStream() as any).getReader();
+
+    await expect(reader.read()).resolves.toMatchObject({ done: false });
+    await reader.cancel('stop');
+    await abortObserved;
+
+    let completedSettled = false;
+    void result.completed.then(() => {
+      completedSettled = true;
+    });
+    await Promise.resolve();
+
+    expect(completedSettled).toBe(false);
+
+    releaseModel?.();
+    await expect(result.completed).resolves.toBeUndefined();
+    expect(result.cancelled).toBe(true);
+    expect(result.error).toBe(null);
+  });
+
   it('marks inputs as sent when aborted before first stream event in server-managed conversations', async () => {
     const waitWithAbort = (ms: number, signal?: AbortSignal) =>
       new Promise<void>((resolve, reject) => {
@@ -1231,6 +1541,724 @@ describe('Runner.run (streaming)', () => {
     expect(toolCalledIndex).toBeGreaterThan(-1);
     expect(toolOutputIndex).toBeGreaterThan(-1);
     expect(toolCalledIndex).toBeLessThan(toolOutputIndex);
+  });
+
+  it('settles a cancelled function tool without starting another model turn', async () => {
+    let markToolStarted: (() => void) | undefined;
+    let releaseTool: (() => void) | undefined;
+    let toolSignal: AbortSignal | undefined;
+    const toolStarted = new Promise<void>((resolve) => {
+      markToolStarted = resolve;
+    });
+    const toolCanFinish = new Promise<void>((resolve) => {
+      releaseTool = resolve;
+    });
+    const abortableTool = tool({
+      name: 'test',
+      description: 'waits for the streamed run to be cancelled',
+      parameters: z.object({ test: z.string() }),
+      execute: async (_input, _context, details) => {
+        toolSignal = details?.signal;
+        markToolStarted?.();
+        if (!toolSignal?.aborted) {
+          await Promise.race([
+            toolCanFinish,
+            new Promise<void>((resolve) => {
+              toolSignal?.addEventListener('abort', () => resolve(), {
+                once: true,
+              });
+            }),
+          ]);
+        }
+        return 'cancelled';
+      },
+    });
+    const model = new CountingFunctionToolStreamModel();
+    const agent = new Agent({
+      name: 'AbortableToolStreamAgent',
+      model,
+      tools: [abortableTool],
+    });
+    const result = await run(agent, 'start', {
+      stream: true,
+      maxTurns: 1,
+    });
+    const reader = (result.toStream() as any).getReader();
+
+    await toolStarted;
+    await reader.cancel('stop');
+    releaseTool?.();
+    await result.completed;
+
+    expect(result.cancelled).toBe(true);
+    expect(toolSignal?.aborted).toBe(true);
+    expect(model.callCount).toBe(1);
+    expect(result.state._currentTurnInProgress).toBe(false);
+    expect(
+      result.state._generatedItems.some(
+        (item) =>
+          item.rawItem.type === 'function_call_result' &&
+          item.rawItem.status === 'completed',
+      ),
+    ).toBe(true);
+
+    const resumed = await run(agent, result.state, { stream: true });
+    await expect(resumed.completed).rejects.toBeInstanceOf(
+      MaxTurnsExceededError,
+    );
+    expect(model.callCount).toBe(1);
+  });
+
+  it('atomically finalizes a completed tool output after cancellation', async () => {
+    const saveResultSpy = vi
+      .spyOn(sessionPersistence, 'saveStreamResultToSession')
+      .mockResolvedValue();
+    let markToolStarted: (() => void) | undefined;
+    let releaseTool: (() => void) | undefined;
+    const toolStarted = new Promise<void>((resolve) => {
+      markToolStarted = resolve;
+    });
+    const toolCanFinish = new Promise<void>((resolve) => {
+      releaseTool = resolve;
+    });
+    const execute = vi.fn(async (_input, _context, details) => {
+      markToolStarted?.();
+      const signal = details?.signal as AbortSignal | undefined;
+      if (!signal?.aborted) {
+        await Promise.race([
+          toolCanFinish,
+          new Promise<void>((resolve) => {
+            signal?.addEventListener('abort', () => resolve(), { once: true });
+          }),
+        ]);
+      }
+      return 'settled after cancellation';
+    });
+    const finalTool = tool({
+      name: 'test',
+      description: 'returns the final output after cancellation',
+      parameters: z.object({ test: z.string() }),
+      execute,
+    });
+    const guardrail = {
+      name: 'allow-final-output',
+      execute: vi.fn().mockResolvedValue({
+        tripwireTriggered: false,
+        outputInfo: { safe: true },
+      }),
+    };
+    const model = new CountingFunctionToolStreamModel();
+    const agent = new Agent({
+      name: 'CancelledFinalToolStreamAgent',
+      model,
+      tools: [finalTool],
+      toolUseBehavior: 'stop_on_first_tool',
+      outputGuardrails: [guardrail],
+    });
+    const runner = new Runner();
+    const agentEnd = vi.fn();
+    runner.on('agent_end', agentEnd);
+    const session = createSessionMock();
+    const cancelled = await runner.run(agent, 'start', {
+      stream: true,
+      session,
+    });
+    const reader = (cancelled.toStream() as any).getReader();
+
+    await toolStarted;
+    await reader.cancel('stop');
+    releaseTool?.();
+    await cancelled.completed;
+
+    expect(cancelled.cancelled).toBe(true);
+    expect(cancelled.finalOutput).toBe('settled after cancellation');
+    expect(cancelled.state._currentStep).toEqual({
+      type: 'next_step_final_output',
+      output: 'settled after cancellation',
+    });
+    expect(cancelled.state._currentTurnInProgress).toBe(false);
+    expect(model.callCount).toBe(1);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(guardrail.execute).toHaveBeenCalledTimes(1);
+    expect(saveResultSpy).toHaveBeenCalledTimes(1);
+    expect(agentEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it('atomically finalizes a completed resumed tool after cancellation', async () => {
+    const saveResultSpy = vi
+      .spyOn(sessionPersistence, 'saveStreamResultToSession')
+      .mockResolvedValue();
+    let markToolStarted: (() => void) | undefined;
+    let releaseTool: (() => void) | undefined;
+    const toolStarted = new Promise<void>((resolve) => {
+      markToolStarted = resolve;
+    });
+    const toolCanFinish = new Promise<void>((resolve) => {
+      releaseTool = resolve;
+    });
+    const execute = vi.fn(async (_input, _context, details) => {
+      markToolStarted?.();
+      const signal = details?.signal as AbortSignal | undefined;
+      if (!signal?.aborted) {
+        await Promise.race([
+          toolCanFinish,
+          new Promise<void>((resolve) => {
+            signal?.addEventListener('abort', () => resolve(), { once: true });
+          }),
+        ]);
+      }
+      return 'cancelled';
+    });
+    const abortableTool = tool({
+      name: 'test',
+      description: 'waits for the resumed stream to be cancelled',
+      parameters: z.object({ test: z.string() }),
+      needsApproval: true,
+      execute,
+    });
+    const guardrail = {
+      name: 'allow-resumed-final-output',
+      execute: vi.fn().mockResolvedValue({
+        tripwireTriggered: false,
+        outputInfo: { safe: true },
+      }),
+    };
+    const model = new CountingFunctionToolStreamModel();
+    const agent = new Agent({
+      name: 'ResumedAbortableToolStreamAgent',
+      model,
+      tools: [abortableTool],
+      toolUseBehavior: 'stop_on_first_tool',
+      outputGuardrails: [guardrail],
+    });
+    const runner = new Runner();
+    const agentEnd = vi.fn();
+    runner.on('agent_end', agentEnd);
+    const session = createSessionMock();
+    const interrupted = await runner.run(agent, 'start', {
+      stream: true,
+      session,
+    });
+    for await (const _event of interrupted) {
+      // Drain the interrupted run.
+    }
+    interrupted.state.approve(interrupted.interruptions[0]);
+
+    const resumed = await runner.run(agent, interrupted.state, {
+      stream: true,
+      session,
+    });
+    const reader = (resumed.toStream() as any).getReader();
+
+    await toolStarted;
+    await reader.cancel('stop');
+    releaseTool?.();
+    await resumed.completed;
+
+    expect(resumed.cancelled).toBe(true);
+    expect(model.callCount).toBe(1);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(resumed.state._currentStep).toEqual({
+      type: 'next_step_final_output',
+      output: 'cancelled',
+    });
+    expect(resumed.state._currentTurnInProgress).toBe(false);
+    expect(resumed.finalOutput).toBe('cancelled');
+    expect(guardrail.execute).toHaveBeenCalledTimes(1);
+    expect(saveResultSpy).toHaveBeenCalledTimes(2);
+    expect(agentEnd).toHaveBeenCalledTimes(1);
+    expect(
+      resumed.state._generatedItems.some(
+        (item) =>
+          item.rawItem.type === 'function_call_result' &&
+          item.rawItem.status === 'completed',
+      ),
+    ).toBe(true);
+  });
+
+  it('finishes finalization once output guardrails have started', async () => {
+    const saveResultSpy = vi
+      .spyOn(sessionPersistence, 'saveStreamResultToSession')
+      .mockResolvedValue();
+    let markGuardrailStarted: (() => void) | undefined;
+    let releaseGuardrail: (() => void) | undefined;
+    const guardrailStarted = new Promise<void>((resolve) => {
+      markGuardrailStarted = resolve;
+    });
+    const guardrailCanFinish = new Promise<void>((resolve) => {
+      releaseGuardrail = resolve;
+    });
+    const guardrail = {
+      name: 'delayed-final-output-guardrail',
+      execute: vi.fn(async () => {
+        markGuardrailStarted?.();
+        await guardrailCanFinish;
+        return {
+          tripwireTriggered: false,
+          outputInfo: { safe: true },
+        };
+      }),
+    };
+    const execute = vi.fn(async () => 'guarded output');
+    const finalTool = tool({
+      name: 'test',
+      description: 'returns output guarded before finalization',
+      parameters: z.object({ test: z.string() }),
+      execute,
+    });
+    const model = new CountingFunctionToolStreamModel();
+    const agent = new Agent({
+      name: 'CancelDuringOutputGuardrailAgent',
+      model,
+      tools: [finalTool],
+      toolUseBehavior: 'stop_on_first_tool',
+      outputGuardrails: [guardrail],
+    });
+    const runner = new Runner();
+    const agentEnd = vi.fn();
+    runner.on('agent_end', agentEnd);
+    const session = createSessionMock();
+    const cancelled = await runner.run(agent, 'start', {
+      stream: true,
+      session,
+    });
+    const reader = (cancelled.toStream() as any).getReader();
+
+    await guardrailStarted;
+    await reader.cancel('stop');
+    releaseGuardrail?.();
+    await cancelled.completed;
+
+    expect(cancelled.cancelled).toBe(true);
+    expect(cancelled.state._currentStep).toEqual({
+      type: 'next_step_final_output',
+      output: 'guarded output',
+    });
+    expect(cancelled.finalOutput).toBe('guarded output');
+    expect(cancelled.state._currentTurnInProgress).toBe(false);
+    expect(guardrail.execute).toHaveBeenCalledTimes(1);
+    expect(model.callCount).toBe(1);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(saveResultSpy).toHaveBeenCalledTimes(1);
+    expect(agentEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it('finishes finalization when cancellation arrives during persistence', async () => {
+    let markPersistenceStarted: (() => void) | undefined;
+    let releasePersistence: (() => void) | undefined;
+    const persistenceStarted = new Promise<void>((resolve) => {
+      markPersistenceStarted = resolve;
+    });
+    const persistenceCanFinish = new Promise<void>((resolve) => {
+      releasePersistence = resolve;
+    });
+    const saveResultSpy = vi
+      .spyOn(sessionPersistence, 'saveStreamResultToSession')
+      .mockImplementation(async () => {
+        markPersistenceStarted?.();
+        await persistenceCanFinish;
+      });
+    const finalTool = tool({
+      name: 'test',
+      description: 'returns output before persistence',
+      parameters: z.object({ test: z.string() }),
+      execute: async () => 'persisted output',
+    });
+    const model = new CountingFunctionToolStreamModel();
+    const agent = new Agent({
+      name: 'CancelDuringFinalPersistenceAgent',
+      model,
+      tools: [finalTool],
+      toolUseBehavior: 'stop_on_first_tool',
+    });
+    const runner = new Runner();
+    const agentEnd = vi.fn();
+    runner.on('agent_end', agentEnd);
+    const result = await runner.run(agent, 'start', {
+      stream: true,
+      session: createSessionMock(),
+    });
+    const reader = (result.toStream() as any).getReader();
+
+    await persistenceStarted;
+    await reader.cancel('stop');
+    releasePersistence?.();
+    await result.completed;
+
+    expect(result.cancelled).toBe(true);
+    expect(result.finalOutput).toBe('persisted output');
+    expect(result.state._currentTurnInProgress).toBe(false);
+    expect(saveResultSpy).toHaveBeenCalledTimes(1);
+    expect(agentEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it('records a cancelled streaming agent tool as incomplete', async () => {
+    let markNestedModelStarted: (() => void) | undefined;
+    const nestedModelStarted = new Promise<void>((resolve) => {
+      markNestedModelStarted = resolve;
+    });
+    const nestedModel: Model = {
+      async getResponse() {
+        throw new Error('Unexpected non-streaming nested model request');
+      },
+      async *getStreamedResponse(request) {
+        markNestedModelStarted?.();
+        if (!request.signal) {
+          throw new Error('Expected nested model abort signal');
+        }
+        if (!request.signal.aborted) {
+          await new Promise<void>((resolve) => {
+            request.signal!.addEventListener('abort', () => resolve(), {
+              once: true,
+            });
+          });
+        }
+        request.signal.throwIfAborted();
+        yield {
+          type: 'response_done',
+          response: {
+            id: 'unexpected-nested-response',
+            usage: {
+              requests: 1,
+              inputTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+            },
+            output: [fakeModelMessage('unexpected nested completion')],
+          },
+        } as StreamEvent;
+      },
+    };
+    const nestedAgent = new Agent({
+      name: 'NestedStreamingAgent',
+      model: nestedModel,
+    });
+    const nestedTool = nestedAgent.asTool({
+      toolName: 'test',
+      toolDescription: 'runs a nested streaming agent',
+      parameters: z.object({ test: z.string() }),
+      inputBuilder: ({ params }) => params.test,
+      onStream: () => {},
+    });
+    const model = new CountingFunctionToolStreamModel();
+    const agent = new Agent({
+      name: 'ParentStreamingAgent',
+      model,
+      tools: [nestedTool],
+    });
+    const cancelled = await run(agent, 'start', { stream: true });
+    const reader = (cancelled.toStream() as any).getReader();
+
+    await nestedModelStarted;
+    await reader.cancel('stop');
+    await cancelled.completed;
+
+    expect(cancelled.cancelled).toBe(true);
+    expect(model.callCount).toBe(1);
+    expect(
+      cancelled.state._generatedItems.find(
+        (item) => item.rawItem.type === 'function_call_result',
+      )?.rawItem,
+    ).toMatchObject({
+      type: 'function_call_result',
+      callId: TEST_MODEL_FUNCTION_CALL.callId,
+      status: 'incomplete',
+      output: { type: 'text', text: 'aborted' },
+    });
+    expect(
+      cancelled.state.hasPendingAgentToolRun(
+        nestedTool.name,
+        TEST_MODEL_FUNCTION_CALL.callId,
+      ),
+    ).toBe(false);
+
+    const resumed = await run(agent, cancelled.state, { stream: true });
+    for await (const _event of resumed) {
+      // Drain the resumed run.
+    }
+
+    expect(resumed.finalOutput).toBe('done');
+    expect(model.callCount).toBe(2);
+  });
+
+  it('preserves a nested agent output committed during cancellation', async () => {
+    let markGuardrailStarted: (() => void) | undefined;
+    let releaseGuardrail: (() => void) | undefined;
+    const guardrailStarted = new Promise<void>((resolve) => {
+      markGuardrailStarted = resolve;
+    });
+    const guardrailCanFinish = new Promise<void>((resolve) => {
+      releaseGuardrail = resolve;
+    });
+    const nestedGuardrail = {
+      name: 'delayed-nested-output-guardrail',
+      execute: vi.fn(async () => {
+        markGuardrailStarted?.();
+        await guardrailCanFinish;
+        return {
+          tripwireTriggered: false,
+          outputInfo: { safe: true },
+        };
+      }),
+    };
+    const nestedModel: Model = {
+      async getResponse() {
+        throw new Error('Unexpected non-streaming nested model request');
+      },
+      async *getStreamedResponse() {
+        yield {
+          type: 'response_done',
+          response: {
+            id: 'nested-final-response',
+            usage: {
+              requests: 1,
+              inputTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+            },
+            output: [fakeModelMessage('nested final output')],
+          },
+        } as StreamEvent;
+      },
+    };
+    const nestedAgent = new Agent({
+      name: 'CommittedNestedStreamingAgent',
+      model: nestedModel,
+      outputGuardrails: [nestedGuardrail],
+    });
+    const nestedTool = nestedAgent.asTool({
+      toolName: 'test',
+      toolDescription: 'runs a nested streaming agent',
+      parameters: z.object({ test: z.string() }),
+      inputBuilder: ({ params }) => params.test,
+      onStream: () => {},
+    });
+    const model = new CountingFunctionToolStreamModel();
+    const agent = new Agent({
+      name: 'ParentOfCommittedNestedAgent',
+      model,
+      tools: [nestedTool],
+      toolUseBehavior: 'stop_on_first_tool',
+    });
+    const result = await run(agent, 'start', { stream: true });
+    const reader = (result.toStream() as any).getReader();
+
+    await guardrailStarted;
+    await reader.cancel('stop');
+    releaseGuardrail?.();
+    await result.completed;
+
+    expect(result.cancelled).toBe(true);
+    expect(result.finalOutput).toBe('nested final output');
+    expect(nestedGuardrail.execute).toHaveBeenCalledTimes(1);
+    expect(
+      result.state._generatedItems.find(
+        (item) => item.rawItem.type === 'function_call_result',
+      )?.rawItem,
+    ).toMatchObject({
+      type: 'function_call_result',
+      callId: TEST_MODEL_FUNCTION_CALL.callId,
+      status: 'completed',
+      output: { type: 'text', text: 'nested final output' },
+    });
+  });
+
+  it('preserves a nested approval committed during cancellation', async () => {
+    let markPersistenceStarted: (() => void) | undefined;
+    let releasePersistence: (() => void) | undefined;
+    const persistenceStarted = new Promise<void>((resolve) => {
+      markPersistenceStarted = resolve;
+    });
+    const persistenceCanFinish = new Promise<void>((resolve) => {
+      releasePersistence = resolve;
+    });
+    let blockedNestedPersistence = false;
+    const saveResultSpy = vi
+      .spyOn(sessionPersistence, 'saveStreamResultToSession')
+      .mockImplementation(async (_session, nestedResult) => {
+        if (
+          !blockedNestedPersistence &&
+          nestedResult.state._currentStep?.type === 'next_step_interruption'
+        ) {
+          blockedNestedPersistence = true;
+          markPersistenceStarted?.();
+          await persistenceCanFinish;
+        }
+      });
+    const approvalTool = tool({
+      name: 'test',
+      description: 'requires approval in the nested agent',
+      parameters: z.object({ test: z.string() }),
+      needsApproval: true,
+      execute: async () => 'approved',
+    });
+    const nestedModel = new CountingFunctionToolStreamModel();
+    const nestedAgent = new Agent({
+      name: 'NestedApprovalAgent',
+      model: nestedModel,
+      tools: [approvalTool],
+    });
+    const nestedSession = createSessionMock();
+    const nestedTool = nestedAgent.asTool({
+      toolName: 'test',
+      toolDescription: 'runs a nested agent that requires approval',
+      parameters: z.object({ test: z.string() }),
+      inputBuilder: ({ params }) => params.test,
+      onStream: () => {},
+      runOptions: { session: nestedSession },
+    });
+    const outerModel = new CountingFunctionToolStreamModel();
+    const outerAgent = new Agent({
+      name: 'ParentOfNestedApprovalAgent',
+      model: outerModel,
+      tools: [nestedTool],
+    });
+    const runner = new Runner();
+    const cancelled = await runner.run(outerAgent, 'start', { stream: true });
+    const reader = (cancelled.toStream() as any).getReader();
+
+    await persistenceStarted;
+    await reader.cancel('stop');
+    releasePersistence?.();
+    await cancelled.completed;
+
+    expect(cancelled.cancelled).toBe(true);
+    expect(cancelled.interruptions).toHaveLength(1);
+    expect(cancelled.interruptions[0]?.agent).toBe(nestedAgent);
+    expect(
+      cancelled.state.hasPendingAgentToolRun(
+        nestedTool.name,
+        TEST_MODEL_FUNCTION_CALL.callId,
+      ),
+    ).toBe(true);
+    expect(
+      saveResultSpy.mock.calls.filter(([session]) => session === nestedSession),
+    ).toHaveLength(1);
+
+    cancelled.state.approve(cancelled.interruptions[0]);
+    const resumed = await runner.run(outerAgent, cancelled.state, {
+      stream: true,
+    });
+    for await (const _event of resumed) {
+      // Drain the resumed run.
+    }
+
+    expect(resumed.finalOutput).toBe('done');
+    expect(
+      resumed.state.hasPendingAgentToolRun(
+        nestedTool.name,
+        TEST_MODEL_FUNCTION_CALL.callId,
+      ),
+    ).toBe(false);
+    expect(nestedModel.callCount).toBe(2);
+    expect(outerModel.callCount).toBe(2);
+  });
+
+  it('does not call the model when cancelled during next-turn preparation', async () => {
+    let filterCalls = 0;
+    let markNextTurnPreparationStarted: (() => void) | undefined;
+    let finishNextTurnPreparation: (() => void) | undefined;
+    const nextTurnPreparationStarted = new Promise<void>((resolve) => {
+      markNextTurnPreparationStarted = resolve;
+    });
+    const nextTurnPreparationCanFinish = new Promise<void>((resolve) => {
+      finishNextTurnPreparation = resolve;
+    });
+    const testTool = tool({
+      name: 'test',
+      description: 'completes before the next model turn',
+      parameters: z.object({ test: z.string() }),
+      execute: async () => 'completed',
+    });
+    const model = new CountingFunctionToolStreamModel();
+    const agent = new Agent({
+      name: 'CancelDuringPreparationAgent',
+      model,
+      tools: [testTool],
+    });
+    const runner = new Runner({
+      callModelInputFilter: async ({ modelData }) => {
+        filterCalls += 1;
+        if (filterCalls === 2) {
+          markNextTurnPreparationStarted?.();
+          await nextTurnPreparationCanFinish;
+        }
+        return modelData;
+      },
+    });
+    const result = await runner.run(agent, 'start', { stream: true });
+    const reader = (result.toStream() as any).getReader();
+
+    await nextTurnPreparationStarted;
+    await reader.cancel('stop');
+    finishNextTurnPreparation?.();
+    await result.completed;
+
+    expect(result.cancelled).toBe(true);
+    expect(model.callCount).toBe(1);
+  });
+
+  it('does not call the model when a resumed turn is cancelled during preparation', async () => {
+    let markToolStarted: (() => void) | undefined;
+    const toolStarted = new Promise<void>((resolve) => {
+      markToolStarted = resolve;
+    });
+    const testTool = tool({
+      name: 'test',
+      description: 'settles after cancellation',
+      parameters: z.object({ test: z.string() }),
+      execute: async (_input, _context, details) => {
+        markToolStarted?.();
+        const signal = details?.signal;
+        if (!signal?.aborted) {
+          await new Promise<void>((resolve) => {
+            signal?.addEventListener('abort', () => resolve(), { once: true });
+          });
+        }
+        return 'completed';
+      },
+    });
+    const model = new CountingFunctionToolStreamModel();
+    const agent = new Agent({
+      name: 'CancelDuringResumedPreparationAgent',
+      model,
+      tools: [testTool],
+    });
+    const first = await run(agent, 'start', { stream: true });
+    const firstReader = (first.toStream() as any).getReader();
+
+    await toolStarted;
+    await firstReader.cancel('stop');
+    await first.completed;
+
+    expect(first.state._currentStep?.type).toBe('next_step_run_again');
+    expect(first.state._currentTurnInProgress).toBe(false);
+
+    let markPreparationStarted: (() => void) | undefined;
+    let releasePreparation: (() => void) | undefined;
+    const preparationStarted = new Promise<void>((resolve) => {
+      markPreparationStarted = resolve;
+    });
+    const preparationCanFinish = new Promise<void>((resolve) => {
+      releasePreparation = resolve;
+    });
+    const runner = new Runner({
+      callModelInputFilter: async ({ modelData }) => {
+        markPreparationStarted?.();
+        await preparationCanFinish;
+        return modelData;
+      },
+    });
+    const resumed = await runner.run(agent, first.state, { stream: true });
+    const resumedReader = (resumed.toStream() as any).getReader();
+
+    await preparationStarted;
+    await resumedReader.cancel('stop');
+    releasePreparation?.();
+    await resumed.completed;
+
+    expect(resumed.cancelled).toBe(true);
+    expect(model.callCount).toBe(1);
   });
 
   it('enforces maxTurns across multiple streamed model calls', async () => {

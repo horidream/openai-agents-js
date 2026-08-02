@@ -28,10 +28,12 @@ import {
 import {
   normalizePosixPath,
   relativePosixPathWithinRoot,
+  shellQuote,
 } from '@openai/agents-core/sandbox/internal';
 import { posix as pathPosix } from 'node:path';
 import {
   assertCoreSnapshotUnsupported,
+  assertRemoteSandboxSessionStateCanResume,
   imageOutputFromBytes,
   RemoteSandboxEditor,
   assertTarWorkspacePersistence,
@@ -41,7 +43,7 @@ import {
   closeRemoteSessionOnManifestError,
   createRunAsRemoteEditor,
   decodeNativeSnapshotRef,
-  deserializeRemoteSandboxSessionStateValues,
+  rehydrateRemoteSandboxSessionStateValues,
   elapsedSeconds,
   encodeNativeSnapshotRef,
   formatExecResponse,
@@ -49,6 +51,7 @@ import {
   manifestMaterializationOptionsWithRunAs,
   materializeEnvironment,
   persistRemoteWorkspaceTar,
+  probeRemoteSandboxPathExists,
   providerErrorMessage,
   assertConfiguredExposedPort,
   getCachedExposedPortEndpoint,
@@ -522,18 +525,44 @@ export class ModalSandboxSession implements SandboxSession<ModalSandboxSessionSt
   async pathExists(path: string, runAs?: string): Promise<boolean> {
     const absolutePath = await this.resolveRemotePath(path);
     if (!runAs) {
-      const process = await this.sandbox.exec(['test', '-e', absolutePath], {
-        mode: 'text',
-        workdir: this.state.manifest.root,
-        stdout: 'ignore',
-        stderr: 'pipe',
+      return await probeRemoteSandboxPathExists({
+        providerName: 'ModalSandboxClient',
+        providerId: 'modal',
+        path: absolutePath,
+        runCommand: async (command) => {
+          const argv =
+            command === `test -e ${shellQuote(absolutePath)}`
+              ? ['test', '-e', absolutePath]
+              : ['/bin/sh', '-c', command];
+          const process = await this.sandbox.exec(argv, {
+            mode: 'text',
+            workdir: this.state.manifest.root,
+            stdout: 'ignore',
+            stderr: 'pipe',
+          });
+          let stderr = '';
+          const stderrPump = startTextStreamPump(process.stderr, (chunk) => {
+            stderr += chunk;
+          });
+          try {
+            const status = await process.wait();
+            await stderrPump.promise;
+            return { status, stderr };
+          } catch (error) {
+            await stderrPump.cancel();
+            throw error;
+          }
+        },
       });
-      return (await process.wait()) === 0;
     }
     return await runAsRemotePathExists(
       absolutePath,
       runAs,
       this.runAsCommandRunner.bind(this),
+      {
+        providerName: 'ModalSandboxClient',
+        providerId: 'modal',
+      },
     );
   }
 
@@ -1426,7 +1455,7 @@ export class ModalSandboxClient implements SandboxClient<
   async deserializeSessionState(
     state: Record<string, unknown>,
   ): Promise<ModalSandboxSessionState> {
-    const baseState = deserializeRemoteSandboxSessionStateValues(
+    const baseState = await rehydrateRemoteSandboxSessionStateValues(
       state,
       this.options.env,
     );
@@ -1467,6 +1496,7 @@ export class ModalSandboxClient implements SandboxClient<
   }
 
   async resume(state: ModalSandboxSessionState): Promise<ModalSandboxSession> {
+    assertRemoteSandboxSessionStateCanResume(state);
     if (!state.sandboxId) {
       throw new UserError(
         'Modal sandbox resume requires a persisted sandboxId.',

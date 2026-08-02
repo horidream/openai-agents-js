@@ -16,6 +16,12 @@ import {
 } from '@openai/agents-core';
 import { RuntimeEventEmitter } from '@openai/agents-core/_shims';
 import { isZodObject, toSmartString } from '@openai/agents-core/utils';
+import {
+  getSafeErrorType,
+  hasDynamicFunctionToolApprovalPolicy,
+  hasInspectableFunctionToolArguments,
+  logToolActionError,
+} from '@openai/agents-core/utils/internal';
 import type {
   RealtimeSessionConfig,
   RealtimeSessionConfigDefinition,
@@ -693,8 +699,11 @@ export class RealtimeSession<
         );
       }
     } catch (error) {
+      const errorDetails = logger.dontLogToolData
+        ? getSafeErrorType(error)
+        : toErrorMessage(error);
       logger.warn(
-        `toolErrorFormatter threw while formatting approval rejection: ${toErrorMessage(error)}`,
+        `toolErrorFormatter threw while formatting approval rejection: ${errorDetails}`,
       );
     }
 
@@ -710,23 +719,43 @@ export class RealtimeSession<
     const toolCall = normalizeRealtimeFunctionCallId(incomingToolCall);
     this.#context.context.history = JSON.parse(JSON.stringify(this.#history)); // deep copy of the history
     let parsedArgs: any = toolCall.arguments;
-    if (tool.parameters) {
-      if (isZodObject(tool.parameters)) {
-        parsedArgs = tool.parameters.parse(parsedArgs);
-      } else {
-        parsedArgs = JSON.parse(parsedArgs);
+    const dynamicApprovalPolicy = hasDynamicFunctionToolApprovalPolicy(tool);
+    let argumentParseError: unknown;
+    try {
+      if (tool.parameters) {
+        if (isZodObject(tool.parameters)) {
+          parsedArgs = tool.parameters.parse(parsedArgs);
+        } else {
+          parsedArgs = JSON.parse(parsedArgs);
+        }
       }
+    } catch (error) {
+      if (!dynamicApprovalPolicy) {
+        throw error;
+      }
+      argumentParseError = error;
     }
-    const needsApproval = await tool.needsApproval(
-      this.#context,
-      parsedArgs,
-      toolCall.callId,
-    );
+    const forceApproval =
+      dynamicApprovalPolicy &&
+      (argumentParseError !== undefined ||
+        !hasInspectableFunctionToolArguments(parsedArgs));
+    const existingApproval = dynamicApprovalPolicy
+      ? this.context.isToolApproved({
+          toolName: tool.name,
+          callId: toolCall.callId,
+        })
+      : undefined;
+    const needsApproval =
+      forceApproval ||
+      existingApproval !== undefined ||
+      (await tool.needsApproval(this.#context, parsedArgs, toolCall.callId));
     if (needsApproval) {
-      const approval = this.context.isToolApproved({
-        toolName: tool.name,
-        callId: toolCall.callId,
-      });
+      const approval =
+        existingApproval ??
+        this.context.isToolApproved({
+          toolName: tool.name,
+          callId: toolCall.callId,
+        });
       if (approval === false) {
         this.#pendingFunctionCalls.delete(toolCall.callId);
         this.emit('agent_tool_start', this.#context, agent, tool, {
@@ -784,6 +813,11 @@ export class RealtimeSession<
     }
 
     this.#pendingFunctionCalls.delete(toolCall.callId);
+    if (argumentParseError !== undefined) {
+      const errorMessage = `An error occurred while parsing tool arguments. Please try again with valid JSON. Error: ${toErrorMessage(argumentParseError)}`;
+      this.#transport.sendFunctionCallOutput(toolCall, errorMessage, true);
+      return;
+    }
 
     const inputGuardrailResult = await runToolInputGuardrails({
       guardrails: tool.inputGuardrails,
@@ -1133,7 +1167,7 @@ export class RealtimeSession<
         }
         await this.#handleFunctionCall(event, dispatchSnapshot);
       } catch (error) {
-        logger.error('Error handling function call', error);
+        logToolActionError(logger, 'Error handling function call', error);
         this.emit('error', {
           type: 'error',
           error,

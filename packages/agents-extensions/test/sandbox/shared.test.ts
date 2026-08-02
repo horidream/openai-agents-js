@@ -47,6 +47,7 @@ import {
   encodeNativeSnapshotRef,
   deserializeRemoteSandboxSessionStateValues,
   getCachedExposedPortEndpoint,
+  rehydrateRemoteSandboxSessionStateValues,
   requireNativeSnapshotRef,
   recordResolvedExposedPortEndpoint,
   readRunAsRemoteFile,
@@ -81,13 +82,17 @@ import {
 import {
   isRcloneCloudBucketMountEntry,
   mountRcloneCloudBucket,
+  rcloneArchiveArch,
+  rcloneInstallCommand,
   unmountRcloneMount,
 } from '../../src/sandbox/shared/inContainerMounts';
 import { makePaxRecord, makeTarArchive } from './tarFixture';
 import {
+  EnvValueReference,
   Manifest,
   SandboxArchiveError,
   SandboxConfigurationError,
+  SandboxMountError,
   SandboxPathResolutionError,
   SandboxProviderError,
   SandboxSnapshotError,
@@ -98,6 +103,7 @@ import {
   localDir,
   localFile,
   mount,
+  registerEnvValueReference,
   type SandboxSessionState,
   type AzureBlobMount,
   type GCSMount,
@@ -288,6 +294,101 @@ describe('exposed port helpers', () => {
 });
 
 describe('remote sandbox path helpers', () => {
+  test.each([
+    ['x86_64', 'amd64'],
+    ['amd64', 'amd64'],
+    ['i386', '386'],
+    ['i686', '386'],
+    ['aarch64', 'arm64'],
+    ['arm64', 'arm64'],
+    ['armv7l', 'arm-v7'],
+    ['armv6l', 'arm-v6'],
+    ['armv5l', 'arm'],
+  ])('maps rclone architecture %s to %s', (machine, expected) => {
+    expect(rcloneArchiveArch(machine)).toBe(expected);
+  });
+
+  test('rejects unsupported rclone architectures', () => {
+    expect(rcloneArchiveArch('mips64')).toBeUndefined();
+  });
+
+  test('pins and verifies the rclone archive before atomic installation', () => {
+    const command = rcloneInstallCommand('amd64');
+
+    expect(command).toContain(
+      'https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-linux-amd64.zip',
+    );
+    expect(command).toContain(
+      'fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d',
+    );
+    expect(command).toContain('sha256sum --check --strict -');
+    expect(command).toContain('mktemp /usr/local/bin/.rclone.XXXXXX');
+    expect(command).toContain('mv -f "$target_tmp" /usr/local/bin/rclone');
+    expect(command).not.toContain('https://rclone.org/install.sh');
+  });
+
+  test('reports rclone archive checksum failures', async () => {
+    const entry: S3Mount = {
+      type: 's3_mount',
+      bucket: 'agent-logs',
+      mountStrategy: {
+        type: 'test_cloud_bucket',
+        pattern: {
+          type: 'rclone',
+          mode: 'nfs',
+          remoteName: 'logs',
+        },
+      },
+    };
+
+    let caught: unknown;
+    try {
+      await mountRcloneCloudBucket({
+        providerName: 'TestSandboxClient',
+        providerId: 'test',
+        strategyType: 'test_cloud_bucket',
+        entry,
+        mountPath: '/workspace/logs',
+        pattern: {
+          type: 'rclone',
+          mode: 'nfs',
+          remoteName: 'logs',
+        },
+        installRcloneViaScript: true,
+        runCommand: async (command) => {
+          if (
+            command ===
+            'command -v rclone >/dev/null 2>&1 || test -x /usr/local/bin/rclone'
+          ) {
+            return { status: 1 };
+          }
+          if (command === 'uname -m') {
+            return { status: 0, stdout: 'x86_64\n' };
+          }
+          if (command.includes('sha256sum --check --strict -')) {
+            return { status: 86, stderr: 'checksum mismatch' };
+          }
+          return { status: 0 };
+        },
+        writeFile: recordMountWrite(new Map<string, string>()),
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(SandboxMountError);
+    expect((caught as SandboxMountError).message).toContain(
+      'checksum verification failed',
+    );
+    expect((caught as SandboxMountError).details).toMatchObject({
+      provider: 'test',
+      package: 'rclone',
+      version: '1.74.4',
+      architecture: 'amd64',
+      status: 86,
+    });
+  });
+
   test('mounts Box entries through the shared rclone helper', async () => {
     const commands: string[] = [];
     const writes = new Map<string, string>();
@@ -763,6 +864,15 @@ describe('remote sandbox path helpers', () => {
         },
         runCommand: async (command) => {
           commands.push(command);
+          if (
+            command ===
+            'command -v rclone >/dev/null 2>&1 || test -x /usr/local/bin/rclone'
+          ) {
+            return { status: 0, stdout: '' };
+          }
+          if (command === 'command -v rclone >/dev/null 2>&1') {
+            return { status: 1, stdout: '' };
+          }
           if (command.includes('mount -v -t nfs')) {
             return { status: 1, stderr: 'mount failed' };
           }
@@ -784,6 +894,14 @@ describe('remote sandbox path helpers', () => {
       "openai_agents_kill_pidfile '/tmp/openai-agents-test-logs.nfs.pid' 'rclone' 'serve' 'nfs'",
     );
     expect(cleanupCommand).not.toContain('kill "$(cat');
+    expect(commands).toContain(
+      "'/usr/local/bin/rclone' 'serve' 'nfs' '--help' >/dev/null 2>&1",
+    );
+    expect(
+      commands.some((command) =>
+        command.includes("('/usr/local/bin/rclone' 'serve' 'nfs'"),
+      ),
+    ).toBe(true);
   });
 
   test('accept in-root absolute workspace paths', () => {
@@ -1139,6 +1257,73 @@ describe('remote sandbox path helpers', () => {
       FEATURE_FLAG: 'enabled',
       KEEP: 'manifest',
     });
+  });
+
+  test('round-trips remote environment references without resolved secrets', async () => {
+    let currentSecret = 'activity-secret';
+    class RemoteSecretReference extends EnvValueReference {
+      static readonly type = 'test.remote_secret_reference';
+
+      constructor(readonly key: string) {
+        super();
+      }
+
+      serialize(): Record<string, unknown> {
+        return { key: this.key };
+      }
+
+      async resolve(): Promise<string> {
+        return `${currentSecret}:${this.key}`;
+      }
+    }
+    const unregister = registerEnvValueReference(
+      RemoteSecretReference,
+      (payload) => {
+        if (typeof payload.key !== 'string') {
+          throw new TypeError('Remote secret reference key must be a string.');
+        }
+        return new RemoteSecretReference(payload.key);
+      },
+    );
+    try {
+      const manifest = new Manifest({
+        environment: {
+          TOKEN: new RemoteSecretReference('openai-key'),
+        },
+      });
+      const serialized = serializeRemoteSandboxSessionState({
+        manifest,
+        environment: {
+          TOKEN: 'activity-secret:openai-key',
+          PROVIDER_VALUE: 'persisted',
+        },
+      });
+      const serializedJson = JSON.stringify(serialized);
+
+      expect(serializedJson).not.toContain('activity-secret');
+      expect(serialized.manifest).toMatchObject({
+        environment: {
+          TOKEN: {
+            type: RemoteSecretReference.type,
+            key: 'openai-key',
+          },
+        },
+      });
+
+      currentSecret = 'worker-secret';
+      const restored = await rehydrateRemoteSandboxSessionStateValues(
+        JSON.parse(serializedJson),
+      );
+      expect(restored.manifest.environment.TOKEN).toBeInstanceOf(
+        RemoteSecretReference,
+      );
+      expect(restored.environment).toEqual({
+        TOKEN: 'worker-secret:openai-key',
+        PROVIDER_VALUE: 'persisted',
+      });
+    } finally {
+      unregister();
+    }
   });
 
   test('materializes and merges environment values', async () => {
@@ -1546,6 +1731,27 @@ describe('remote sandbox path helpers', () => {
     expect(files.has('renamed/new.txt')).toBe(false);
   });
 
+  test('does not treat unreadable editor fallback reads as missing files', async () => {
+    const denied = Object.assign(new Error('Permission denied'), {
+      code: 'EACCES',
+    });
+    const editor = new RemoteSandboxEditor({
+      readText: async () => {
+        throw denied;
+      },
+      writeText: vi.fn(),
+      deletePath: vi.fn(),
+    });
+
+    await expect(
+      editor.createFile({
+        type: 'create_file',
+        path: '/workspace/blocked',
+        diff: '+hello',
+      }),
+    ).rejects.toBe(denied);
+  });
+
   test('prepares runAs remote writes with privileged ownership commands', async () => {
     const commands: Array<{
       command: string;
@@ -1646,7 +1852,32 @@ describe('remote sandbox path helpers', () => {
         command: "test -e '/workspace/missing'",
         options: { runAs: 'sandbox-user' },
       },
+      {
+        command: expect.stringContaining('OPENAI_AGENTS_READ_PATH_PROBE_V1'),
+        options: { runAs: 'sandbox-user' },
+      },
     ]);
+  });
+
+  test.each([
+    { status: 1, stderr: 'Permission denied' },
+    { status: 2, stderr: 'Input/output error' },
+  ])('preserves failed runAs path probes: %j', async (result) => {
+    await expect(
+      runAsRemotePathExists(
+        '/workspace/blocked',
+        'sandbox-user',
+        async () => result,
+        { providerName: 'FakeSandboxClient', providerId: 'fake' },
+      ),
+    ).rejects.toMatchObject({
+      code: 'provider_error',
+      details: {
+        provider: 'fake',
+        path: '/workspace/blocked',
+        status: result.status,
+      },
+    });
   });
 
   test('reports runAs command failures with provider context', async () => {
@@ -1711,18 +1942,22 @@ describe('remote sandbox path helpers', () => {
       options: { runAs: 'sandbox-user' },
     });
     expect(commands[1]).toEqual({
+      command: expect.stringContaining('OPENAI_AGENTS_READ_PATH_PROBE_V1'),
+      options: { runAs: 'sandbox-user' },
+    });
+    expect(commands[2]).toEqual({
       command: "mkdir -p -- '/workspace/src'",
       options: { runAs: 'sandbox-user' },
     });
-    expect(commands[2]).toMatchObject({
+    expect(commands[3]).toMatchObject({
       command: expect.stringContaining("chown 'sandbox-user':'sandbox-user'"),
       options: { runAs: 'root' },
     });
-    expect(commands[3]).toMatchObject({
+    expect(commands[4]).toMatchObject({
       command: expect.stringContaining("cat -- '/tmp/openai-agents-"),
       options: { runAs: 'sandbox-user' },
     });
-    expect(commands[4]).toMatchObject({
+    expect(commands[5]).toMatchObject({
       command: expect.stringContaining("rm -f -- '/tmp/openai-agents-"),
       options: { runAs: 'root' },
     });
@@ -1942,7 +2177,7 @@ describe('remote sandbox path helpers', () => {
       {
         name: 'global-pax',
         type: 'g',
-        content: makePaxRecord('path', 'workspace/not-used.txt'),
+        content: makePaxRecord('comment', 'harmless metadata'),
       },
       {
         name: 'long-name',
@@ -1979,6 +2214,47 @@ describe('remote sandbox path helpers', () => {
     ).toThrow(/symlink member not allowed: workspace\/keep\/link/);
   });
 
+  test.each(['path', 'linkpath'])('rejects global PAX %s overrides', (key) => {
+    const archive = makeTarArchive([
+      {
+        name: 'global-pax',
+        type: 'g',
+        content: makePaxRecord(key, 'logs/events.jsonl'),
+      },
+      { name: 'safe.txt', content: 'unsafe destination' },
+    ]);
+
+    expect(() => validateWorkspaceTarArchive(archive)).toThrow(
+      new RegExp(`global PAX ${key} override not allowed`),
+    );
+  });
+
+  test('rejects malformed PAX byte framing and encoding', () => {
+    const archive = makeTarArchive([
+      {
+        name: 'local-pax',
+        type: 'x',
+        content: '999 path=logs/events.jsonl\n',
+      },
+      { name: 'safe.txt', content: 'unsafe destination' },
+    ]);
+
+    expect(() => validateWorkspaceTarArchive(archive)).toThrow(
+      /PAX record exceeds payload/,
+    );
+
+    const invalidUtf8 = makeTarArchive([
+      {
+        name: 'local-pax',
+        type: 'x',
+        content: new Uint8Array([0x37, 0x20, 0x78, 0x3d, 0xc3, 0x28, 0x0a]),
+      },
+    ]);
+    expect(() => validateWorkspaceTarArchive(invalidUtf8)).toThrow(
+      /invalid UTF-8 in PAX record/,
+    );
+  });
+
   test('rejects malformed tar headers and unsupported member types', () => {
     expect(() => validateWorkspaceTarArchive(new Uint8Array(1))).toThrow(
       /truncated header/,
@@ -2010,6 +2286,63 @@ describe('remote sandbox path helpers', () => {
         makeTarArchive([{ name: 'device', type: '3' }]),
       ),
     ).toThrow(/unsupported member type/);
+  });
+
+  test('rejects archive members that overlap protected paths', () => {
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: 'cache/data.json', content: 'unsafe' }]),
+        { rejectRelPaths: ['cache'] },
+      ),
+    ).toThrow(SandboxArchiveError);
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: 'safe/cache.txt', content: 'safe' }]),
+        { rejectRelPaths: ['cache'] },
+      ),
+    ).not.toThrow();
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([
+          { name: 'workspace/cache/data.json', content: 'unsafe' },
+        ]),
+        {
+          rejectRelPaths: ['cache'],
+          rootName: 'workspace',
+        },
+      ),
+    ).toThrow(SandboxArchiveError);
+
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: 'cache', content: 'blocking file' }]),
+        { rejectRelPaths: ['cache/mounted'] },
+      ),
+    ).toThrow(SandboxArchiveError);
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: 'cache', type: '5', mode: 0o755 }]),
+        { rejectRelPaths: ['cache/mounted'] },
+      ),
+    ).not.toThrow();
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: 'cache', type: '5', mode: 0o555 }]),
+        { rejectRelPaths: ['cache/mounted'] },
+      ),
+    ).toThrow(/archive directory blocks protected path: cache\/mounted/);
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: '.', type: '5', mode: 0o555 }]),
+        { rejectRelPaths: ['cache/mounted'] },
+      ),
+    ).toThrow(/archive directory blocks protected path: cache\/mounted/);
+    expect(() =>
+      validateWorkspaceTarArchive(
+        makeTarArchive([{ name: 'README.md', content: 'protected root' }]),
+        { rejectRelPaths: [''] },
+      ),
+    ).toThrow(SandboxArchiveError);
   });
 
   test('rejects workspace tar archives over resource limits', () => {
@@ -2075,6 +2408,459 @@ describe('remote sandbox path helpers', () => {
       }),
     ).rejects.toBeInstanceOf(SandboxArchiveError);
     expect(writeFile).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    {
+      name: 'an exact ephemeral file',
+      manifest: new Manifest({
+        root: '/custom/workspace',
+        entries: {
+          'secret.txt': {
+            type: 'file',
+            content: 'runtime-only',
+            ephemeral: true,
+          },
+        },
+      }),
+      archive: makeTarArchive([
+        { name: 'secret.txt', content: 'persisted secret' },
+      ]),
+      protectedPath: 'secret.txt',
+    },
+    {
+      name: 'a descendant of an ephemeral directory',
+      manifest: new Manifest({
+        root: '/custom/workspace',
+        entries: {
+          logs: { type: 'dir', ephemeral: true },
+        },
+      }),
+      archive: makeTarArchive([
+        { name: 'logs/events.jsonl', content: 'persisted log' },
+      ]),
+      protectedPath: 'logs',
+    },
+    {
+      name: 'a file that blocks an ephemeral descendant',
+      manifest: new Manifest({
+        root: '/custom/workspace',
+        entries: {
+          cache: {
+            type: 'dir',
+            children: {
+              'session.json': {
+                type: 'file',
+                content: 'runtime-only',
+                ephemeral: true,
+              },
+            },
+          },
+        },
+      }),
+      archive: makeTarArchive([{ name: 'cache', content: 'blocking file' }]),
+      protectedPath: 'cache/session.json',
+    },
+    {
+      name: 'a descendant of an ephemeral mount target',
+      manifest: new Manifest({
+        root: '/custom/workspace',
+        entries: {
+          remote: mount({
+            source: 's3://bucket/data',
+            mountPath: 'mounted/cache',
+            ephemeral: true,
+            mountStrategy: { type: 'in_container' },
+          }),
+        },
+      }),
+      archive: makeTarArchive([
+        { name: 'mounted/cache/data.json', content: 'persisted mount data' },
+      ]),
+      protectedPath: 'mounted/cache',
+    },
+  ])(
+    'rejects $name before hydrating tar archives',
+    async ({ manifest, archive, protectedPath }) => {
+      const writeFile = vi.fn();
+      const runCommand = vi.fn(async (command: string) => ({
+        status: 0,
+        stdout: command.includes('resolve-workspace-path.sh')
+          ? `${manifest.root}\n`
+          : '',
+        stderr: '',
+      }));
+
+      await expect(
+        hydrateRemoteWorkspaceTar({
+          providerName: 'FakeProvider',
+          manifest,
+          data: archive,
+          io: {
+            mkdir: vi.fn(),
+            readFile: vi.fn(),
+            writeFile,
+            runCommand,
+          },
+        }),
+      ).rejects.toMatchObject({
+        details: {
+          reason: `archive member overlaps protected path: ${protectedPath}`,
+        },
+      });
+      expect(writeFile).not.toHaveBeenCalled();
+      expect(runCommand).not.toHaveBeenCalled();
+    },
+  );
+
+  test('hydrates tar archives without ephemeral manifest paths', async () => {
+    const archive = makeTarArchive([
+      { name: 'src/index.ts', content: 'export {};' },
+    ]);
+    const writeFile = vi.fn();
+    const runCommand = vi.fn(async (command: string) => ({
+      status: 0,
+      stdout: command.includes('resolve-workspace-path.sh')
+        ? '/custom/workspace\n'
+        : '',
+      stderr: '',
+    }));
+
+    await hydrateRemoteWorkspaceTar({
+      providerName: 'FakeProvider',
+      manifest: new Manifest({
+        root: '/custom/workspace',
+        entries: {
+          logs: { type: 'dir', ephemeral: true },
+        },
+      }),
+      data: archive,
+      io: {
+        mkdir: vi.fn(),
+        readFile: vi.fn(),
+        writeFile,
+        runCommand,
+      },
+    });
+
+    expect(writeFile).toHaveBeenCalledWith(expect.any(String), archive);
+    expect(runCommand).toHaveBeenCalled();
+  });
+
+  test('rejects global PAX path overrides before hydration side effects', async () => {
+    const archive = makeTarArchive([
+      {
+        name: 'global-pax',
+        type: 'g',
+        content: makePaxRecord('path', 'logs/events.jsonl'),
+      },
+      { name: 'safe.txt', content: 'unsafe destination' },
+    ]);
+    const writeFile = vi.fn();
+    const runCommand = vi.fn();
+
+    await expect(
+      hydrateRemoteWorkspaceTar({
+        providerName: 'FakeProvider',
+        manifest: new Manifest({
+          root: '/custom/workspace',
+          entries: {
+            logs: { type: 'dir', ephemeral: true },
+          },
+        }),
+        data: archive,
+        io: {
+          mkdir: vi.fn(),
+          readFile: vi.fn(),
+          writeFile,
+          runCommand,
+        },
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'global PAX path override not allowed',
+      },
+    });
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  test('parses multibyte PAX records before protected paths', async () => {
+    const archive = makeTarArchive([
+      {
+        name: 'local-pax',
+        type: 'x',
+        content: `${makePaxRecord('comment', 'é')}${makePaxRecord(
+          'path',
+          'logs/events.jsonl',
+        )}`,
+      },
+      { name: 'safe.txt', content: 'unsafe destination' },
+    ]);
+    const writeFile = vi.fn();
+    const runCommand = vi.fn();
+
+    await expect(
+      hydrateRemoteWorkspaceTar({
+        providerName: 'FakeProvider',
+        manifest: new Manifest({
+          root: '/custom/workspace',
+          entries: {
+            logs: { type: 'dir', ephemeral: true },
+          },
+        }),
+        data: archive,
+        io: {
+          mkdir: vi.fn(),
+          readFile: vi.fn(),
+          writeFile,
+          runCommand,
+        },
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'archive member overlaps protected path: logs',
+      },
+    });
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  test('rejects NUL-bearing PAX paths before hydration side effects', async () => {
+    const archive = makeTarArchive([
+      {
+        name: 'local-pax',
+        type: 'x',
+        content: makePaxRecord('path', 'secret.txt\0ignored'),
+      },
+      { name: 'safe.txt', content: 'persisted secret' },
+    ]);
+    const writeFile = vi.fn();
+    const runCommand = vi.fn(async (command: string) => ({
+      status: 0,
+      stdout: command.includes('resolve-workspace-path.sh')
+        ? '/custom/workspace\n'
+        : '',
+      stderr: '',
+    }));
+
+    await expect(
+      hydrateRemoteWorkspaceTar({
+        providerName: 'FakeProvider',
+        manifest: new Manifest({
+          root: '/custom/workspace',
+          entries: {
+            'secret.txt': {
+              type: 'file',
+              content: 'runtime-only',
+              ephemeral: true,
+            },
+          },
+        }),
+        data: archive,
+        io: {
+          mkdir: vi.fn(),
+          readFile: vi.fn(),
+          writeFile,
+          runCommand,
+        },
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'NUL byte in PAX record',
+      },
+    });
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  test('rejects PAX size overrides before hydration side effects', async () => {
+    const embeddedHeader = makeTarArchive([
+      { name: 'logs/events.jsonl', content: '' },
+    ]).subarray(0, 512);
+    const archive = makeTarArchive([
+      {
+        name: 'local-pax',
+        type: 'x',
+        content: makePaxRecord('size', '0'),
+      },
+      { name: 'safe.txt', content: embeddedHeader },
+    ]);
+    const writeFile = vi.fn();
+    const runCommand = vi.fn(async (command: string) => ({
+      status: 0,
+      stdout: command.includes('resolve-workspace-path.sh')
+        ? '/custom/workspace\n'
+        : '',
+      stderr: '',
+    }));
+
+    await expect(
+      hydrateRemoteWorkspaceTar({
+        providerName: 'FakeProvider',
+        manifest: new Manifest({
+          root: '/custom/workspace',
+          entries: {
+            logs: { type: 'dir', ephemeral: true },
+          },
+        }),
+        data: archive,
+        io: {
+          mkdir: vi.fn(),
+          readFile: vi.fn(),
+          writeFile,
+          runCommand,
+        },
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'PAX size override not allowed',
+      },
+    });
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  test('rejects GNU sparse PAX destinations before hydration side effects', async () => {
+    const archive = makeTarArchive([
+      {
+        name: 'local-pax',
+        type: 'x',
+        content: makePaxRecord('GNU.sparse.name', 'logs/events.jsonl'),
+      },
+      { name: 'safe.txt', content: 'unsafe destination' },
+    ]);
+    const writeFile = vi.fn();
+    const runCommand = vi.fn();
+
+    await expect(
+      hydrateRemoteWorkspaceTar({
+        providerName: 'FakeProvider',
+        manifest: new Manifest({
+          root: '/custom/workspace',
+          entries: {
+            logs: { type: 'dir', ephemeral: true },
+          },
+        }),
+        data: archive,
+        io: {
+          mkdir: vi.fn(),
+          readFile: vi.fn(),
+          writeFile,
+          runCommand,
+        },
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'PAX GNU.sparse.name override not allowed',
+      },
+    });
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  test('rejects populated tar archives when the workspace root is ephemeral', async () => {
+    const archive = makeTarArchive([
+      { name: 'src/index.ts', content: 'export {};' },
+    ]);
+    const writeFile = vi.fn();
+    const runCommand = vi.fn(async (command: string) => ({
+      status: 0,
+      stdout: command.includes('resolve-workspace-path.sh')
+        ? '/custom/workspace\n'
+        : '',
+      stderr: '',
+    }));
+
+    await expect(
+      hydrateRemoteWorkspaceTar({
+        providerName: 'FakeProvider',
+        manifest: new Manifest({
+          root: '/custom/workspace',
+          entries: {
+            '': { type: 'dir', ephemeral: true },
+          },
+        }),
+        data: archive,
+        io: {
+          mkdir: vi.fn(),
+          readFile: vi.fn(),
+          writeFile,
+          runCommand,
+        },
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'archive member overlaps protected path: ',
+      },
+    });
+
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  test('round-trips an ephemeral workspace root as an empty tar archive', async () => {
+    const manifest = new Manifest({
+      root: '/custom/workspace',
+      entries: {
+        '': { type: 'dir', ephemeral: true },
+      },
+    });
+    const persistedContent = makeTarArchive([
+      { name: 'secret.txt', content: 'must not persist' },
+    ]);
+    const persistRunCommand = vi.fn(async (command: string) => ({
+      status: 0,
+      stdout: command.includes('resolve-workspace-path.sh')
+        ? '/custom/workspace\n'
+        : '',
+      stderr: '',
+    }));
+    const persistReadFile = vi.fn(async () => persistedContent);
+
+    const archive = await persistRemoteWorkspaceTar({
+      providerName: 'FakeProvider',
+      manifest,
+      io: {
+        mkdir: vi.fn(),
+        readFile: persistReadFile,
+        writeFile: vi.fn(),
+        runCommand: persistRunCommand,
+      },
+    });
+
+    expect(archive).toEqual(makeTarArchive([]));
+    expect(persistReadFile).not.toHaveBeenCalled();
+    expect(persistRunCommand).not.toHaveBeenCalled();
+
+    const hydrateWriteFile = vi.fn();
+    const hydrateRunCommand = vi.fn(async (command: string) => ({
+      status: 0,
+      stdout: command.includes('resolve-workspace-path.sh')
+        ? '/custom/workspace\n'
+        : '',
+      stderr: '',
+    }));
+
+    await hydrateRemoteWorkspaceTar({
+      providerName: 'FakeProvider',
+      manifest,
+      data: archive,
+      io: {
+        mkdir: vi.fn(),
+        readFile: vi.fn(),
+        writeFile: hydrateWriteFile,
+        runCommand: hydrateRunCommand,
+      },
+    });
+
+    expect(hydrateWriteFile).toHaveBeenCalledWith(expect.any(String), archive);
+    expect(hydrateRunCommand).toHaveBeenCalled();
   });
 
   test('clears remote workspace root before hydrating tar archives', async () => {
@@ -2164,6 +2950,11 @@ describe('remote sandbox path helpers', () => {
     const manifest = new Manifest({
       entries: {
         keep: { type: 'file', content: 'keep' },
+        'literal[1]*?': {
+          type: 'file',
+          content: 'literal',
+          ephemeral: true,
+        },
         secret: { type: 'file', content: 'secret', ephemeral: true },
         mounted: mount({
           source: 's3://bucket/data',
@@ -2175,11 +2966,9 @@ describe('remote sandbox path helpers', () => {
     });
 
     expect(workspaceTarExcludeArgs(manifest)).toEqual([
-      "--exclude='cache'",
       "--exclude='./cache'",
-      "--exclude='mounted'",
+      "--exclude='./literal\\[1\\]\\*\\?'",
       "--exclude='./mounted'",
-      "--exclude='secret'",
       "--exclude='./secret'",
     ]);
   });
@@ -2733,8 +3522,16 @@ describe('remote sandbox path helpers', () => {
       'test',
       {
         localSourceGrants: [
-          { path: dirname(sourceFile), readOnly: true },
-          { path: sourceDir, readOnly: true },
+          {
+            path: '/mnt/source-file',
+            hostPath: dirname(sourceFile),
+            readOnly: true,
+          },
+          {
+            path: '/mnt/source-dir',
+            hostPath: sourceDir,
+            readOnly: true,
+          },
         ],
       },
     );

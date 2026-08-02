@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { Manifest, dir, file, mount } from '../src/sandbox';
+import {
+  EnvValueReference,
+  Manifest,
+  dir,
+  file,
+  mount,
+  registerEnvValueReference,
+} from '../src/sandbox';
 import {
   deserializeManifest,
   deserializePersistedEnvironmentForRuntime,
@@ -11,6 +18,7 @@ import {
   mergeManifestEntryDelta,
   mergeMaterializedEnvironment,
   mergeStaticMaterializedEnvironment,
+  rehydratePersistedEnvironmentForRuntime,
   serializeManifestEnvironment,
   serializeManifestRecord,
   serializeRuntimeEnvironmentForPersistence,
@@ -39,6 +47,7 @@ const processPlatformDescriptor = Object.getOwnPropertyDescriptor(
 afterEach(() => {
   vi.doUnmock('node:os');
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   vi.resetModules();
   if (processPlatformDescriptor) {
     Object.defineProperty(process, 'platform', processPlatformDescriptor);
@@ -231,6 +240,13 @@ describe('sandbox shared helpers', () => {
           ephemeral: true,
         },
       },
+      extraPathGrants: [
+        {
+          path: '/mnt/shared-data',
+          hostPath: '/private/tmp/shared-data',
+          readOnly: true,
+        },
+      ],
     });
 
     const serialized = serializeManifestRecord(manifest);
@@ -263,6 +279,12 @@ describe('sandbox shared helpers', () => {
       environment: {
         KEPT: { value: 'ok' },
       },
+      extraPathGrants: [
+        {
+          path: '/mnt/shared-data',
+          readOnly: true,
+        },
+      ],
     });
     expect(serialized.entries).not.toHaveProperty('tmp.txt');
     expect(serialized.entries).not.toHaveProperty([
@@ -274,6 +296,30 @@ describe('sandbox shared helpers', () => {
       'dir',
       'children',
       'nested.tmp',
+    ]);
+    expect(serialized.extraPathGrants).not.toHaveProperty([0, 'hostPath']);
+  });
+
+  it('does not restore host path grants from persisted manifests', () => {
+    const restored = deserializeManifest({
+      version: 1,
+      root: '/workspace',
+      entries: {},
+      environment: {},
+      extraPathGrants: [
+        {
+          path: '/mnt/shared-data',
+          hostPath: '/private/tmp/untrusted-data',
+          readOnly: true,
+        },
+      ],
+    });
+
+    expect(restored.extraPathGrants).toEqual([
+      {
+        path: '/mnt/shared-data',
+        readOnly: true,
+      },
     ]);
   });
 
@@ -302,6 +348,23 @@ describe('sandbox shared helpers', () => {
     expect(
       (restored.entries.nested as any).children['payload.bin'].content,
     ).toEqual(bytes);
+  });
+
+  it('restores binary manifest files without host base64 globals', () => {
+    const bytes = Uint8Array.from([0, 255, 34, 17, 128]);
+    const serialized = serializeManifestRecord(
+      new Manifest({
+        entries: {
+          'payload.bin': file({ content: bytes }),
+        },
+      }),
+    );
+    vi.stubGlobal('Buffer', undefined);
+    vi.stubGlobal('atob', undefined);
+
+    const restored = deserializeManifest(serialized);
+
+    expect((restored.entries['payload.bin'] as any).content).toEqual(bytes);
   });
 
   it('materializes manifest environment values and preserves runtime overrides', async () => {
@@ -408,6 +471,74 @@ describe('sandbox shared helpers', () => {
     });
   });
 
+  it('persists environment references without their resolved runtime values', async () => {
+    let currentSecret = 'first-secret';
+    class SessionSecretReference extends EnvValueReference {
+      static readonly type = 'test.session_secret_reference';
+
+      constructor(readonly key: string) {
+        super();
+      }
+
+      serialize(): Record<string, unknown> {
+        return { key: this.key };
+      }
+
+      async resolve(): Promise<string> {
+        return `${currentSecret}:${this.key}`;
+      }
+    }
+    const unregister = registerEnvValueReference(
+      SessionSecretReference,
+      (payload) => {
+        if (typeof payload.key !== 'string') {
+          throw new TypeError('Session secret reference key must be a string.');
+        }
+        return new SessionSecretReference(payload.key);
+      },
+    );
+    try {
+      const manifest = new Manifest({
+        environment: {
+          TOKEN: new SessionSecretReference('openai-key'),
+          STATIC: 'enabled',
+        },
+      });
+
+      expect(serializeManifestRecord(manifest).environment).toEqual({
+        TOKEN: {
+          type: SessionSecretReference.type,
+          key: 'openai-key',
+        },
+        STATIC: { value: 'enabled' },
+      });
+      expect(
+        serializeRuntimeEnvironmentForPersistence(manifest, {
+          TOKEN: 'first-secret:openai-key',
+          STATIC: 'runtime-override',
+        }),
+      ).toEqual({
+        STATIC: 'enabled',
+      });
+
+      const restored = deserializeManifest(
+        JSON.parse(JSON.stringify(serializeManifestRecord(manifest))),
+      );
+      currentSecret = 'replayed-secret';
+      await expect(
+        rehydratePersistedEnvironmentForRuntime(restored, {
+          TOKEN: 'persisted-plaintext-must-not-win',
+          STATIC: 'enabled',
+        }),
+      ).resolves.toEqual({
+        TOKEN: 'replayed-secret:openai-key',
+        STATIC: 'enabled',
+      });
+    } finally {
+      unregister();
+    }
+  });
+
   it('materializes static manifest environment without invoking resolvers', () => {
     const previous = new Manifest({
       environment: {
@@ -472,19 +603,33 @@ describe('sandbox shared helpers', () => {
   });
 
   it('merges manifest deltas by replacing named and path-keyed entries', () => {
+    const baseHostPath = process.cwd();
+    const updatedHostPath = `${process.cwd()}-updated`;
     const base = new Manifest({
       entries: {
         'base.txt': file({ content: 'base' }),
       },
       groups: [{ name: 'operators', users: [{ name: 'agent' }] }],
-      extraPathGrants: [{ path: '/tmp/base', readOnly: true }],
+      extraPathGrants: [
+        {
+          path: '/tmp/base',
+          hostPath: baseHostPath,
+          readOnly: true,
+        },
+      ],
     });
     const update = new Manifest({
       entries: {
         'update.txt': file({ content: 'update' }),
       },
       groups: [{ name: 'operators', users: [{ name: 'reviewer' }] }],
-      extraPathGrants: [{ path: '/tmp/base', readOnly: false }],
+      extraPathGrants: [
+        {
+          path: '/tmp/base',
+          hostPath: updatedHostPath,
+          readOnly: false,
+        },
+      ],
     });
 
     const merged = mergeManifestDelta(base, update);
@@ -494,7 +639,11 @@ describe('sandbox shared helpers', () => {
       { name: 'operators', users: [{ name: 'reviewer' }] },
     ]);
     expect(merged.extraPathGrants).toEqual([
-      { path: '/tmp/base', readOnly: false },
+      {
+        path: '/tmp/base',
+        hostPath: updatedHostPath,
+        readOnly: false,
+      },
     ]);
   });
 

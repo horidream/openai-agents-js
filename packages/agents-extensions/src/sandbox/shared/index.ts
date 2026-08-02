@@ -25,6 +25,7 @@ export {
   entryContainsLocalSource,
   materializeInlineManifestEntry,
   materializeInlineManifest,
+  manifestWithMaterializedEnvironmentReferences,
   manifestContainsLocalSource,
   mergeManifestDelta,
   mergeManifestEntryDelta,
@@ -96,6 +97,7 @@ export {
   type RemoteRunAsCommandResult,
   type RemoteRunAsCommandRunner,
 } from './runAs';
+export { probeRemoteSandboxPathExists } from './pathProbe';
 export {
   RemoteSandboxSessionBase,
   type RemoteSandboxCommandKind,
@@ -104,7 +106,9 @@ export {
   type RemoteSandboxSessionBaseOptions,
 } from './sessionBase';
 export {
+  assertRemoteSandboxSessionStateCanResume,
   deserializeRemoteSandboxSessionStateValues,
+  rehydrateRemoteSandboxSessionStateValues,
   serializeRemoteSandboxSessionState,
 } from './sessionState';
 export {

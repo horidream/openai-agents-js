@@ -14,24 +14,7 @@ import {
 } from '../items';
 import { StreamedRunResult } from '../result';
 
-export const isAbortError = (error: unknown): boolean => {
-  if (!error) {
-    return false;
-  }
-  if (error instanceof Error && error.name === 'AbortError') {
-    return true;
-  }
-  const DomExceptionCtor =
-    typeof DOMException !== 'undefined' ? DOMException : undefined;
-  if (
-    DomExceptionCtor &&
-    error instanceof DomExceptionCtor &&
-    error.name === 'AbortError'
-  ) {
-    return true;
-  }
-  return false;
-};
+export { isAbortError } from '../utils/abortSignals';
 
 function getRunItemStreamEventName(
   item: RunItem,
@@ -74,7 +57,11 @@ function enqueueRunItemStreamEvent(
 ): void {
   const itemName = getRunItemStreamEventName(item);
   if (!itemName) {
-    logger.warn('Unknown item type: ', item);
+    if (logger.dontLogModelData || logger.dontLogToolData) {
+      logger.warn('Unknown item type. Item data is redacted.');
+    } else {
+      logger.warn('Unknown item type: ', item);
+    }
     return;
   }
   result._addItem(new RunItemStreamEvent(itemName, item));

@@ -1,5 +1,67 @@
 # @openai/agents-core
 
+## 0.14.2
+
+### Patch Changes
+
+- e8de524: fix: clean MCP servers before reconnecting
+- b4b8b21: fix: redact MCP URL credentials from external metadata
+- 7255289: fix: redact endpoint credentials from MCP transport errors
+- 25e1cf0: feat: preserve sandbox environment secret references
+
+## 0.14.1
+
+### Patch Changes
+
+- e4158f1: fix: allow Docker command workdirs within sandbox path grants (#1539)
+- 73abbdc: fix: support native Windows host paths in sandbox path grants (#1537)
+- 48094d0: fix: preserve Docker path-grant sessions with verified live reuse and safe snapshot fallback
+- 58e3a43: fix: export lifecycle hook and agent tool helper types (#1534)
+
+## 0.14.0
+
+### Minor Changes
+
+- f7771c1: feat: add default task and turn tracing with a per-run opt-out
+- 67e9733: feat: disable sensitive model and tool data logging by default with a programmatic opt-in
+
+### Patch Changes
+
+- 457166e: fix: redact sensitive tool and model data from error logs
+- b907917: fix: propagate run cancellation to MCP tool requests (#1530)
+- 02ef342: feat: add Programmatic Tool Calling with caller-aware replay, runtime-validated Zod outputs, configuration preflight, examples, and explicit unsupported-adapter errors
+- b45fd21: fix: preserve assistant message phases across Responses history and replay
+- efdd60e: fix: fail closed when dynamic tool approval receives invalid arguments
+- e4f3293: fix(core): reconcile non-streaming function tool cancellation safely (#1521)
+- fa7c36f: fix: honor sensitive logging flags across runtime error and payload paths
+- a3092ca: fix: distinguish missing sandbox paths from inaccessible files and provider failures
+- 68cc86b: fix: parse SELinux security-context markers in permission strings
+- 4461a35: fix(core): wait for cancelled stream cleanup before resolving completion (#1521)
+- 84aed6e: fix(core): propagate streamed cancellation to function tools without replaying settled work (#1521)
+
+## 0.13.5
+
+### Patch Changes
+
+- 2437c35: feat: add AI SDK provider-executed tool search support (#1479)
+- 72ca4bc: fix: correlate streamed text deltas with completed output items (#1484)
+- f1ae0b4: fix: decode persisted binary sandbox manifest content without host base64 globals
+
+## 0.13.4
+
+### Patch Changes
+
+- a1670ce: fix: fail zodJsonSchemaCompat union/tuple conversion instead of silently dropping unconvertible members
+
+  When the fallback zod-to-JSON-schema converter met a union (or tuple) member it could not convert — for example a discriminated-union variant containing `z.preprocess` — it silently filtered the member out and emitted the remaining schema. The result looked valid but forbade outputs the Zod schema accepts: an agent whose `outputType` union lost a variant could never emit that action under structured outputs. Conversion now fails the whole union/tuple so the caller raises the existing descriptive `UserError` instead of degrading the model's output space.
+
+## 0.13.3
+
+### Patch Changes
+
+- a1ea36f: test: improve retry, MCP approval, and Realtime sequencing coverage
+- 4292ecc: fix: avoid installing tracing process-lifecycle listeners in workerd and browsers
+
 ## 0.13.2
 
 ### Patch Changes

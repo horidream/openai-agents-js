@@ -12,7 +12,11 @@ import {
   type MCPListToolsSpanData,
   type Span,
 } from './tracing';
-import { logger as globalLogger, type Logger } from './logger';
+import {
+  logger as globalLogger,
+  logToolActionWarning,
+  type Logger,
+} from './logger';
 import {
   JsonObjectSchema,
   JsonObjectSchemaNonStrict,
@@ -27,6 +31,7 @@ import type {
   MCPToolMetaContext,
   MCPToolMetaResolver,
 } from './mcpUtil';
+import { getMcpServerExternalName } from './mcpLogging';
 import type { RunContext } from './runContext';
 import type { Agent } from './agent';
 import { maybeExtractToolOutputCustomData } from './utils/customData';
@@ -40,6 +45,7 @@ import {
   cachedMcpToolKeysByServer as _cachedToolKeysByServer,
   cachedMcpTools as _cachedTools,
 } from './mcpToolCache';
+import { getToolCallParentSpanFromDetails } from './agentToolRunConfig';
 
 export {
   BaseMCPServerSSE,
@@ -57,6 +63,10 @@ export type MCPToolErrorFunction = (args: {
   context: RunContext;
   error: Error | unknown;
 }) => Promise<string> | string;
+
+export interface MCPCallToolOptions {
+  signal?: AbortSignal;
+}
 
 const MCP_FUNCTION_TOOL_NAME_MAX_LENGTH = 64;
 const MCP_FUNCTION_TOOL_HASH_LENGTH = 8;
@@ -97,6 +107,7 @@ export interface MCPServer {
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResultContent>;
   /**
    * Invoke a tool and return the full serializable MCP result.
@@ -105,6 +116,7 @@ export interface MCPServer {
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResult>;
   invalidateToolsCache(): Promise<void>;
 }
@@ -242,15 +254,17 @@ export class MCPServerStdio
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResultContent> {
-    return (await this.callToolResult(toolName, args, meta)).content;
+    return (await this.callToolResult(toolName, args, meta, options)).content;
   }
   callToolResult(
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResult> {
-    return this.underlying.callToolResult(toolName, args, meta);
+    return this.underlying.callToolResult(toolName, args, meta, options);
   }
   listResources(
     params?: MCPListResourcesParams,
@@ -324,17 +338,24 @@ export class MCPServerStreamableHttp
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResultContent> {
-    return (await this.callToolResult(toolName, args, meta)).content;
+    return (await this.callToolResult(toolName, args, meta, options)).content;
   }
   async callToolResult(
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResult> {
     const previousSessionId = this.sessionId;
     try {
-      return await this.underlying.callToolResult(toolName, args, meta);
+      return await this.underlying.callToolResult(
+        toolName,
+        args,
+        meta,
+        options,
+      );
     } finally {
       if (previousSessionId !== this.sessionId) {
         this.clearLocalToolsCache();
@@ -392,15 +413,17 @@ export class MCPServerSSE
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResultContent> {
-    return (await this.callToolResult(toolName, args, meta)).content;
+    return (await this.callToolResult(toolName, args, meta, options)).content;
   }
   callToolResult(
     toolName: string,
     args: Record<string, unknown> | null,
     meta?: Record<string, unknown> | null,
+    options?: MCPCallToolOptions,
   ): Promise<CallToolResult> {
-    return this.underlying.callToolResult(toolName, args, meta);
+    return this.underlying.callToolResult(toolName, args, meta, options);
   }
   listResources(
     params?: MCPListResourcesParams,
@@ -449,6 +472,12 @@ export const defaultMCPToolCacheKey: MCPToolCacheKeyGenerator = ({
   return server.name;
 };
 
+function logMcpToolFilterDebug(buildMessage: () => string): void {
+  if (!globalLogger.dontLogToolData) {
+    globalLogger.debug(buildMessage());
+  }
+}
+
 /**
  * Fetches and filters raw MCP tools from a single MCP server.
  */
@@ -457,11 +486,13 @@ async function getMcpToolsFromServer<TContext = UnknownContext>({
   runContext,
   agent,
   generateMCPToolCacheKey,
+  tracingParent,
 }: {
   server: MCPServer;
   runContext?: RunContext<TContext>;
   agent?: Agent<any, any>;
   generateMCPToolCacheKey?: MCPToolCacheKeyGenerator;
+  tracingParent?: Span<any>;
 }): Promise<MCPTool[]> {
   const cacheKey = (generateMCPToolCacheKey || defaultMCPToolCacheKey)({
     server,
@@ -488,8 +519,9 @@ async function getMcpToolsFromServer<TContext = UnknownContext>({
           if (typeof filter === 'function') {
             const filtered = await filter(context, tool);
             if (!filtered) {
-              globalLogger.debug(
-                `MCP Tool (server: ${server.name}, tool: ${tool.name}) is blocked by the callable filter.`,
+              logMcpToolFilterDebug(
+                () =>
+                  `MCP Tool (server: ${getMcpServerExternalName(server.name)}, tool: ${tool.name}) is blocked by the callable filter.`,
               );
               continue;
             }
@@ -507,12 +539,14 @@ async function getMcpToolsFromServer<TContext = UnknownContext>({
                   : false;
               if (!allowed || blocked) {
                 if (blocked) {
-                  globalLogger.debug(
-                    `MCP Tool (server: ${server.name}, tool: ${tool.name}) is blocked by the static filter.`,
+                  logMcpToolFilterDebug(
+                    () =>
+                      `MCP Tool (server: ${getMcpServerExternalName(server.name)}, tool: ${tool.name}) is blocked by the static filter.`,
                   );
                 } else if (!allowed) {
-                  globalLogger.debug(
-                    `MCP Tool (server: ${server.name}, tool: ${tool.name}) is not allowed by the static filter.`,
+                  logMcpToolFilterDebug(
+                    () =>
+                      `MCP Tool (server: ${getMcpServerExternalName(server.name)}, tool: ${tool.name}) is not allowed by the static filter.`,
                   );
                 }
                 continue;
@@ -539,13 +573,17 @@ async function getMcpToolsFromServer<TContext = UnknownContext>({
     return mcpTools;
   };
 
-  if (!getCurrentTrace()) {
+  if (!tracingParent && !getCurrentTrace()) {
     return listToolsForServer();
   }
 
-  return withMCPListToolsSpan(listToolsForServer, {
-    data: { server: server.name },
-  });
+  return withMCPListToolsSpan(
+    listToolsForServer,
+    {
+      data: { server: getMcpServerExternalName(server.name) },
+    },
+    tracingParent,
+  );
 }
 
 function convertMcpToolsToFunctionTools<TContext = UnknownContext>({
@@ -579,6 +617,7 @@ async function getFunctionToolsFromServer<TContext = UnknownContext>({
   agent,
   generateMCPToolCacheKey,
   errorFunction,
+  tracingParent,
 }: {
   server: MCPServer;
   convertSchemasToStrict: boolean;
@@ -586,12 +625,14 @@ async function getFunctionToolsFromServer<TContext = UnknownContext>({
   agent?: Agent<any, any>;
   generateMCPToolCacheKey?: MCPToolCacheKeyGenerator;
   errorFunction?: MCPToolErrorFunction | null;
+  tracingParent?: Span<any>;
 }): Promise<FunctionTool<TContext, any, unknown>[]> {
   const mcpTools = await getMcpToolsFromServer({
     server,
     runContext,
     agent,
     generateMCPToolCacheKey,
+    tracingParent,
   });
   return convertMcpToolsToFunctionTools({
     mcpTools,
@@ -613,6 +654,7 @@ export type GetAllMcpToolsOptions<TContext> = {
   errorFunction?: MCPToolErrorFunction | null;
   includeServerInToolNames?: boolean;
   reservedToolNames?: Set<string>;
+  tracingParent?: Span<any>;
 };
 
 /**
@@ -643,6 +685,7 @@ export async function getAllMcpTools<TContext = UnknownContext>(
     errorFunction,
     includeServerInToolNames = false,
     reservedToolNames,
+    tracingParent,
   } = opts;
   const allTools: Tool<TContext>[] = [];
   const toolNames = new Set<string>();
@@ -657,6 +700,7 @@ export async function getAllMcpTools<TContext = UnknownContext>(
           runContext: runContextFromOpts,
           agent: agentFromOpts,
           generateMCPToolCacheKey,
+          tracingParent,
         }),
       })),
     );
@@ -700,6 +744,7 @@ export async function getAllMcpTools<TContext = UnknownContext>(
       agent: agentFromOpts,
       generateMCPToolCacheKey,
       errorFunction,
+      tracingParent,
     });
     const serverToolNames = new Set(serverTools.map((t) => t.name));
     const intersection = [...serverToolNames]
@@ -869,17 +914,30 @@ function buildPrefixedToolNameOverrides(
 ): Map<string, string> {
   const baseNameCounts = new Map<string, number>();
   for (const { server, mcpTools } of serverToolBatches) {
+    const serverName = getMcpServerExternalName(server.name);
     for (const mcpTool of mcpTools) {
-      const baseName = buildPrefixedToolBaseName(server.name, mcpTool.name);
+      const baseName = buildPrefixedToolBaseName(serverName, mcpTool.name);
       baseNameCounts.set(baseName, (baseNameCounts.get(baseName) ?? 0) + 1);
     }
   }
 
   const candidates: PrefixedToolNameCandidate[] = [];
+  const rawServerNamesBySeed = new Map<string, string>();
   for (const { server, serverIndex, mcpTools } of serverToolBatches) {
+    const serverName = getMcpServerExternalName(server.name);
     mcpTools.forEach((mcpTool, toolIndex) => {
-      const baseName = buildPrefixedToolBaseName(server.name, mcpTool.name);
-      const seed = `${server.name}\0${mcpTool.name}`;
+      const baseName = buildPrefixedToolBaseName(serverName, mcpTool.name);
+      const seed = `${serverName}\0${mcpTool.name}`;
+      const previousRawServerName = rawServerNamesBySeed.get(seed);
+      if (
+        previousRawServerName !== undefined &&
+        previousRawServerName !== server.name
+      ) {
+        throw new UserError(
+          `MCP server names are indistinguishable after URL redaction for tool '${mcpTool.name}': '${serverName}'. Configure unique safe server names when includeServerInToolNames is enabled.`,
+        );
+      }
+      rawServerNamesBySeed.set(seed, server.name);
       const forceHash =
         (baseNameCounts.get(baseName) ?? 0) > 1 || reservedNames.has(baseName);
       candidates.push({
@@ -991,26 +1049,39 @@ export function mcpToFunctionTool(
     } else if (typeof input === 'object' && input != null) {
       args = input;
     }
-    const currentSpan = getCurrentSpan();
+    const currentSpan =
+      getToolCallParentSpanFromDetails(details) ?? getCurrentSpan();
     if (currentSpan) {
-      currentSpan.spanData['mcp_data'] = { server: server.name };
+      currentSpan.spanData['mcp_data'] = {
+        server: getMcpServerExternalName(server.name),
+      };
     }
     const meta = runContext
       ? await resolveMcpToolMeta(server, runContext, mcpTool.name, args)
       : undefined;
-    const result: CallToolResult =
+    const callOptions = details?.signal
+      ? { signal: details.signal }
+      : undefined;
+    const useFullResult =
       (server.useStructuredContent === true ||
         server.customDataExtractor !== undefined) &&
-      server.callToolResult
-        ? meta === undefined
-          ? await server.callToolResult(mcpTool.name, args)
-          : await server.callToolResult(mcpTool.name, args, meta)
-        : {
-            content:
-              meta === undefined
-                ? await server.callTool(mcpTool.name, args)
-                : await server.callTool(mcpTool.name, args, meta),
-          };
+      server.callToolResult !== undefined;
+    let result: CallToolResult;
+    if (useFullResult) {
+      result = callOptions
+        ? await server.callToolResult!(mcpTool.name, args, meta, callOptions)
+        : meta === undefined
+          ? await server.callToolResult!(mcpTool.name, args)
+          : await server.callToolResult!(mcpTool.name, args, meta);
+    } else {
+      result = {
+        content: callOptions
+          ? await server.callTool(mcpTool.name, args, meta, callOptions)
+          : meta === undefined
+            ? await server.callTool(mcpTool.name, args)
+            : await server.callTool(mcpTool.name, args, meta),
+      };
+    }
     const content = result.content as CallToolResultContent;
     const resultMeta = result._meta ?? content._meta;
     const structuredContent =
@@ -1078,7 +1149,11 @@ export function mcpToFunctionTool(
         },
       });
     } catch (e) {
-      globalLogger.warn(`Error converting MCP schema to strict mode: ${e}`);
+      logToolActionWarning(
+        globalLogger,
+        'Error converting MCP schema to strict mode:',
+        e,
+      );
     }
   }
 

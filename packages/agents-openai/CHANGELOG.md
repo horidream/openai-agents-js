@@ -1,5 +1,82 @@
 # @openai/agents-openai
 
+## 0.14.2
+
+### Patch Changes
+
+- Updated dependencies [e8de524]
+- Updated dependencies [b4b8b21]
+- Updated dependencies [7255289]
+- Updated dependencies [25e1cf0]
+  - @openai/agents-core@0.14.2
+
+## 0.14.1
+
+### Patch Changes
+
+- Updated dependencies [e4158f1]
+- Updated dependencies [73abbdc]
+- Updated dependencies [48094d0]
+- Updated dependencies [58e3a43]
+  - @openai/agents-core@0.14.1
+
+## 0.14.0
+
+### Minor Changes
+
+- 67e9733: feat: disable sensitive model and tool data logging by default with a programmatic opt-in
+
+### Patch Changes
+
+- f7771c1: feat: add default task and turn tracing with a per-run opt-out
+- 02ef342: feat: add Programmatic Tool Calling with caller-aware replay, runtime-validated Zod outputs, configuration preflight, examples, and explicit unsupported-adapter errors
+- b45fd21: fix: preserve assistant message phases across Responses history and replay
+- fa7c36f: fix: honor sensitive logging flags across runtime error and payload paths
+- Updated dependencies [f7771c1]
+- Updated dependencies [457166e]
+- Updated dependencies [b907917]
+- Updated dependencies [02ef342]
+- Updated dependencies [b45fd21]
+- Updated dependencies [efdd60e]
+- Updated dependencies [e4f3293]
+- Updated dependencies [fa7c36f]
+- Updated dependencies [67e9733]
+- Updated dependencies [a3092ca]
+- Updated dependencies [68cc86b]
+- Updated dependencies [4461a35]
+- Updated dependencies [84aed6e]
+  - @openai/agents-core@0.14.0
+
+## 0.13.5
+
+### Patch Changes
+
+- 72ca4bc: fix: correlate streamed text deltas with completed output items (#1484)
+- Updated dependencies [2437c35]
+- Updated dependencies [72ca4bc]
+- Updated dependencies [f1ae0b4]
+  - @openai/agents-core@0.13.5
+
+## 0.13.4
+
+### Patch Changes
+
+- db1fe16: fix: preserve token usage reported on earlier Chat Completions stream chunks
+
+  When streaming Chat Completions, usage was overwritten on every chunk, so a trailing chunk without usage reset the previously reported totals to zero. Some OpenAI-compatible providers or gateways may emit a later chunk without usage after reporting usage on an earlier chunk, which caused `response_done` to report `inputTokens`/`outputTokens`/`totalTokens` as 0. Usage is now retained when a later chunk omits it, while the normal OpenAI path (usage on the final chunk) is unchanged.
+
+- Updated dependencies [a1670ce]
+  - @openai/agents-core@0.13.4
+
+## 0.13.3
+
+### Patch Changes
+
+- a1ea36f: test: improve retry, MCP approval, and Realtime sequencing coverage
+- Updated dependencies [a1ea36f]
+- Updated dependencies [4292ecc]
+  - @openai/agents-core@0.13.3
+
 ## 0.13.2
 
 ### Patch Changes

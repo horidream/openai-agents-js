@@ -13,15 +13,19 @@
     "docs:translate": "pnpm -F docs translate",
     "docs:build": "pnpm -F docs build",
     "docs:scripts:check": "pnpm exec tsc --pretty false --project docs/tsconfig.scripts.json",
-    "test": "CI=1 NODE_ENV=test vitest",
+    "test": "CI=1 NODE_ENV=test vitest && pnpm test:rclone-pin",
     "test:coverage": "NODE_ENV=test vitest run --coverage",
     "test:examples": "pnpm -r build-check",
     "test:integration": "NODE_ENV=test vitest run --config=vitest.integration.config.ts",
+    "test:integration:sdk-core": "NODE_ENV=test vitest run --config=vitest.integration.config.ts integration-tests/node-sdk-behavior.test.ts -t \"core behavior profile\"",
+    "test:integration:sdk-capabilities": "NODE_ENV=test vitest run --config=vitest.integration.config.ts integration-tests/node-sdk-behavior.test.ts -t \"capability behavior profile\"",
+    "test:rclone-pin": "node --test scripts/update-rclone-pin.test.mjs",
     "test:watch": "NODE_ENV=test vitest --watch",
     "dev": "tsx scripts/dev.mts",
     "format": "prettier --write \"packages/**/*.ts\" \"examples/**/*.ts\" \"integration-tests/**/*.ts\"",
     "format:changed": "node scripts/prettier-changed.mjs",
     "format:check:changed": "node scripts/prettier-changed.mjs --check",
+    "update:rclone-pin": "node scripts/update-rclone-pin.mjs",
     "lint": "eslint",
     "lint:fix": "eslint --fix",
     "examples:basic": "pnpm -F basic start",
@@ -45,6 +49,7 @@
     "examples:tools-codex": "pnpm -F tools start:codex",
     "examples:tools-codex-same-thread": "pnpm -F tools start:codex-same-thread",
     "examples:tools-file-search": "pnpm -F tools start:file-search",
+    "examples:tools-programmatic-tool-calling": "pnpm -F tools start:programmatic-tool-calling",
     "examples:tools-tool-search": "pnpm -F tools start:tool-search",
     "examples:tools-web-search": "pnpm -F tools start:web-search",
     "examples:tools-shell": "pnpm -F tools start:shell",
@@ -100,5 +105,5 @@
     "verdaccio": "^6.7.4",
     "vitest": "^3.2.6"
   },
-  "packageManager": "pnpm@11.10.0+sha512.0b7f8b98060031904c017e3a41eb187a16d40eeb829b95c4f8cb03681761fc4ab53dd219115b9b447f4dce1a05a214764461e7d3703392a9f32f9511ce8c86c8"
+  "packageManager": "pnpm@11.18.0+sha512.33d83c77da82f49fba836925c6f1b841181ec3132b670639bd012f7075f5c7cf634c5f870147c19aae7478fac01df09d8892e880454896edd23ee9b33757563c"
 }

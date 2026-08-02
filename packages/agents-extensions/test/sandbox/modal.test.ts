@@ -209,6 +209,17 @@ describe('ModalSandboxClient', () => {
     sandboxExecMock.mockImplementation(
       async (command: string[], _params?: Record<string, unknown>) => {
         if (command[0] === '/bin/sh') {
+          if (command[2]?.includes('OPENAI_AGENTS_READ_PATH_PROBE_V1')) {
+            return {
+              stdin: {
+                writeText: async (_text: string) => {},
+                close: async () => {},
+              },
+              stdout: textStream(''),
+              stderr: textStream(''),
+              wait: async () => 1,
+            };
+          }
           const resolvedPath = resolvedRemotePathFromValidationCommand(
             command[2] ?? '',
           );
@@ -356,6 +367,38 @@ describe('ModalSandboxClient', () => {
         command.join(' ').includes("target_user='root'"),
       ),
     ).toBe(true);
+  });
+
+  test.each([
+    { status: 1, stderr: 'Permission denied' },
+    { status: 2, stderr: 'Input/output error' },
+  ])('preserves failed Modal filesystem probes: %j', async (result) => {
+    const client = new ModalSandboxClient();
+    const session = await client.create(new Manifest(), {
+      appName: 'sandbox-tests',
+    } satisfies ModalSandboxClientOptions);
+    const originalImplementation = sandboxExecMock.getMockImplementation();
+    sandboxExecMock.mockImplementation(async (command, options) => {
+      if (command[0] === 'test') {
+        return {
+          stdout: textStream(''),
+          stderr: textStream(result.stderr),
+          wait: async () => result.status,
+        };
+      }
+      return await originalImplementation?.(command, options);
+    });
+
+    await expect(
+      session.pathExists('/workspace/blocked'),
+    ).rejects.toMatchObject({
+      code: 'provider_error',
+      details: {
+        provider: 'modal',
+        path: '/workspace/blocked',
+        status: result.status,
+      },
+    });
   });
 
   test('clears exec yield timers when commands finish before timeout', async () => {
@@ -596,6 +639,37 @@ describe('ModalSandboxClient', () => {
         feature: 'workspacePersistence.tar',
         root: '/workspace',
         mountPaths: ['/workspace/data'],
+      },
+    });
+    expect(sandboxExecMock).not.toHaveBeenCalled();
+    expect(sandboxFilesystemWriteBytesMock).not.toHaveBeenCalled();
+  });
+
+  test('rejects ephemeral paths before tar hydration side effects', async () => {
+    const client = new ModalSandboxClient();
+    const session = await client.create(
+      new Manifest({
+        entries: {
+          logs: { type: 'dir', ephemeral: true },
+        },
+      }),
+      {
+        appName: 'sandbox-tests',
+      },
+    );
+
+    sandboxExecMock.mockClear();
+    sandboxFilesystemWriteBytesMock.mockClear();
+
+    await expect(
+      session.hydrateWorkspace(
+        makeTarArchive([
+          { name: 'logs/events.jsonl', content: 'persisted log' },
+        ]),
+      ),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'archive member overlaps protected path: logs',
       },
     });
     expect(sandboxExecMock).not.toHaveBeenCalled();
@@ -1260,35 +1334,7 @@ describe('ModalSandboxClient', () => {
     expect(session.state.idleTimeoutMs).toBe(60_000);
   });
 
-  test('falls back to tar persistence when the workspace root is ephemeral', async () => {
-    const archive = makeTarArchive([{ name: 'keep.txt', content: 'keep' }]);
-    sandboxExecMock.mockImplementation(
-      async (command: string[], _params?: Record<string, unknown>) => {
-        if (command[0] === '/bin/sh') {
-          const resolvedPath = resolvedRemotePathFromValidationCommand(
-            command[2] ?? '',
-          );
-          if (resolvedPath) {
-            return {
-              stdin: { writeText: async () => {}, close: async () => {} },
-              stdout: textStream(`${resolvedPath}\n`),
-              stderr: textStream(''),
-              wait: async () => 0,
-            };
-          }
-          const archivePath = command[2]?.match(/-cf '([^']+)'/)?.[1];
-          if (archivePath) {
-            files.set(archivePath, archive);
-          }
-        }
-        return {
-          stdin: { writeText: async () => {}, close: async () => {} },
-          stdout: textStream(''),
-          stderr: textStream(''),
-          wait: async () => 0,
-        };
-      },
-    );
+  test('persists an empty tar when the workspace root is ephemeral', async () => {
     const client = new ModalSandboxClient();
     const session = await client.create(
       new Manifest({
@@ -1304,12 +1350,16 @@ describe('ModalSandboxClient', () => {
         workspacePersistence: 'snapshot_filesystem',
       } satisfies ModalSandboxClientOptions,
     );
+    sandboxExecMock.mockClear();
+    sandboxFilesystemReadBytesMock.mockClear();
 
     const snapshotBytes = await session.persistWorkspace();
 
     expect(sandboxSnapshotFilesystemMock).not.toHaveBeenCalled();
     expect(decodeNativeSnapshotRef(snapshotBytes)).toBeUndefined();
-    expect(snapshotBytes).toEqual(archive);
+    expect(snapshotBytes).toEqual(makeTarArchive([]));
+    expect(sandboxExecMock).not.toHaveBeenCalled();
+    expect(sandboxFilesystemReadBytesMock).not.toHaveBeenCalled();
   });
 
   test('clears cached exposed ports after snapshot filesystem restore', async () => {

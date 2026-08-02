@@ -174,6 +174,29 @@ describe('OpenAIRealtimeWebRTC.interrupt', () => {
     });
   });
 
+  it('preserves known server payloads on wildcard events', async () => {
+    const rtc = new OpenAIRealtimeWebRTC();
+    await rtc.connect({ apiKey: 'ek_test' });
+    const events: any[] = [];
+    rtc.on('*', (event) => events.push(event));
+    const payload = {
+      type: 'conversation.created',
+      event_id: 'evt_known',
+      conversation: {
+        id: 'conv_1',
+        provider_nested: { value: true },
+      },
+      provider_top_level: 123,
+    };
+
+    const channel = lastChannel as FakeRTCDataChannel;
+    channel.dispatchEvent(
+      new MessageEvent('message', { data: JSON.stringify(payload) }),
+    );
+
+    expect(events).toEqual([payload]);
+  });
+
   it('rejects with the provider error message when /realtime/calls fails', async () => {
     Object.defineProperty(globalThis, 'fetch', {
       value: async () => ({

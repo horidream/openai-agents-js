@@ -13,7 +13,13 @@ export {
   ToolUseBehavior,
   ToolUseBehaviorFlags,
 } from './agent';
-export type { CompletedAgentToolInvocationRunResult } from './agent';
+export type {
+  AgentTool,
+  AgentToolOptions,
+  AgentToolOptionsWithDefault,
+  AgentToolOptionsWithParameters,
+  CompletedAgentToolInvocationRunResult,
+} from './agent';
 export { Computer } from './computer';
 export { ShellAction, ShellResult, ShellOutputResult, Shell } from './shell';
 export {
@@ -26,6 +32,7 @@ export {
   AgentsError,
   GuardrailExecutionError,
   InputGuardrailTripwireTriggered,
+  InvalidToolOutputError,
   MaxTurnsExceededError,
   ModelBehaviorError,
   ModelRefusalError,
@@ -37,6 +44,7 @@ export {
   UserError,
   SystemError,
 } from './errors';
+export type { ToolOutputErrorContext } from './errors';
 export {
   RunAgentUpdatedStreamEvent,
   RunRawModelStreamEvent,
@@ -100,12 +108,15 @@ export {
   RunToolSearchOutputItem,
 } from './items';
 export { AgentHooks } from './lifecycle';
+export type { AgentHookEvents, RunHookEvents } from './lifecycle';
 export { getLogger } from './logger';
+export { setSensitiveDataLoggingEnabled } from './config';
 export { applyDiff } from './utils/applyDiff';
 export {
   getAllMcpTools,
   invalidateServerToolsCache,
   mcpToFunctionTool,
+  MCPCallToolOptions,
   MCPBlobResourceContent,
   CallToolResult,
   CallToolResultContent,
@@ -225,6 +236,8 @@ export {
   ToolExecuteArgument,
   ToolEnabledFunction,
   ToolOptionsWithGuardrails,
+  ToolAllowedCaller,
+  ToolAllowedCallers,
 } from './tool';
 export type {
   ClientToolSearchExecutor,
@@ -248,6 +261,7 @@ export type {
   ShellToolContainerNetworkPolicyDisabled,
   ShellToolContainerNetworkPolicyDomainSecret,
   ToolInputParameters,
+  ToolOutputSchema,
   ToolOptions,
   ToolNamespaceOptions,
   ToolOutputCustomData,
@@ -283,6 +297,9 @@ export type {
   ShellCallResultItem,
   ApplyPatchCallItem,
   ApplyPatchCallResultItem,
+  ProgramCallItem,
+  ProgramCallResultItem,
+  ToolCaller,
   FunctionCallItem,
   FunctionCallResultItem,
   JsonSchemaDefinition,
