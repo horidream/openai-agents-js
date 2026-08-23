@@ -28,6 +28,8 @@ Run it when you change:
 
 You can skip `$code-change-verification` for docs-only or repo-meta changes (for example, `docs/`, `.agents/`, `README.md`, `AGENTS.md`, `.github/`), unless a user explicitly asks to run the full verification stack.
 
+Treat `$code-change-verification` as the post-review final gate, not as an iterative review check. When `$implementation-final-review` applies, satisfy its clean-review condition before starting the repository-wide install, build, lint, typecheck, test, examples, integration, and format-check stack. Immediately before starting that stack, use available read-only task or process evidence to check for another broad test, typecheck, build, examples, or integration command already running on the same host. When concrete contention is visible, keep making progress on review, remediation, evidence preparation, or focused checks and defer the broad stack until capacity is available. Do not add a repository lock, host-wide mutex, sentinel file, or user-triggered `finalize` step. Lack of host telemetry alone is not a blocker.
+
 #### `$changeset-validation`
 
 When you change anything under `packages/` or touch `.changeset/`, use `$changeset-validation` to create and validate the changeset before you treat the code as final. Codex must ensure an appropriate changeset exists that covers every changed package, and run this skill alongside `$code-change-verification` ahead of handoff. When writing the changeset summary, use a Conventional Commit-style message (for example, `fix: ...` or `feat: ...`) so it can serve as a commit title.
@@ -42,11 +44,33 @@ Before changing or reviewing runtime code, exported APIs, external configuration
 
 Repeat the skill before editing each new review-feedback batch; an earlier strategy decision is stale when a comment would widen the supported contract or add another compatibility branch, resolver condition, or test permutation. Judge breaking changes against the latest release tag, not unreleased branch-local churn. Interfaces introduced or changed after the latest release tag may be rewritten without compatibility shims unless they already have a released or otherwise supported durable-state consumer, or the user explicitly asks for a migration path.
 
+An independent reviewer dispatched by `$implementation-final-review` must not invoke `$implementation-strategy` again when its complete reviewer packet contains the parent-prepared implementation scope contract, current compatibility boundary, and resolved base. For that read-only review, the parent invocation satisfies the strategy preparation requirement; the reviewer validates the supplied contract against the complete diff and reports a missing or inconsistent packet instead of reconstructing the workflow. This exception does not apply to the implementer or to a reviewer asked to propose a widened contract.
+
+#### `$implementation-final-review`
+
+After implementing runtime code, tests, examples, build/test behavior, or behavior-impacting docs and completing focused tests, run `$implementation-final-review` before final `$changeset-validation`, `$code-change-verification`, and `$pr-draft-summary` work and before declaring the task complete. Do not start repository-wide lint, typecheck, tests, builds, examples, integration suites, or format checks while the independent review is incomplete or finding-bearing. This repository instruction authorizes automatic invocation without a separate user mention. Do not invoke it for planning, investigation, review, or report-only tasks, repo-meta changes, or docs without behavior impact. The skill's clean-review gate does not replace any other mandatory repository skill or verification gate.
+
 #### `$pr-draft-summary`
 
 Before sending the final response for a task, inspect the actual task diff. If it includes runtime code, tests, examples, build/test configuration, or docs with behavior impact, invoke `$pr-draft-summary` to generate the required PR summary block, branch suggestion, title, and draft description. This is a mandatory close-out gate regardless of the perceived size of the change; do not classify an eligible runtime, test, example, or build/test configuration change as trivial. Run it after any required `$code-change-verification` and `$changeset-validation` work.
 
 Skip `$pr-draft-summary` only when no eligible files changed, every change is limited to repo metadata or docs without behavior impact, the task is conversation-only, or the user explicitly says not to include the PR draft block.
+
+### Documentation Change Verification Tiers
+
+Classify the complete task-owned diff, including committed, staged, unstaged, and task-owned untracked files, by the highest applicable documentation risk tier. This section is the source of truth for documentation-specific verification; skills that edit or audit docs must reference these tiers instead of defining a second verification policy. These tiers add focused documentation checks only. They do not change the existing eligibility rules for `$implementation-final-review`, `$code-change-verification`, `$changeset-validation`, or `$pr-draft-summary`.
+
+- **Editorial**: Changes only spelling, grammar, punctuation, formatting, or wording that preserves the exact technical meaning. The complete diff must not change technical claims, links, anchors, frontmatter, snippets, snippet imports, navigation, Astro configuration, or generators. Run `git diff --check` and Prettier check for the changed Markdown or MDX files. Skip `pnpm docs:build`, `pnpm -F docs-code build-check`, and independent behavior review unless another changed path or existing eligibility rule requires them.
+- **Content**: Changes technical claims, API names, defaults, behavior descriptions, links, anchors, frontmatter, snippet imports, rendered snippet wiring, or TypeScript/TSX sources under `examples/docs/`. Verify every changed claim against the implementation or another authoritative source, and write authored English that explicitly names actors, objects, and lifecycle subjects for reliable translation. Run `git diff --check` and Prettier check for the changed authored docs and snippet files. When the diff changes a rendered TypeScript/TSX snippet source or its MDX import/rendering, run `pnpm -F docs-code build-check`. Skip `pnpm docs:build` when the diff has no Structural change.
+- **Structural**: Changes documentation navigation, routes, page layout, `docs/astro.config.mjs`, sidebar configuration, docs build configuration, or documentation and translation generators such as `docs/src/scripts/**`. Run the applicable Content checks, `pnpm docs:build`, and `pnpm docs:scripts:check` when `docs/src/scripts/**` changes. Do not run `pnpm docs:translate` as routine verification and do not hand-edit generated translations.
+
+For every tier, update only authored English docs. Do not edit generated translations under `docs/src/content/docs/ja`, `docs/src/content/docs/ko`, or `docs/src/content/docs/zh`. TypeScript and TSX rendered in docs must continue to live under `examples/docs/`, be imported into MDX with `?raw`, and pass `pnpm -F docs-code build-check` whenever the complete diff changes that snippet source or wiring. If the complete diff also contains runtime code, tests, examples, build/test behavior, behavior-impacting docs, package files, or changesets, run every broader repository gate already required for those paths.
+
+### Work Status Reporting
+
+- Use `RUNNING` only in commentary while autonomous work remains and no user action is required. Do not end a turn with a final response that says the task is still running or asks the user to send a generic continuation prompt.
+- Use `COMPLETE` in the final response only when the requested work and every applicable review, verification, and local handoff step are complete.
+- Use `NEEDS_DECISION` in the final response only when progress requires a concrete user choice, expanded authority, or an unresolved external condition. State the exact decision or condition instead of asking the user to say "continue".
 
 ### Git Worktree and Branch Safety
 
@@ -57,6 +81,10 @@ If isolation or a different checkout is needed, explain why and ask the user bef
 ### pnpm Safety
 
 Use pnpm in the user's selected checkout without changing worktrees or branches. Do not use `CI=1`, `--force`, or `confirmModulesPurge=false` to bypass an incompatible `node_modules` prompt. Stop and diagnose the pnpm configuration mismatch instead of silently recreating dependencies. Keep machine-specific pnpm store and shell configuration outside the repository.
+
+### Documentation Release Timing
+
+When a feature or bug fix introduces behavior that is not yet available in the latest published release, do not include `docs/` changes that describe that unreleased behavior in the feature or bug-fix pull request, and do not expect those changes as part of that pull request. Handle them in a separate docs-only pull request so maintainers can coordinate its merge timing with the release that makes the documentation accurate. This exception applies only when the documentation would be incorrect for the latest published release; documentation that is already accurate for released behavior remains part of the normal change scope.
 
 ### Scope Discipline and Complexity Reset
 
@@ -93,7 +121,8 @@ The OpenAI Agents JS repository is a pnpm-managed monorepo that provides:
 ### Repo Structure & Important Files
 
 - `packages/agents-core/`, `packages/agents-openai/`, `packages/agents-realtime/`, `packages/agents-extensions/`: Each has its own `package.json`, `src/`, `test/`, and build scripts.
-- `docs/`: Documentation source; develop with `pnpm docs:dev` or build with `pnpm docs:build`. Translated docs under `docs/src/content/docs/ja`, `docs/src/content/docs/ko`, and `docs/src/content/docs/zh` are generated via `pnpm docs:translate`; do not edit them manually.
+- `docs/`: Documentation source; develop with `pnpm docs:dev` or build with `pnpm docs:build`. Write and review authored English source docs for reliable translation: explicitly name actors, objects, and lifecycle subjects; avoid ambiguous pronouns and slash-compressed concepts; preserve exact API identifiers and established SDK terminology; and do not weaken or strengthen technical claims merely to simplify translation. Translated docs under `docs/src/content/docs/ja`, `docs/src/content/docs/ko`, and `docs/src/content/docs/zh` are generated via `pnpm docs:translate`; do not edit them manually.
+- Every TypeScript or TSX snippet shown in authored docs must come from a compilable source file under `examples/docs/`, be imported into MDX with `?raw`, and pass `pnpm -F docs-code build-check`. Do not add ad hoc TypeScript or TSX fenced blocks directly to MDX. If an example is not useful enough to maintain and build-check as a complete source file, explain the behavior in prose instead. Do not add artificial runtime side effects, such as `console.log`, solely to mark declarations as used; the `examples/docs/` TypeScript project permits unused declarations so documentation examples can stay focused on the behavior they teach.
 - `examples/`: Subdirectories (e.g. `basic`, `agent-patterns`) with their own `package.json` and start scripts.
 - `scripts/dev.mts`: Runs concurrent build-watchers and the docs dev server (`pnpm dev`).
 - `scripts/embedMeta.ts`: Generates `src/metadata.ts` for each package before build.
@@ -139,7 +168,7 @@ Use this checklist when the touched code is in the relevant area. Add focused re
 - Session, RunState, and compaction changes: check serialization/deserialization, resume, OpenAI Conversations sessions, local sessions, session callbacks, public history replay, and storage replacement order. Clear or replace persisted history only after the replacement payload is normalized and validated.
 - Sandbox provider changes: treat persisted session state as untrusted, prefer trusted configuration on resume/recreate, verify credential refresh and expiry behavior, separate cleanup from preservation, account for remote timeout operations that can complete late, clean up mount secrets on every failure path, and validate real paths and privileged command environments.
 - Provider-specific behavior changes: do not rely only on docs when field names, timeout units, lifecycle defaults, credential behavior, or generated SDK surfaces are involved. Compare docs, generated types, and a small live probe when practical.
-- Docs and examples changes: typecheck or otherwise verify sample imports against real package exports. In translated docs, preserve locale-prefixed links and localized anchors.
+- Docs and examples changes: typecheck or otherwise verify sample imports against real package exports. TypeScript and TSX snippets rendered in docs must originate from `examples/docs/` and pass `pnpm -F docs-code build-check`; inline MDX snippets are not an exception. In translated docs, preserve locale-prefixed links and localized anchors.
 
 ## Operation Guide
 
@@ -169,6 +198,7 @@ Before submitting changes, ensure all checks pass and augment tests when you tou
 When `$code-change-verification` applies (see Mandatory Skill Usage), invoke it to run the required verification stack from the repository root. Rerun the full stack after fixes.
 
 - Add or update unit tests for any code change unless it is truly infeasible; if something prevents adding tests, explain why in the PR.
+- For provider-neutral agent workflow tests, prefer `ScriptedModel` over adding a new mock or fake `Model`. Prefer `ScriptedRealtimeTransport` for Realtime session tests and `scriptedSandboxSession()` for deterministic Sandbox session calls. Keep a specialized double only for a boundary the scripted utilities cannot preserve, such as provider-wire conversion, malformed streams, controlled suspension or concurrency, or exact abort or lifecycle delivery, and document that reason in the test.
 
 #### Build and Type Checking
 
@@ -186,7 +216,7 @@ When `$code-change-verification` applies (see Mandatory Skill Usage), invoke it 
 
 - Run the full test suite:
   ```bash
-  CI=1 pnpm test
+  pnpm test
   ```
 - Tests are located under each package in `packages/<pkg>/test/`.
 - The test script already sets `CI=1` to avoid watch mode.
@@ -275,6 +305,7 @@ Before opening a pull request, always run `$changeset-validation` to ensure all 
 
 ### Pull Request & Commit Guidelines
 
+- In copy-ready GitHub text, use native issue and pull-request references: exactly `#123` for this repository and `owner/repo#123` for another repository. Do not qualify same-repository references as `openai/openai-agents-js#123`. Preserve closing forms such as `Fixes #123` or `Resolves #123`. Never wrap these references in Markdown links such as `[PR #123](https://github.com/owner/repo/pull/123)` or `[#123](...)`; those Codex-friendly links require manual cleanup after pasting into GitHub. Use descriptive Markdown links only for external resources or GitHub targets that cannot be expressed as a native issue or pull-request reference.
 - Use **Conventional Commits**:
   - `feat`: new feature
   - `fix`: bug fix
@@ -318,5 +349,5 @@ Before opening a pull request, always run `$changeset-validation` to ensure all 
 - ✅ Tests cover new behavior and edge cases.
 - ✅ Code is readable and maintainable.
 - ✅ Examples updated if behavior changes.
-- ✅ Documentation (in `docs/`) updated for user-facing changes.
+- ✅ Documentation (in `docs/`) updated for user-facing changes, except unreleased-behavior documentation that must follow the separate docs-only pull request policy above.
 - ✅ Commit history is clean and follows Conventional Commits.

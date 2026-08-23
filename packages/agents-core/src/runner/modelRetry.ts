@@ -6,12 +6,19 @@ import type {
   ModelRetryAdviceRequest,
   ModelRetryBackoffSettings,
   ModelRetryNormalizedError,
+  ModelSettings,
   RetryDecision,
   RetryPolicy,
   RetryPolicyContext,
 } from '../model';
+import { ModelTimeoutError, UserError } from '../errors';
 import type { StreamEvent } from '../types/protocol';
 import { RequestUsage, Usage } from '../usage';
+import {
+  attachModelFailureUsage,
+  consumeModelFailureUsage,
+  createModelFailureUsageScope,
+} from './usageTracking';
 
 const DEFAULT_INITIAL_DELAY_MS = 250;
 const DEFAULT_MAX_DELAY_MS = 2_000;
@@ -19,20 +26,35 @@ const DEFAULT_BACKOFF_MULTIPLIER = 2;
 const DEFAULT_BACKOFF_JITTER = true;
 const RETRY_AFTER_MS_HEADER = 'retry-after-ms';
 const RETRY_AFTER_HEADER = 'retry-after';
+const MAX_MODEL_TIMEOUT_MS = 2_147_483_647;
 
 type ResolvedRetryDecision = {
   retry: boolean;
   delayMs?: number;
   reason?: string;
+  approveUnsafeReplay?: boolean;
 };
 
-// Marks internal veto decisions that should stop retryPolicies.any() immediately.
+// Marks internal veto and approval decisions without widening the public API.
 const hardVetoSymbol = Symbol('hardRetryVeto');
+const delegableReplayVetoSymbol = Symbol('delegableReplayVeto');
 const replaySafeApprovalSymbol = Symbol('replaySafeApproval');
+const providerRetryAuthoritySymbol = Symbol('providerRetryAuthority');
+
+type ProviderRetryAuthority = Readonly<{
+  suggested?: boolean;
+  replaySafety: 'safe' | 'unsafe' | 'unknown';
+  responseStarted?: boolean;
+}>;
 
 type InternalRetryDecision = ResolvedRetryDecision & {
   [hardVetoSymbol]?: true;
+  [delegableReplayVetoSymbol]?: true;
   [replaySafeApprovalSymbol]?: true;
+};
+
+type InternalRetryPolicyContext = RetryPolicyContext & {
+  [providerRetryAuthoritySymbol]?: ProviderRetryAuthority;
 };
 
 type EvaluateRetryParams = {
@@ -43,50 +65,151 @@ type EvaluateRetryParams = {
   retryBackoff?: ModelRetryBackoffSettings;
   signal?: AbortSignal;
   stream: boolean;
-  replayUnsafeRequest: boolean;
+  request: ModelRequest;
   emittedVisibleEvent: boolean;
   emittedRawModelEvent: boolean;
   providerAdvice?: ModelRetryAdvice;
+  allowUnsafeStreamReplayApproval?: boolean;
+};
+
+type ModelRetryHandlers = {
+  onModelFailureUsage?: (usage: Usage) => void;
+  onModelTimeout?: () => void;
+  onPossiblyAcceptedRequestFailure?: () => void;
+};
+
+type ModelAttemptScope = {
+  request: ModelRequest;
+  cleanup: () => void;
+  normalizeError: (error: unknown) => unknown;
+  timeoutError: () => ModelTimeoutError | undefined;
+  timedOut: () => boolean;
 };
 
 function addFailedRetryAttemptsToUsage(
   usage: Usage,
-  failedRetryAttempts: number,
+  failedUsage: Array<Usage | undefined>,
 ): Usage {
-  if (failedRetryAttempts <= 0) {
+  if (failedUsage.length === 0) {
     return usage;
   }
 
   const inferredEndpoint = usage.requestUsageEntries?.[0]?.endpoint;
-  const requestUsageEntries = [
-    ...Array.from(
-      { length: failedRetryAttempts },
-      () =>
-        new RequestUsage({
-          endpoint: inferredEndpoint,
+  const combinedUsage = new Usage();
+  for (const failedAttemptUsage of failedUsage) {
+    combinedUsage.add(
+      failedAttemptUsage ??
+        new Usage({
+          requests: 1,
+          requestUsageEntries: [
+            new RequestUsage({
+              endpoint: inferredEndpoint,
+            }),
+          ],
         }),
-    ),
-    ...(usage.requestUsageEntries?.map((entry) => new RequestUsage(entry)) ?? [
-      new RequestUsage({
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        totalTokens: usage.totalTokens,
-        inputTokensDetails: usage.inputTokensDetails[0],
-        outputTokensDetails: usage.outputTokensDetails[0],
-        endpoint: inferredEndpoint,
-      }),
-    ]),
-  ];
+    );
+  }
 
-  return new Usage({
-    requests: usage.requests + failedRetryAttempts,
-    inputTokens: usage.inputTokens,
-    outputTokens: usage.outputTokens,
-    totalTokens: usage.totalTokens,
-    inputTokensDetails: usage.inputTokensDetails,
-    outputTokensDetails: usage.outputTokensDetails,
-    requestUsageEntries,
-  });
+  combinedUsage.add(
+    usage.requestUsageEntries?.length
+      ? usage
+      : new Usage({
+          requests: usage.requests,
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          totalTokens: usage.totalTokens,
+          inputTokensDetails: usage.inputTokensDetails,
+          outputTokensDetails: usage.outputTokensDetails,
+          requestUsageEntries: [
+            new RequestUsage({
+              inputTokens: usage.inputTokens,
+              outputTokens: usage.outputTokens,
+              totalTokens: usage.totalTokens,
+              inputTokensDetails: usage.inputTokensDetails[0],
+              outputTokensDetails: usage.outputTokensDetails[0],
+              endpoint: inferredEndpoint,
+            }),
+          ],
+        }),
+  );
+  return combinedUsage;
+}
+
+function combineKnownFailureUsage(
+  failedUsage: Array<Usage | undefined>,
+): Usage | undefined {
+  let combinedUsage: Usage | undefined;
+  for (const usage of failedUsage) {
+    if (!usage) {
+      continue;
+    }
+    combinedUsage ??= new Usage();
+    combinedUsage.add(usage);
+  }
+  return combinedUsage;
+}
+
+function createFailedAttemptUsageTracker(
+  onFailureUsage: ModelRetryHandlers['onModelFailureUsage'],
+) {
+  const failedUsage: Array<Usage | undefined> = [];
+  let pendingUsage: Usage | undefined;
+  const report = (usage: Usage) => {
+    pendingUsage ??= new Usage();
+    pendingUsage.add(usage);
+    // Runner accounting must not depend on a later response being admitted.
+    onFailureUsage?.(usage);
+  };
+  const finishAttempt = () => {
+    failedUsage.push(pendingUsage);
+    pendingUsage = undefined;
+  };
+  const takeKnownUsage = () => {
+    if (pendingUsage) {
+      finishAttempt();
+    }
+    const knownUsage = combineKnownFailureUsage(failedUsage);
+    failedUsage.length = 0;
+    return knownUsage;
+  };
+  return {
+    report,
+    hasAttempts: () => failedUsage.length > 0 || pendingUsage !== undefined,
+    record(error: unknown): void {
+      const usage = consumeModelFailureUsage(error);
+      if (usage) {
+        report(usage);
+      }
+      finishAttempt();
+    },
+    addTo(usage: Usage): Usage {
+      if (pendingUsage) {
+        finishAttempt();
+      }
+      const combinedUsage = addFailedRetryAttemptsToUsage(
+        usage,
+        onFailureUsage
+          ? failedUsage.filter((attemptUsage) => attemptUsage === undefined)
+          : failedUsage,
+      );
+      failedUsage.length = 0;
+      return combinedUsage;
+    },
+    finishFailure(error: unknown): void {
+      const replacementUsage = consumeModelFailureUsage(error);
+      if (replacementUsage) {
+        report(replacementUsage);
+      }
+      const knownUsage = takeKnownUsage();
+      if (knownUsage && !onFailureUsage) {
+        attachModelFailureUsage(error, knownUsage);
+      }
+    },
+    close(): void {
+      failedUsage.length = 0;
+      pendingUsage = undefined;
+    },
+  };
 }
 
 function withRunnerManagedRetry(request: ModelRequest): ModelRequest {
@@ -111,6 +234,116 @@ function shouldDisableProviderManagedRetry(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+export function validateModelTimeoutMs(
+  modelSettings: ModelSettings,
+): number | undefined {
+  const timeoutMs = modelSettings.timeoutMs;
+  if (timeoutMs === undefined) {
+    return undefined;
+  }
+  if (
+    !Number.isFinite(timeoutMs) ||
+    timeoutMs <= 0 ||
+    timeoutMs > MAX_MODEL_TIMEOUT_MS
+  ) {
+    throw new UserError(
+      `modelSettings.timeoutMs must be a positive finite number less than or equal to ${MAX_MODEL_TIMEOUT_MS} when provided.`,
+    );
+  }
+  return timeoutMs;
+}
+
+function createModelTimeoutError(
+  timeoutMs: number,
+  cause?: unknown,
+): ModelTimeoutError {
+  return new ModelTimeoutError({ timeoutMs, cause });
+}
+
+function createModelAttemptScope(
+  request: ModelRequest,
+  timeoutMs: number | undefined,
+): ModelAttemptScope {
+  if (timeoutMs === undefined) {
+    return {
+      request,
+      cleanup: () => {},
+      normalizeError: (error) => error,
+      timeoutError: () => undefined,
+      timedOut: () => false,
+    };
+  }
+
+  const controller = new AbortController();
+  const parentSignal = request.signal;
+  let didTimeOut = false;
+  let timeoutError: ModelTimeoutError | undefined;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+
+  const clearAttemptTimeout = () => {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+      timeout = undefined;
+    }
+  };
+  const detachParentAbort = () => {
+    parentSignal?.removeEventListener('abort', onParentAbort);
+  };
+  const onParentAbort = () => {
+    clearAttemptTimeout();
+    detachParentAbort();
+    controller.abort(parentSignal?.reason);
+  };
+
+  if (parentSignal?.aborted) {
+    onParentAbort();
+  } else {
+    parentSignal?.addEventListener('abort', onParentAbort, { once: true });
+    timeout = setTimeout(() => {
+      didTimeOut = true;
+      timeoutError = createModelTimeoutError(timeoutMs);
+      timeout = undefined;
+      detachParentAbort();
+      controller.abort(timeoutError);
+    }, timeoutMs);
+  }
+
+  const cleanup = () => {
+    clearAttemptTimeout();
+    detachParentAbort();
+  };
+
+  return {
+    request: {
+      ...request,
+      signal: controller.signal,
+    },
+    cleanup,
+    normalizeError: (error) => {
+      if (parentSignal?.aborted) {
+        try {
+          throwAbortError(parentSignal);
+        } catch (parentError) {
+          return parentError;
+        }
+      }
+      if (!didTimeOut) {
+        return error;
+      }
+      if (error === timeoutError) {
+        return error;
+      }
+      return createModelTimeoutError(timeoutMs, error);
+    },
+    timeoutError: () => timeoutError,
+    timedOut: () => didTimeOut,
+  };
+}
+
+function isStatefulRequest(request: ModelRequest): boolean {
+  return Boolean(request.previousResponseId || request.conversationId);
 }
 
 function asError(value: unknown): Error | undefined {
@@ -322,23 +555,109 @@ function normalizeRetryError(
   signal: AbortSignal | undefined,
   providerAdvice?: ModelRetryAdvice,
 ): ModelRetryNormalizedError {
+  const isModelTimeout = error instanceof ModelTimeoutError;
   const headers = extractHeaders(error);
   const normalized: ModelRetryNormalizedError = {
     statusCode: getStatusCode(error),
     retryAfterMs: getRetryAfterMs(headers),
     errorCode: getErrorCode(error),
     isNetworkError: isNetworkLikeError(error),
-    isAbort: Boolean(signal?.aborted) || isAbortLikeError(error),
+    isAbort:
+      !isModelTimeout && (Boolean(signal?.aborted) || isAbortLikeError(error)),
   };
 
   if (providerAdvice?.retryAfterMs !== undefined) {
     normalized.retryAfterMs = providerAdvice.retryAfterMs;
   }
 
+  const providerNormalized = providerAdvice?.normalized;
   return {
     ...normalized,
-    ...(providerAdvice?.normalized ?? {}),
+    ...(providerNormalized ?? {}),
+    // Provider normalization may add abort evidence but cannot clear evidence
+    // inferred from the signal or raw exception.
+    isAbort:
+      !isModelTimeout &&
+      (normalized.isAbort || providerNormalized?.isAbort === true),
   };
+}
+
+function createProviderRetryAuthority(
+  providerAdvice: ModelRetryAdvice | undefined,
+): ProviderRetryAuthority {
+  const replaySafety = providerAdvice?.replaySafety;
+  return Object.freeze({
+    suggested: providerAdvice?.suggested,
+    replaySafety:
+      replaySafety === 'safe' || replaySafety === 'unsafe'
+        ? replaySafety
+        : 'unknown',
+    responseStarted: providerAdvice?.responseStarted,
+  });
+}
+
+function withTimeoutReplayAuthority(
+  providerAdvice: ModelRetryAdvice | undefined,
+  timedOut: boolean,
+): ModelRetryAdvice | undefined {
+  if (!timedOut || providerAdvice?.replaySafety === 'safe') {
+    return providerAdvice;
+  }
+  return {
+    ...providerAdvice,
+    replaySafety: 'unsafe',
+  };
+}
+
+function requestMayHaveBeenAccepted(
+  authority: ProviderRetryAuthority,
+): boolean {
+  return (
+    authority.replaySafety === 'unsafe' || authority.responseStarted === true
+  );
+}
+
+function withProviderRetryAuthority(
+  context: RetryPolicyContext,
+  authority = createProviderRetryAuthority(context.providerAdvice),
+): InternalRetryPolicyContext {
+  const existing = (context as InternalRetryPolicyContext)[
+    providerRetryAuthoritySymbol
+  ];
+  if (existing) {
+    return context as InternalRetryPolicyContext;
+  }
+
+  const internalContext = { ...context } as InternalRetryPolicyContext;
+  Object.defineProperties(internalContext, {
+    replaySafety: {
+      value: authority.replaySafety,
+      enumerable: true,
+    },
+    responseStarted: {
+      value: authority.responseStarted,
+      enumerable: true,
+    },
+    statefulRequest: {
+      value:
+        context.statefulRequest ??
+        Boolean(context.previousResponseId || context.conversationId),
+      enumerable: true,
+    },
+    [providerRetryAuthoritySymbol]: {
+      value: authority,
+    },
+  });
+  return internalContext;
+}
+
+function getProviderRetryAuthority(
+  context: RetryPolicyContext,
+): ProviderRetryAuthority {
+  return (
+    (context as InternalRetryPolicyContext)[providerRetryAuthoritySymbol] ??
+    createProviderRetryAuthority(context.providerAdvice)
+  );
 }
 
 function resolveRetryDecision(decision: RetryDecision): ResolvedRetryDecision {
@@ -365,6 +684,18 @@ function withHardVeto(decision: ResolvedRetryDecision): InternalRetryDecision {
   return markInternalDecision(decision, hardVetoSymbol);
 }
 
+function withDelegableReplayVeto(
+  decision: ResolvedRetryDecision,
+): InternalRetryDecision {
+  const marked = withHardVeto(decision);
+  Object.defineProperty(marked, delegableReplayVetoSymbol, {
+    value: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return marked;
+}
+
 function withReplaySafeApproval(
   decision: ResolvedRetryDecision,
 ): InternalRetryDecision {
@@ -382,6 +713,16 @@ function isHardVeto(
   );
 }
 
+function isDelegableReplayVeto(
+  decision: ResolvedRetryDecision,
+): decision is InternalRetryDecision {
+  return (
+    isHardVeto(decision) &&
+    delegableReplayVetoSymbol in decision &&
+    decision[delegableReplayVetoSymbol] === true
+  );
+}
+
 function isReplaySafeApproval(
   decision: ResolvedRetryDecision,
 ): decision is InternalRetryDecision {
@@ -391,6 +732,42 @@ function isReplaySafeApproval(
     replaySafeApprovalSymbol in decision &&
     decision[replaySafeApprovalSymbol] === true
   );
+}
+
+function withUnsafeReplayApproval(
+  decision: ResolvedRetryDecision,
+  approveUnsafeReplay: boolean,
+): ResolvedRetryDecision {
+  if (!approveUnsafeReplay || decision.approveUnsafeReplay) {
+    return decision;
+  }
+
+  const approved = {
+    ...decision,
+    approveUnsafeReplay: true,
+  };
+  return isReplaySafeApproval(decision)
+    ? withReplaySafeApproval(approved)
+    : approved;
+}
+
+function resolveDelegableReplayVeto(
+  veto: ResolvedRetryDecision,
+  approving: ResolvedRetryDecision,
+): ResolvedRetryDecision {
+  if (!approving.retry || !approving.approveUnsafeReplay) {
+    return veto;
+  }
+
+  const resolved: ResolvedRetryDecision = {
+    retry: true,
+    delayMs: approving.delayMs,
+    reason: approving.reason ?? veto.reason,
+    approveUnsafeReplay: true,
+  };
+  return isReplaySafeApproval(approving)
+    ? withReplaySafeApproval(resolved)
+    : resolved;
 }
 
 function getDefaultDelayMs(
@@ -423,6 +800,59 @@ function throwAbortError(signal: AbortSignal | undefined): never {
   const error = new Error('The operation was aborted.');
   error.name = 'AbortError';
   throw error;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throwAbortError(signal);
+  }
+}
+
+function throwIfTimedModelCallParentAborted(
+  signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): void {
+  if (timeoutMs !== undefined) {
+    throwIfAborted(signal);
+  }
+}
+
+async function awaitWithTimedModelCallParentAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): Promise<T> {
+  if (timeoutMs === undefined || !signal) {
+    return await promise;
+  }
+  if (signal.aborted) {
+    throwAbortError(signal);
+  }
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      try {
+        throwAbortError(signal);
+      } catch (error) {
+        reject(error);
+      }
+    };
+    const cleanup = () => {
+      signal.removeEventListener('abort', onAbort);
+    };
+
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
 }
 
 async function waitForRetryDelay(
@@ -476,10 +906,6 @@ async function getRetryAdvice(
   return await getModelRetryAdvice.call(model, args);
 }
 
-function isStatefulConversationRequest(request: ModelRequest): boolean {
-  return Boolean(request.conversationId || request.previousResponseId);
-}
-
 async function evaluateRetry({
   error,
   attempt,
@@ -488,21 +914,41 @@ async function evaluateRetry({
   retryBackoff,
   signal,
   stream,
-  replayUnsafeRequest,
+  request,
   emittedVisibleEvent,
   emittedRawModelEvent,
   providerAdvice,
+  allowUnsafeStreamReplayApproval,
 }: EvaluateRetryParams): Promise<ResolvedRetryDecision> {
   if (attempt > maxRetries) {
     return { retry: false };
   }
 
   const normalized = normalizeRetryError(error, signal, providerAdvice);
+  const authority = createProviderRetryAuthority(providerAdvice);
+  const context = withProviderRetryAuthority(
+    {
+      error,
+      attempt,
+      maxRetries,
+      stream,
+      providerAdvice,
+      normalized,
+      previousResponseId: request.previousResponseId,
+      conversationId: request.conversationId,
+    },
+    authority,
+  );
+
+  // Aborts and emitted stream events are absolute vetoes. Provider-unsafe
+  // streaming failures also remain blocked before application policy runs.
   if (
     normalized.isAbort ||
     emittedVisibleEvent ||
     emittedRawModelEvent ||
-    providerAdvice?.replaySafety === 'unsafe'
+    (stream &&
+      authority.replaySafety === 'unsafe' &&
+      !allowUnsafeStreamReplayApproval)
   ) {
     return {
       retry: false,
@@ -514,19 +960,31 @@ async function evaluateRetry({
     return { retry: false };
   }
 
-  const context: RetryPolicyContext = {
-    error,
-    attempt,
-    maxRetries,
-    stream,
-    providerAdvice,
-    normalized,
-  };
   const decision = resolveRetryDecision(await retryPolicy(context));
   if (!decision.retry) {
     return decision;
   }
-  if (replayUnsafeRequest && !isReplaySafeApproval(decision)) {
+
+  const statefulRequest = context.statefulRequest === true;
+  const providerMarksReplaySafe = authority.replaySafety === 'safe';
+  const providerMarksReplayUnsafe = authority.replaySafety === 'unsafe';
+  if (
+    statefulRequest &&
+    !(
+      isReplaySafeApproval(decision) ||
+      providerMarksReplaySafe ||
+      (decision.approveUnsafeReplay && providerMarksReplayUnsafe)
+    )
+  ) {
+    return {
+      retry: false,
+      reason: decision.reason ?? providerAdvice?.reason,
+    };
+  }
+  if (
+    providerMarksReplayUnsafe &&
+    !(isReplaySafeApproval(decision) || decision.approveUnsafeReplay)
+  ) {
     return {
       retry: false,
       reason: decision.reason ?? providerAdvice?.reason,
@@ -540,6 +998,7 @@ async function evaluateRetry({
       normalized.retryAfterMs ??
       getDefaultDelayMs(attempt, retryBackoff),
     reason: decision.reason ?? providerAdvice?.reason,
+    approveUnsafeReplay: decision.approveUnsafeReplay,
   };
 }
 
@@ -549,22 +1008,28 @@ export const retryPolicies = {
   },
 
   providerSuggested(): RetryPolicy {
-    return ({ providerAdvice, normalized }) => {
-      if (providerAdvice?.suggested === false) {
-        return withHardVeto({
+    return (inputContext) => {
+      const context = withProviderRetryAuthority(inputContext);
+      const authority = getProviderRetryAuthority(context);
+      const { providerAdvice, normalized } = context;
+      if (authority.suggested === false) {
+        const veto = {
           retry: false,
-          reason: providerAdvice.reason,
-        });
+          reason: providerAdvice?.reason,
+        };
+        return authority.replaySafety === 'unsafe'
+          ? withDelegableReplayVeto(veto)
+          : withHardVeto(veto);
       }
-      if (!providerAdvice?.suggested) {
+      if (authority.suggested !== true) {
         return false;
       }
       const decision = {
         retry: true,
-        delayMs: providerAdvice.retryAfterMs ?? normalized.retryAfterMs,
-        reason: providerAdvice.reason,
+        delayMs: providerAdvice?.retryAfterMs ?? normalized.retryAfterMs,
+        reason: providerAdvice?.reason,
       };
-      return providerAdvice.replaySafety === 'safe'
+      return authority.replaySafety === 'safe'
         ? withReplaySafeApproval(decision)
         : decision;
     };
@@ -593,17 +1058,27 @@ export const retryPolicies = {
   },
 
   any(...policies: RetryPolicy[]): RetryPolicy {
-    return async (context) => {
+    return async (inputContext) => {
+      const context = withProviderRetryAuthority(inputContext);
       let firstRetryDecision: ResolvedRetryDecision | undefined;
       let lastObjectDecision: ResolvedRetryDecision | undefined;
+      let delegableReplayVeto: ResolvedRetryDecision | undefined;
 
       for (const policy of policies) {
         const rawDecision = await policy(context);
         const decision = resolveRetryDecision(rawDecision);
         if (isHardVeto(decision)) {
+          if (isDelegableReplayVeto(decision)) {
+            delegableReplayVeto ??= decision;
+            continue;
+          }
           return decision;
         }
         if (decision.retry) {
+          const approveUnsafeReplay = Boolean(
+            firstRetryDecision?.approveUnsafeReplay ||
+            decision.approveUnsafeReplay,
+          );
           if (
             firstRetryDecision === undefined ||
             (isReplaySafeApproval(decision) &&
@@ -611,11 +1086,20 @@ export const retryPolicies = {
           ) {
             firstRetryDecision = decision;
           }
+          firstRetryDecision = withUnsafeReplayApproval(
+            firstRetryDecision,
+            approveUnsafeReplay,
+          );
           continue;
         }
         if (typeof rawDecision !== 'boolean') {
           lastObjectDecision = decision;
         }
+      }
+      if (delegableReplayVeto) {
+        return firstRetryDecision
+          ? resolveDelegableReplayVeto(delegableReplayVeto, firstRetryDecision)
+          : delegableReplayVeto;
       }
       if (firstRetryDecision) {
         return firstRetryDecision;
@@ -625,15 +1109,21 @@ export const retryPolicies = {
   },
 
   all(...policies: RetryPolicy[]): RetryPolicy {
-    return async (context) => {
+    return async (inputContext) => {
+      const context = withProviderRetryAuthority(inputContext);
       if (policies.length === 0) {
         return false;
       }
 
       let merged: ResolvedRetryDecision = { retry: true };
+      let delegableReplayVeto: ResolvedRetryDecision | undefined;
       for (const policy of policies) {
         const decision = resolveRetryDecision(await policy(context));
         if (isHardVeto(decision)) {
+          if (isDelegableReplayVeto(decision)) {
+            delegableReplayVeto ??= decision;
+            continue;
+          }
           return decision;
         }
         if (!decision.retry) {
@@ -645,9 +1135,15 @@ export const retryPolicies = {
         if (decision.reason !== undefined) {
           merged.reason = decision.reason;
         }
+        if (decision.approveUnsafeReplay) {
+          merged.approveUnsafeReplay = true;
+        }
         if (isReplaySafeApproval(decision)) {
           merged = withReplaySafeApproval(merged);
         }
+      }
+      if (delegableReplayVeto) {
+        return resolveDelegableReplayVeto(delegableReplayVeto, merged);
       }
       return merged;
     };
@@ -657,128 +1153,319 @@ export const retryPolicies = {
 export async function getResponseWithRetry(
   model: Model,
   request: ModelRequest,
+  handlers: ModelRetryHandlers = {},
 ): Promise<ModelResponse> {
   const maxRetries = request.modelSettings.retry?.maxRetries ?? 0;
   const retryPolicy = request.modelSettings.retry?.policy;
   const retryBackoff = request.modelSettings.retry?.backoff;
+  const timeoutMs = validateModelTimeoutMs(request.modelSettings);
 
+  const failedAttemptUsage = createFailedAttemptUsageTracker(
+    handlers.onModelFailureUsage,
+  );
   let attempt = 1;
-  const replayUnsafeRequest = isStatefulConversationRequest(request);
-  while (true) {
-    const requestForAttempt = shouldDisableProviderManagedRetry(
-      request,
-      attempt,
-    )
-      ? withRunnerManagedRetry(request)
-      : request;
-    try {
-      const response = await model.getResponse(requestForAttempt);
-      if (attempt === 1) {
-        return response;
-      }
-      return {
-        ...response,
-        usage: addFailedRetryAttemptsToUsage(response.usage, attempt - 1),
-      };
-    } catch (error) {
-      const providerAdvice = await getRetryAdvice(model, {
+  try {
+    while (true) {
+      const requestForAttempt = shouldDisableProviderManagedRetry(
         request,
-        error,
-        stream: false,
         attempt,
-      });
-      const decision = await evaluateRetry({
-        error,
-        attempt,
-        maxRetries,
-        retryPolicy,
-        retryBackoff,
-        signal: request.signal,
-        stream: false,
-        replayUnsafeRequest,
-        emittedVisibleEvent: false,
-        emittedRawModelEvent: false,
-        providerAdvice,
-      });
+      )
+        ? withRunnerManagedRetry(request)
+        : request;
+      const attemptScope = createModelAttemptScope(
+        requestForAttempt,
+        timeoutMs,
+      );
+      const usageScope = createModelFailureUsageScope(
+        attemptScope.request,
+        failedAttemptUsage.report,
+      );
+      try {
+        const response = await model.getResponse(usageScope.request);
+        throwIfTimedModelCallParentAborted(request.signal, timeoutMs);
+        if (attemptScope.timedOut()) {
+          throw (
+            attemptScope.timeoutError() ?? createModelTimeoutError(timeoutMs!)
+          );
+        }
+        if (!failedAttemptUsage.hasAttempts()) {
+          return response;
+        }
+        return {
+          ...response,
+          usage: failedAttemptUsage.addTo(response.usage),
+        };
+      } catch (caughtError) {
+        failedAttemptUsage.record(caughtError);
+        attemptScope.cleanup();
+        const error = attemptScope.normalizeError(caughtError);
+        let providerAdvice: ModelRetryAdvice | undefined;
+        try {
+          providerAdvice = await awaitWithTimedModelCallParentAbort(
+            getRetryAdvice(model, {
+              request,
+              error: caughtError,
+              stream: false,
+              attempt,
+            }),
+            request.signal,
+            timeoutMs,
+          );
+        } catch (retryAdviceError) {
+          if (attemptScope.timedOut() && isStatefulRequest(request)) {
+            handlers.onPossiblyAcceptedRequestFailure?.();
+          }
+          throwIfTimedModelCallParentAborted(request.signal, timeoutMs);
+          throw retryAdviceError;
+        }
+        providerAdvice = withTimeoutReplayAuthority(
+          providerAdvice,
+          attemptScope.timedOut(),
+        );
+        const authority = createProviderRetryAuthority(providerAdvice);
+        const markPossiblyAcceptedFailure = () => {
+          if (
+            requestMayHaveBeenAccepted(authority) ||
+            (attemptScope.timedOut() &&
+              isStatefulRequest(request) &&
+              authority.replaySafety !== 'safe')
+          ) {
+            handlers.onPossiblyAcceptedRequestFailure?.();
+          }
+        };
+        const throwIfParentAbortedAfterTimedFailure = () => {
+          if (timeoutMs !== undefined && request.signal?.aborted) {
+            markPossiblyAcceptedFailure();
+            throwAbortError(request.signal);
+          }
+        };
+        throwIfParentAbortedAfterTimedFailure();
+        let decision: ResolvedRetryDecision;
+        try {
+          decision = await awaitWithTimedModelCallParentAbort(
+            evaluateRetry({
+              error,
+              attempt,
+              maxRetries,
+              retryPolicy,
+              retryBackoff,
+              signal: request.signal,
+              stream: false,
+              request,
+              emittedVisibleEvent: false,
+              emittedRawModelEvent: false,
+              providerAdvice,
+            }),
+            request.signal,
+            timeoutMs,
+          );
+        } catch (retryError) {
+          markPossiblyAcceptedFailure();
+          throwIfTimedModelCallParentAborted(request.signal, timeoutMs);
+          throw retryError;
+        }
+        throwIfParentAbortedAfterTimedFailure();
 
-      if (!decision.retry) {
-        throw error;
+        if (!decision.retry) {
+          markPossiblyAcceptedFailure();
+          throw error;
+        }
+
+        try {
+          await waitForRetryDelay(request.signal, decision.delayMs ?? 0);
+        } catch (retryDelayError) {
+          markPossiblyAcceptedFailure();
+          throw retryDelayError;
+        }
+        attempt += 1;
+      } finally {
+        usageScope.close();
+        attemptScope.cleanup();
       }
-
-      await waitForRetryDelay(request.signal, decision.delayMs ?? 0);
-      attempt += 1;
     }
+  } catch (error) {
+    failedAttemptUsage.finishFailure(error);
+    throw error;
+  } finally {
+    failedAttemptUsage.close();
   }
 }
 
 export async function* getStreamedResponseWithRetry(
   model: Model,
   request: ModelRequest,
+  handlers: ModelRetryHandlers = {},
 ): AsyncIterable<StreamEvent> {
   const maxRetries = request.modelSettings.retry?.maxRetries ?? 0;
   const retryPolicy = request.modelSettings.retry?.policy;
   const retryBackoff = request.modelSettings.retry?.backoff;
+  const timeoutMs = validateModelTimeoutMs(request.modelSettings);
 
+  const failedAttemptUsage = createFailedAttemptUsageTracker(
+    handlers.onModelFailureUsage,
+  );
   let attempt = 1;
-  const replayUnsafeRequest = isStatefulConversationRequest(request);
-  while (true) {
-    let emittedVisibleEvent = false;
-    let emittedRawModelEvent = false;
-    const requestForAttempt = shouldDisableProviderManagedRetry(
-      request,
-      attempt,
-    )
-      ? withRunnerManagedRetry(request)
-      : request;
-    try {
-      for await (const event of model.getStreamedResponse(requestForAttempt)) {
-        if (event.type === 'model') {
-          emittedRawModelEvent = true;
-        }
-        emittedVisibleEvent = true;
-        if (event.type === 'response_done' && attempt > 1) {
-          yield {
-            ...event,
-            response: {
-              ...event.response,
-              usage: addFailedRetryAttemptsToUsage(
-                new Usage(event.response.usage),
-                attempt - 1,
-              ),
-            },
-          };
-          continue;
-        }
-        yield event;
-      }
-      return;
-    } catch (error) {
-      const providerAdvice = await getRetryAdvice(model, {
+  try {
+    while (true) {
+      let emittedVisibleEvent = false;
+      let emittedRawModelEvent = false;
+      const requestForAttempt = shouldDisableProviderManagedRetry(
         request,
-        error,
-        stream: true,
         attempt,
-      });
-      const decision = await evaluateRetry({
-        error,
-        attempt,
-        maxRetries,
-        retryPolicy,
-        retryBackoff,
-        signal: request.signal,
-        stream: true,
-        replayUnsafeRequest,
-        emittedVisibleEvent,
-        emittedRawModelEvent,
-        providerAdvice,
-      });
+      )
+        ? withRunnerManagedRetry(request)
+        : request;
+      const attemptScope = createModelAttemptScope(
+        requestForAttempt,
+        timeoutMs,
+      );
+      const usageScope = createModelFailureUsageScope(
+        attemptScope.request,
+        failedAttemptUsage.report,
+      );
+      try {
+        for await (const event of model.getStreamedResponse(
+          usageScope.request,
+        )) {
+          throwIfTimedModelCallParentAborted(request.signal, timeoutMs);
+          if (attemptScope.timedOut()) {
+            throw (
+              attemptScope.timeoutError() ?? createModelTimeoutError(timeoutMs!)
+            );
+          }
+          if (event.type === 'model') {
+            emittedRawModelEvent = true;
+          }
+          emittedVisibleEvent = true;
+          if (event.type === 'response_done') {
+            attemptScope.cleanup();
+          }
+          if (
+            event.type === 'response_done' &&
+            failedAttemptUsage.hasAttempts()
+          ) {
+            yield {
+              ...event,
+              response: {
+                ...event.response,
+                usage: failedAttemptUsage.addTo(
+                  new Usage(event.response.usage),
+                ),
+              },
+            };
+            continue;
+          }
+          yield event;
+        }
+        throwIfTimedModelCallParentAborted(request.signal, timeoutMs);
+        if (attemptScope.timedOut()) {
+          throw (
+            attemptScope.timeoutError() ?? createModelTimeoutError(timeoutMs!)
+          );
+        }
+        return;
+      } catch (caughtError) {
+        failedAttemptUsage.record(caughtError);
+        attemptScope.cleanup();
+        const error = attemptScope.normalizeError(caughtError);
+        const markTimedOutFailure = () => {
+          if (attemptScope.timedOut()) {
+            handlers.onModelTimeout?.();
+          }
+        };
+        let providerAdvice: ModelRetryAdvice | undefined;
+        try {
+          providerAdvice = await awaitWithTimedModelCallParentAbort(
+            getRetryAdvice(model, {
+              request,
+              error: caughtError,
+              stream: true,
+              attempt,
+            }),
+            request.signal,
+            timeoutMs,
+          );
+        } catch (retryAdviceError) {
+          markTimedOutFailure();
+          if (attemptScope.timedOut() && isStatefulRequest(request)) {
+            handlers.onPossiblyAcceptedRequestFailure?.();
+          }
+          throwIfTimedModelCallParentAborted(request.signal, timeoutMs);
+          throw retryAdviceError;
+        }
+        providerAdvice = withTimeoutReplayAuthority(
+          providerAdvice,
+          attemptScope.timedOut(),
+        );
+        const authority = createProviderRetryAuthority(providerAdvice);
+        const markPossiblyAcceptedFailure = () => {
+          if (
+            requestMayHaveBeenAccepted(authority) ||
+            (attemptScope.timedOut() &&
+              isStatefulRequest(request) &&
+              authority.replaySafety !== 'safe')
+          ) {
+            handlers.onPossiblyAcceptedRequestFailure?.();
+          }
+        };
+        const throwIfParentAbortedAfterTimedFailure = () => {
+          if (timeoutMs !== undefined && request.signal?.aborted) {
+            markPossiblyAcceptedFailure();
+            throwAbortError(request.signal);
+          }
+        };
+        throwIfParentAbortedAfterTimedFailure();
+        let decision: ResolvedRetryDecision;
+        try {
+          decision = await awaitWithTimedModelCallParentAbort(
+            evaluateRetry({
+              error,
+              attempt,
+              maxRetries,
+              retryPolicy,
+              retryBackoff,
+              signal: request.signal,
+              stream: true,
+              request,
+              emittedVisibleEvent,
+              emittedRawModelEvent,
+              providerAdvice,
+              allowUnsafeStreamReplayApproval: attemptScope.timedOut(),
+            }),
+            request.signal,
+            timeoutMs,
+          );
+        } catch (retryError) {
+          markTimedOutFailure();
+          markPossiblyAcceptedFailure();
+          throwIfTimedModelCallParentAborted(request.signal, timeoutMs);
+          throw retryError;
+        }
+        throwIfParentAbortedAfterTimedFailure();
 
-      if (!decision.retry) {
-        throw error;
+        if (!decision.retry) {
+          markTimedOutFailure();
+          markPossiblyAcceptedFailure();
+          throw error;
+        }
+
+        try {
+          await waitForRetryDelay(request.signal, decision.delayMs ?? 0);
+        } catch (retryDelayError) {
+          markTimedOutFailure();
+          markPossiblyAcceptedFailure();
+          throw retryDelayError;
+        }
+        attempt += 1;
+      } finally {
+        usageScope.close();
+        attemptScope.cleanup();
       }
-
-      await waitForRetryDelay(request.signal, decision.delayMs ?? 0);
-      attempt += 1;
     }
+  } catch (error) {
+    failedAttemptUsage.finishFailure(error);
+    throw error;
+  } finally {
+    failedAttemptUsage.close();
   }
 }

@@ -60,10 +60,18 @@ export type RealtimeInputAudioNoiseReductionConfig = {
 };
 
 export type RealtimeInputAudioTranscriptionConfig = {
+  delay?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  keywords?: string[];
   language?: string;
+  languages?: string[];
   model?:
+    | 'gpt-transcribe'
+    | 'gpt-live-transcribe'
     | 'gpt-4o-transcribe'
     | 'gpt-4o-mini-transcribe'
+    | 'gpt-4o-mini-transcribe-2025-12-15'
+    | 'gpt-4o-transcribe-diarize'
+    | 'gpt-realtime-whisper'
     | 'whisper-1'
     | (string & {});
   prompt?: string;
@@ -277,8 +285,17 @@ export function normalizeAudioFormat(
   format?: RealtimeAudioFormat | undefined,
 ): RealtimeAudioFormatDefinition | undefined {
   if (!format) return undefined;
-  if (typeof format === 'object')
+  if (typeof format === 'object') {
+    if (
+      format.type === 'audio/pcm' &&
+      typeof format.rate === 'number' &&
+      !Number.isFinite(format.rate)
+    ) {
+      return { type: 'audio/pcm', rate: 24000 };
+    }
+
     return format as RealtimeAudioFormatDefinition;
+  }
   const f = String(format);
   if (f === 'pcm16') return { type: 'audio/pcm', rate: 24000 };
   if (f === 'g711_ulaw') return { type: 'audio/pcmu' };

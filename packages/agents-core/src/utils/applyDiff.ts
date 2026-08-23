@@ -99,16 +99,22 @@ function parseUpdateDiff(
   let cursor = 0;
 
   while (!isDone(parser, END_SECTION_MARKERS)) {
-    const anchor = readStr(parser, '@@ ');
-    const hasBareAnchor = !anchor && parser.lines[parser.index] === '@@';
-    if (hasBareAnchor) parser.index += 1;
+    const { anchors, anchorCount } = readAnchors(parser);
 
-    if (!(anchor || hasBareAnchor || cursor === 0)) {
+    if (!(anchorCount > 0 || cursor === 0)) {
       throw new Error(`Invalid Line:\n${parser.lines[parser.index]}`);
     }
 
-    if (anchor.trim()) {
-      cursor = advanceCursorToAnchor(anchor, inputLines, cursor, parser);
+    const requireAnchorMatch = anchorCount > 1;
+    for (const [index, anchor] of anchors.entries()) {
+      cursor = advanceCursorToAnchor(
+        anchor,
+        inputLines,
+        cursor,
+        parser,
+        requireAnchorMatch,
+        index > 0,
+      );
     }
 
     const { nextContext, sectionChunks, endIndex, eof } = readSection(
@@ -142,15 +148,47 @@ function parseUpdateDiff(
   return { chunks, fuzz: parser.fuzz };
 }
 
+function readAnchors(parser: ParserState): {
+  anchors: string[];
+  anchorCount: number;
+} {
+  const anchors: string[] = [];
+  let anchorCount = 0;
+
+  while (true) {
+    const startIndex = parser.index;
+    const anchor = readStr(parser, '@@ ');
+    let consumed = parser.index !== startIndex;
+
+    if (!consumed && parser.lines[parser.index] === '@@') {
+      parser.index += 1;
+      consumed = true;
+    }
+
+    if (!consumed) break;
+    anchorCount += 1;
+    if (anchor.trim()) anchors.push(anchor);
+  }
+
+  return { anchors, anchorCount };
+}
+
 function advanceCursorToAnchor(
   anchor: string,
   inputLines: string[],
   cursor: number,
   parser: ParserState,
+  requireMatch = false,
+  forceForwardSearch = false,
 ): number {
   let found = false;
+  const hasExactMatchBeforeCursor =
+    !forceForwardSearch &&
+    inputLines.slice(0, cursor).some((line) => line === anchor);
 
-  if (!inputLines.slice(0, cursor).some((s) => s === anchor)) {
+  if (hasExactMatchBeforeCursor) {
+    found = true;
+  } else {
     for (let i = cursor; i < inputLines.length; i += 1) {
       if (inputLines[i] === anchor) {
         cursor = i + 1;
@@ -160,18 +198,27 @@ function advanceCursorToAnchor(
     }
   }
 
-  if (
-    !found &&
-    !inputLines.slice(0, cursor).some((s) => s.trim() === anchor.trim())
-  ) {
-    for (let i = cursor; i < inputLines.length; i += 1) {
-      if (inputLines[i].trim() === anchor.trim()) {
-        cursor = i + 1;
-        parser.fuzz += 1;
-        found = true;
-        break;
+  if (!found) {
+    const hasTrimmedMatchBeforeCursor =
+      !forceForwardSearch &&
+      inputLines.slice(0, cursor).some((line) => line.trim() === anchor.trim());
+
+    if (hasTrimmedMatchBeforeCursor) {
+      found = true;
+    } else {
+      for (let i = cursor; i < inputLines.length; i += 1) {
+        if (inputLines[i].trim() === anchor.trim()) {
+          cursor = i + 1;
+          parser.fuzz += 1;
+          found = true;
+          break;
+        }
       }
     }
+  }
+
+  if (requireMatch && !found) {
+    throw new Error(`Invalid Anchor ${cursor}:\n${anchor}`);
   }
 
   return cursor;

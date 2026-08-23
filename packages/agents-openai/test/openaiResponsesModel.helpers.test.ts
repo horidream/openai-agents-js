@@ -860,6 +860,51 @@ describe('getInputItems', () => {
     expect(items.some((entry) => entry.type === 'reasoning')).toBe(true);
   });
 
+  it('serializes apply_patch update move destinations for Responses input', () => {
+    const [item, inPlaceItem] = getInputItems([
+      {
+        type: 'apply_patch_call',
+        id: 'ap-move',
+        callId: 'p-move',
+        status: 'completed',
+        operation: {
+          type: 'update_file',
+          path: 'old.txt',
+          diff: '@@\n-old\n+new\n',
+          moveTo: 'renamed/new.txt',
+        },
+      },
+      {
+        type: 'apply_patch_call',
+        id: 'ap-in-place',
+        callId: 'p-in-place',
+        status: 'completed',
+        operation: {
+          type: 'update_file',
+          path: 'keep.txt',
+          diff: '@@\n-old\n+new\n',
+        },
+      },
+    ] as any);
+
+    expect(item).toMatchObject({
+      type: 'apply_patch_call',
+      call_id: 'p-move',
+      operation: {
+        type: 'update_file',
+        path: 'old.txt',
+        diff: '@@\n-old\n+new\n',
+        move_to: 'renamed/new.txt',
+      },
+    });
+    expect((item as any).operation).not.toHaveProperty('moveTo');
+    expect((inPlaceItem as any).operation).toEqual({
+      type: 'update_file',
+      path: 'keep.txt',
+      diff: '@@\n-old\n+new\n',
+    });
+  });
+
   it('preserves replay-only Responses fields when rebuilding input items', () => {
     const items = getInputItems([
       {
@@ -1167,7 +1212,7 @@ describe('getInputItems', () => {
     });
   });
 
-  it('preserves official tool search metadata when replaying tool search outputs', () => {
+  it('strips output-only created_by when replaying tool search outputs', () => {
     const items = getInputItems([
       {
         type: 'tool_search_output',
@@ -1189,7 +1234,33 @@ describe('getInputItems', () => {
       tools: [],
       call_id: 'call_ts_1',
       execution: 'client',
-      created_by: 'assistant',
+    });
+  });
+
+  it('strips output-only created_by after expanding provider data', () => {
+    const items = getInputItems([
+      {
+        type: 'function_call',
+        id: 'fc_created_by',
+        callId: 'call_created_by',
+        name: 'lookup',
+        arguments: '{}',
+        status: 'completed',
+        providerData: {
+          created_by: 'assistant',
+          retained: 'provider metadata',
+        },
+      },
+    ] as any);
+
+    expect(items[0]).toEqual({
+      type: 'function_call',
+      id: 'fc_created_by',
+      call_id: 'call_created_by',
+      name: 'lookup',
+      arguments: '{}',
+      status: 'completed',
+      retained: 'provider metadata',
     });
   });
 
@@ -2973,4 +3044,141 @@ describe('convertToOutputItem', () => {
       output: 'conflict',
     });
   });
+
+  it('preserves apply_patch update move destinations from Responses output', () => {
+    const [output] = convertToOutputItem([
+      {
+        type: 'apply_patch_call',
+        id: 'ap-move',
+        call_id: 'p-move',
+        status: 'in_progress',
+        operation: {
+          type: 'update_file',
+          path: 'old.txt',
+          diff: '@@\n-old\n+new\n',
+          move_to: 'renamed/new.txt',
+        },
+      } as any,
+    ]);
+
+    expect(output).toMatchObject({
+      type: 'apply_patch_call',
+      callId: 'p-move',
+      operation: {
+        type: 'update_file',
+        path: 'old.txt',
+        diff: '@@\n-old\n+new\n',
+        moveTo: 'renamed/new.txt',
+      },
+    });
+  });
+
+  it.each([undefined, null])(
+    'keeps apply_patch updates in place when move_to is %s',
+    (moveTo) => {
+      const operation = {
+        type: 'update_file',
+        path: 'keep.txt',
+        diff: '@@\n-old\n+new\n',
+        ...(moveTo !== undefined ? { move_to: moveTo } : {}),
+      };
+      const [output] = convertToOutputItem([
+        {
+          type: 'apply_patch_call',
+          id: 'ap-in-place',
+          call_id: 'p-in-place',
+          status: 'in_progress',
+          operation,
+        } as any,
+      ]);
+
+      expect((output as any).operation).toEqual({
+        type: 'update_file',
+        path: 'keep.txt',
+        diff: '@@\n-old\n+new\n',
+      });
+    },
+  );
+
+  it.each([5, ''])(
+    'rejects malformed apply_patch move destinations: %j',
+    (moveTo) => {
+      expect(() =>
+        convertToOutputItem([
+          {
+            type: 'apply_patch_call',
+            id: 'ap-invalid-move',
+            call_id: 'p-invalid-move',
+            status: 'in_progress',
+            operation: {
+              type: 'update_file',
+              path: 'old.txt',
+              diff: '@@\n-old\n+new\n',
+              move_to: moveTo,
+            },
+          } as any,
+        ]),
+      ).toThrowError(
+        'apply_patch_call update_file move_to must be a non-empty string',
+      );
+    },
+  );
+
+  it.each([
+    [
+      'camelCase moveTo on update_file',
+      {
+        type: 'update_file',
+        path: 'old.txt',
+        diff: '@@\n-old\n+new\n',
+        moveTo: 'unsupported.txt',
+      },
+      {
+        type: 'update_file',
+        path: 'old.txt',
+        diff: '@@\n-old\n+new\n',
+      },
+    ],
+    [
+      'move_to on create_file',
+      {
+        type: 'create_file',
+        path: 'created.txt',
+        diff: '+created\n',
+        move_to: 'unsupported.txt',
+      },
+      {
+        type: 'create_file',
+        path: 'created.txt',
+        diff: '+created\n',
+      },
+    ],
+    [
+      'move_to on delete_file',
+      {
+        type: 'delete_file',
+        path: 'deleted.txt',
+        move_to: 'unsupported.txt',
+      },
+      {
+        type: 'delete_file',
+        path: 'deleted.txt',
+      },
+    ],
+  ])(
+    'ignores unsupported apply_patch destinations: %s',
+    (_, operation, expected) => {
+      const [output] = convertToOutputItem([
+        {
+          type: 'apply_patch_call',
+          id: 'ap-unsupported-move',
+          call_id: 'p-unsupported-move',
+          status: 'in_progress',
+          operation,
+        } as any,
+      ]);
+
+      expect((output as any).operation).toEqual(expected);
+    },
+  );
 });

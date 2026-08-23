@@ -1,9 +1,15 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   Agent,
+  ModelBehaviorError,
   Runner,
+  Span,
+  Trace,
+  setTraceProcessors,
   withTrace,
   setTracingDisabled,
+  type RetryPolicyContext,
+  type TracingProcessor,
 } from '@openai/agents-core';
 import { OpenAIChatCompletionsModel } from '../src/openaiChatCompletionsModel';
 import { HEADERS } from '../src/defaults';
@@ -34,10 +40,83 @@ class FakeClient {
   baseURL = 'base';
 }
 
+class RecordingProcessor implements TracingProcessor {
+  readonly spansEnded: Span<any>[] = [];
+
+  async onTraceStart(_trace: Trace): Promise<void> {}
+  async onTraceEnd(_trace: Trace): Promise<void> {}
+  async onSpanStart(_span: Span<any>): Promise<void> {}
+  async onSpanEnd(span: Span<any>): Promise<void> {
+    this.spansEnded.push(span);
+  }
+  async shutdown(): Promise<void> {}
+  async forceFlush(): Promise<void> {}
+}
+
+type ChatCompletionsRequestMode = 'non-streaming' | 'streaming';
+
+async function callModel(
+  model: OpenAIChatCompletionsModel,
+  request: any,
+  mode: ChatCompletionsRequestMode,
+): Promise<void> {
+  if (mode === 'non-streaming') {
+    await withTrace('test', () => model.getResponse(request));
+    return;
+  }
+
+  await withTrace('test', async () => {
+    for await (const event of model.getStreamedResponse(request)) {
+      void event;
+    }
+  });
+}
+
+const parallelToolCallRequestCases = (
+  ['non-streaming', 'streaming'] as const
+).flatMap((mode) =>
+  (['none', 'function', 'handoff'] as const).flatMap((toolSource) =>
+    ([true, false, undefined] as const).map((parallelToolCalls) => ({
+      mode,
+      toolSource,
+      parallelToolCalls,
+    })),
+  ),
+);
+
+const functionTool = {
+  type: 'function',
+  name: 'lookup',
+  description: 'Look up a record.',
+  parameters: {
+    type: 'object',
+    properties: {},
+    required: [],
+    additionalProperties: false,
+  },
+  strict: true,
+};
+
+const handoffTool = {
+  toolName: 'transfer_to_specialist',
+  toolDescription: 'Transfer to a specialist.',
+  inputJsonSchema: {
+    type: 'object',
+    properties: {},
+    required: [],
+    additionalProperties: false,
+  },
+};
+
 describe('OpenAIChatCompletionsModel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     setTracingDisabled(true);
+  });
+
+  afterEach(() => {
+    setTracingDisabled(true);
+    setTraceProcessors([]);
   });
 
   it('handles text message output', async () => {
@@ -83,6 +162,149 @@ describe('OpenAIChatCompletionsModel', () => {
         ],
       },
     ]);
+    expect(result.rawUsage).toBeUndefined();
+    expect(result.requestId).toBeUndefined();
+  });
+
+  it('propagates the request ID in a non-streamed response', async () => {
+    const client = new FakeClient();
+    const response = {
+      id: 'r',
+      choices: [{ message: { content: 'hi' } }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    } as any;
+    Object.defineProperty(response, '_request_id', {
+      value: 'req_nonstreamed_123',
+      enumerable: false,
+    });
+    client.chat.completions.create.mockResolvedValue(response);
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    const req: any = {
+      input: 'u',
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+    };
+
+    const result = await withTrace('t', () => model.getResponse(req));
+
+    expect(result.requestId).toBe('req_nonstreamed_123');
+    expect(result.providerData).toBe(response);
+  });
+
+  it('preserves raw usage field presence before normalization when enabled', async () => {
+    const client = new FakeClient();
+    const response = {
+      id: 'r',
+      choices: [{ message: { content: 'hi' } }],
+      usage: {
+        prompt_tokens: 3,
+        completion_tokens: 2,
+        total_tokens: 5,
+        prompt_tokens_details: {
+          cached_tokens: 0,
+          provider_metric: null,
+        },
+      },
+    } as any;
+    client.chat.completions.create.mockResolvedValue(response);
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    const result = await withTrace('t', () =>
+      model.getResponse({
+        input: 'u',
+        modelSettings: { preserveRawUsage: true },
+        tools: [],
+        outputType: 'text',
+        handoffs: [],
+        tracing: false,
+      } as any),
+    );
+
+    response.usage.prompt_tokens_details.cached_tokens = 9;
+
+    expect(result.rawUsage).toEqual({
+      prompt_tokens: 3,
+      completion_tokens: 2,
+      total_tokens: 5,
+      prompt_tokens_details: {
+        cached_tokens: 0,
+        provider_metric: null,
+      },
+    });
+    expect(result.rawUsage?.prompt_tokens_details).not.toHaveProperty(
+      'cache_write_tokens',
+    );
+    expect(result.usage.inputTokensDetails).toEqual([{ cached_tokens: 0 }]);
+  });
+
+  it('captures raw and normalized usage before tracing processors can mutate it', async () => {
+    const client = new FakeClient();
+    client.chat.completions.create.mockResolvedValue({
+      id: 'r',
+      choices: [{ message: { content: 'hi' } }],
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+    } as any);
+    const processor = new RecordingProcessor();
+    processor.onSpanEnd = async (span) => {
+      const response = span.spanData.output?.[0] as any;
+      if (response?.usage) {
+        response.usage.prompt_tokens = 99;
+      }
+      processor.spansEnded.push(span);
+    };
+    setTracingDisabled(false);
+    setTraceProcessors([processor]);
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    const result = await withTrace('t', () =>
+      model.getResponse({
+        input: 'u',
+        modelSettings: { preserveRawUsage: true },
+        tools: [],
+        outputType: 'text',
+        handoffs: [],
+        tracing: true,
+      } as any),
+    );
+
+    expect(result.rawUsage).toEqual({
+      prompt_tokens: 3,
+      completion_tokens: 2,
+      total_tokens: 5,
+    });
+    expect(result.usage.inputTokens).toBe(3);
+    const generationSpan = processor.spansEnded.find(
+      (span) => span.spanData.type === 'generation',
+    );
+    expect(generationSpan?.spanData.usage).toBeUndefined();
+  });
+
+  it('counts the request when the provider omits usage', async () => {
+    const client = new FakeClient();
+    client.chat.completions.create.mockResolvedValue({
+      id: 'r',
+      choices: [{ message: { content: 'hi' } }],
+    } as any);
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    const result = await withTrace('t', () =>
+      model.getResponse({
+        input: 'u',
+        modelSettings: { preserveRawUsage: true },
+        tools: [],
+        outputType: 'text',
+        handoffs: [],
+        tracing: false,
+      } as any),
+    );
+
+    expect(result.rawUsage).toBeUndefined();
+    expect(result.usage.requests).toBe(1);
+    expect(result.usage.totalTokens).toBe(0);
   });
 
   it('sends placeholder for non-text-only tool output by default', async () => {
@@ -472,6 +694,433 @@ describe('OpenAIChatCompletionsModel', () => {
     ]);
   });
 
+  it.each([null, ''])(
+    'rejects a truncated empty message (content: %j)',
+    async (content) => {
+      const client = new FakeClient();
+      client.chat.completions.create.mockResolvedValue({
+        id: 'truncated-response',
+        choices: [
+          {
+            finish_reason: 'length',
+            message: { role: 'assistant', content },
+          },
+        ],
+        usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+      } as any);
+
+      const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+      await expect(
+        withTrace('truncated-empty', () =>
+          model.getResponse({
+            input: 'u',
+            modelSettings: {},
+            tools: [],
+            outputType: 'text',
+            handoffs: [],
+            tracing: false,
+          } as any),
+        ),
+      ).rejects.toThrow(ModelBehaviorError);
+    },
+  );
+
+  it.each([
+    ['text', { role: 'assistant', content: 'partial' }],
+    ['whitespace text', { role: 'assistant', content: ' ' }],
+    [
+      'refusal',
+      { role: 'assistant', content: null, refusal: 'provider refusal' },
+    ],
+    ['audio', { role: 'assistant', content: null, audio: { data: 'abc' } }],
+    [
+      'reasoning',
+      { role: 'assistant', content: null, reasoning: 'partial reasoning' },
+    ],
+    [
+      'function call',
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          {
+            id: 'call-1',
+            type: 'function',
+            function: { name: 'lookup', arguments: '{}' },
+          },
+        ],
+      },
+    ],
+  ])('preserves truncated output containing %s', async (_label, message) => {
+    const client = new FakeClient();
+    const response = {
+      id: 'partial-response',
+      choices: [{ finish_reason: 'length', message }],
+      usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+    } as any;
+    Object.defineProperty(response, '_request_id', {
+      value: 'req_partial_123',
+      enumerable: false,
+    });
+    client.chat.completions.create.mockResolvedValue(response);
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    const result = await withTrace('truncated-partial', () =>
+      model.getResponse({
+        input: 'u',
+        modelSettings: { preserveRawUsage: true },
+        tools: [],
+        outputType: 'text',
+        handoffs: [],
+        tracing: false,
+      } as any),
+    );
+
+    expect(result.output).toHaveLength(1);
+    expect(result.providerData).toBe(response);
+    expect(result.requestId).toBe('req_partial_123');
+    expect(result.rawUsage).toEqual({
+      prompt_tokens: 3,
+      completion_tokens: 4,
+      total_tokens: 7,
+    });
+  });
+
+  it('records response, usage, and error evidence for a truncated empty message', async () => {
+    const processor = new RecordingProcessor();
+    setTraceProcessors([processor]);
+    setTracingDisabled(false);
+
+    const client = new FakeClient();
+    const response = {
+      id: 'truncated-response',
+      choices: [
+        {
+          finish_reason: 'length',
+          message: { role: 'assistant', content: null },
+        },
+      ],
+      usage: {
+        prompt_tokens: 11,
+        completion_tokens: 7,
+        total_tokens: 18,
+        prompt_tokens_details: { cached_tokens: 2 },
+        completion_tokens_details: { reasoning_tokens: 6 },
+      },
+    } as any;
+    client.chat.completions.create.mockResolvedValue(response);
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    const error = await withTrace('truncated-empty-trace', () =>
+      model.getResponse({
+        input: 'u',
+        modelSettings: {},
+        tools: [],
+        outputType: 'text',
+        handoffs: [],
+        tracing: true,
+      } as any),
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ModelBehaviorError);
+    expect(error).toMatchObject({
+      unsafeToReplay: true,
+      responseStarted: true,
+    });
+    const generationSpan = processor.spansEnded.find(
+      (span) => span.spanData.type === 'generation',
+    );
+    expect(generationSpan?.spanData.output).toEqual([response]);
+    expect(generationSpan?.spanData.usage).toEqual({
+      requests: 1,
+      input_tokens: 11,
+      output_tokens: 7,
+      total_tokens: 18,
+      input_tokens_details: { cached_tokens: 2 },
+      output_tokens_details: { reasoning_tokens: 6 },
+    });
+    expect(generationSpan?.error?.message).toContain("finish_reason='length'");
+  });
+
+  it.each([
+    [
+      'reported',
+      { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 },
+      { requests: 1, input_tokens: 11, output_tokens: 7, total_tokens: 18 },
+    ],
+    [
+      'omitted',
+      undefined,
+      { requests: 1, input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    ],
+  ])(
+    'vetoes replay and records task and turn usage when usage is %s',
+    async (_label, usage, expectedUsage) => {
+      const processor = new RecordingProcessor();
+      setTraceProcessors([processor]);
+      setTracingDisabled(false);
+
+      const client = new FakeClient();
+      client.chat.completions.create.mockResolvedValue({
+        id: 'truncated-response',
+        choices: [
+          {
+            finish_reason: 'length',
+            message: { role: 'assistant', content: null },
+          },
+        ],
+        usage,
+      } as any);
+      const retryPolicy = vi.fn((_context: RetryPolicyContext) => true);
+      const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+      const runner = new Runner({
+        model: 'gpt',
+        modelProvider: { getModel: () => model },
+        modelSettings: {
+          retry: {
+            maxRetries: 1,
+            policy: retryPolicy,
+            backoff: { initialDelayMs: 0, jitter: false },
+          },
+        },
+      });
+
+      const error = await runner
+        .run(new Agent({ name: 'Truncated response agent' }), 'hello')
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ModelBehaviorError);
+      expect(client.chat.completions.create).toHaveBeenCalledTimes(1);
+      expect(retryPolicy).toHaveBeenCalledTimes(1);
+      expect(retryPolicy.mock.calls[0]?.[0]).toMatchObject({
+        replaySafety: 'unsafe',
+        responseStarted: true,
+      });
+      const taskSpan = processor.spansEnded.find(
+        (candidate) => candidate.spanData.type === 'task',
+      );
+      expect(taskSpan?.spanData.usage).toMatchObject(expectedUsage);
+      const turnSpan = processor.spansEnded.find(
+        (candidate) => candidate.spanData.type === 'turn',
+      );
+      expect(turnSpan?.spanData.usage).toMatchObject({
+        input_tokens: expectedUsage.input_tokens,
+        output_tokens: expectedUsage.output_tokens,
+      });
+    },
+  );
+
+  it.each([null, ''])(
+    'surfaces an empty content-filtered message as a refusal (content: %j)',
+    async (content) => {
+      const client = new FakeClient();
+      const response = {
+        id: 'r',
+        choices: [
+          {
+            finish_reason: 'content_filter',
+            message: {
+              role: 'assistant',
+              content,
+              refusal: '',
+              tool_calls: [],
+            },
+          },
+        ],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      } as any;
+      client.chat.completions.create.mockResolvedValue(response);
+
+      const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+      const req: any = {
+        input: 'u',
+        modelSettings: {},
+        tools: [],
+        outputType: 'text',
+        handoffs: [],
+        tracing: false,
+      };
+
+      const result = await withTrace('t', () => model.getResponse(req));
+
+      expect(result.output).toEqual([
+        {
+          id: 'r',
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [
+            {
+              type: 'refusal',
+              refusal: "Response withheld by the provider's content filter.",
+              providerData: {
+                role: 'assistant',
+                content: null,
+                tool_calls: [],
+              },
+            },
+          ],
+        },
+      ]);
+    },
+  );
+
+  it('preserves content, provider refusals, and tool calls from content-filtered messages', async () => {
+    const client = new FakeClient();
+    client.chat.completions.create
+      .mockResolvedValueOnce({
+        id: 'content-response',
+        choices: [
+          {
+            finish_reason: 'content_filter',
+            message: { content: 'partial' },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        id: 'refusal-response',
+        choices: [
+          {
+            finish_reason: 'content_filter',
+            message: { content: null, refusal: 'provider refusal' },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        id: 'tool-response',
+        choices: [
+          {
+            finish_reason: 'content_filter',
+            message: {
+              content: null,
+              tool_calls: [
+                {
+                  id: 'call-1',
+                  type: 'function',
+                  function: { name: 'lookup', arguments: '{}' },
+                },
+              ],
+            },
+          },
+        ],
+      });
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    const req: any = {
+      input: 'u',
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+    };
+
+    const contentResult = await withTrace('content', () =>
+      model.getResponse(req),
+    );
+    const refusalResult = await withTrace('refusal', () =>
+      model.getResponse(req),
+    );
+    const toolResult = await withTrace('tool', () => model.getResponse(req));
+
+    expect(contentResult.output[0]).toMatchObject({
+      type: 'message',
+      content: [{ type: 'output_text', text: 'partial' }],
+    });
+    expect(refusalResult.output[0]).toMatchObject({
+      type: 'message',
+      content: [{ type: 'refusal', refusal: 'provider refusal' }],
+    });
+    expect(toolResult.output).toMatchObject([
+      {
+        id: 'tool-response',
+        type: 'function_call',
+        arguments: '{}',
+        name: 'lookup',
+        callId: 'call-1',
+        status: 'completed',
+      },
+    ]);
+  });
+
+  it('does not synthesize a refusal for other finish reasons', async () => {
+    const client = new FakeClient();
+    client.chat.completions.create.mockResolvedValue({
+      id: 'r',
+      choices: [
+        {
+          finish_reason: 'stop',
+          message: { content: null },
+        },
+      ],
+    });
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    const result = await withTrace('t', () =>
+      model.getResponse({
+        input: 'u',
+        modelSettings: {},
+        tools: [],
+        outputType: 'text',
+        handoffs: [],
+        tracing: false,
+      }),
+    );
+
+    expect(result.output).toEqual([]);
+  });
+
+  it('traces the synthesized refusal without mutating raw provider data', async () => {
+    const processor = new RecordingProcessor();
+    setTraceProcessors([processor]);
+    setTracingDisabled(false);
+
+    const client = new FakeClient();
+    const rawResponse = {
+      id: 'r',
+      choices: [
+        {
+          finish_reason: 'content_filter',
+          message: { role: 'assistant', content: null },
+        },
+      ],
+    };
+    client.chat.completions.create.mockResolvedValue(rawResponse);
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+
+    const result = await withTrace('content-filter-refusal', () =>
+      model.getResponse({
+        input: 'u',
+        modelSettings: {},
+        tools: [],
+        outputType: 'text',
+        handoffs: [],
+        tracing: true,
+      }),
+    );
+
+    expect(result.providerData).toBe(rawResponse);
+    expect(rawResponse.choices[0].message).toEqual({
+      role: 'assistant',
+      content: null,
+    });
+
+    const generationSpan = processor.spansEnded.find(
+      (span) => span.spanData.type === 'generation',
+    );
+    expect(generationSpan?.spanData.output).toEqual([
+      expect.objectContaining({
+        choices: [
+          expect.objectContaining({
+            message: expect.objectContaining({
+              refusal: "Response withheld by the provider's content filter.",
+            }),
+          }),
+        ],
+      }),
+    ]);
+  });
+
   it('sends prompt cache controls when provided', async () => {
     const client = new FakeClient();
     const response = {
@@ -593,11 +1242,21 @@ describe('OpenAIChatCompletionsModel', () => {
     ]);
   });
 
-  it('handles audio message', async () => {
+  it('preserves audio from a content-filtered message', async () => {
     const client = new FakeClient();
     const response = {
       id: 'r',
-      choices: [{ message: { audio: { data: 'zzz', format: 'mp3' } } }],
+      choices: [
+        {
+          finish_reason: 'content_filter',
+          message: {
+            content: null,
+            refusal: null,
+            tool_calls: [],
+            audio: { data: 'zzz', format: 'mp3' },
+          },
+        },
+      ],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     } as any;
     client.chat.completions.create.mockResolvedValue(response);
@@ -1017,12 +1676,48 @@ describe('OpenAIChatCompletionsModel', () => {
     expect(result.output).toEqual([]);
   });
 
+  it('rejects a truncated message containing only an ignored custom tool call', async () => {
+    const client = new FakeClient();
+    client.chat.completions.create.mockResolvedValue({
+      id: 'r',
+      choices: [
+        {
+          finish_reason: 'length',
+          message: {
+            tool_calls: [
+              {
+                id: 'call1',
+                type: 'custom',
+                custom: { name: 'raw_tool', input: 'payload' },
+              },
+            ],
+          },
+        },
+      ],
+    } as any);
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    await expect(
+      withTrace('truncated-custom', () =>
+        model.getResponse({
+          input: 'u',
+          modelSettings: {},
+          tools: [],
+          outputType: 'text',
+          handoffs: [],
+          tracing: false,
+        } as any),
+      ),
+    ).rejects.toThrow(ModelBehaviorError);
+  });
+
   it('rejects custom tool calls in strict mode', async () => {
     const client = new FakeClient();
     const response = {
       id: 'r',
       choices: [
         {
+          finish_reason: 'length',
           message: {
             tool_calls: [
               {
@@ -1362,20 +2057,178 @@ describe('OpenAIChatCompletionsModel', () => {
     });
   });
 
-  it('throws when parallelToolCalls set without tools', async () => {
+  it.each(parallelToolCallRequestCases)(
+    '$mode request with $toolSource tools and parallelToolCalls=$parallelToolCalls',
+    async ({ mode, toolSource, parallelToolCalls }) => {
+      const client = new FakeClient();
+      const response = {
+        id: 'r',
+        choices: [{ message: { content: 'done' } }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      } as any;
+      client.chat.completions.create.mockResolvedValue(
+        mode === 'streaming'
+          ? (async function* () {
+              yield { id: 'c' } as any;
+            })()
+          : response,
+      );
+
+      const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+      const modelSettings =
+        parallelToolCalls === undefined ? {} : { parallelToolCalls };
+      const request: any = {
+        input: 'u',
+        modelSettings,
+        tools: toolSource === 'function' ? [functionTool] : [],
+        outputType: 'text',
+        handoffs: toolSource === 'handoff' ? [handoffTool] : [],
+        tracing: false,
+      };
+
+      await callModel(model, request, mode);
+
+      expect(client.chat.completions.create).toHaveBeenCalledTimes(1);
+      const [requestData] = client.chat.completions.create.mock.calls[0];
+      if (toolSource === 'none' || parallelToolCalls === undefined) {
+        expect(requestData).not.toHaveProperty('parallel_tool_calls');
+      } else {
+        expect(requestData.parallel_tool_calls).toBe(parallelToolCalls);
+      }
+      if (toolSource === 'none') {
+        expect(requestData.tools).toBeUndefined();
+      } else {
+        expect(requestData.tools).toHaveLength(1);
+      }
+    },
+  );
+
+  it.each(['non-streaming', 'streaming'] as const)(
+    'omits providerData parallel_tool_calls without tools for %s requests',
+    async (mode) => {
+      const client = new FakeClient();
+      const response = {
+        id: 'r',
+        choices: [{ message: { content: 'done' } }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      } as any;
+      client.chat.completions.create.mockResolvedValue(
+        mode === 'streaming'
+          ? (async function* () {
+              yield { id: 'c' } as any;
+            })()
+          : response,
+      );
+
+      const providerData = {
+        parallel_tool_calls: true,
+        custom_option: 'keep',
+      };
+      const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+      await callModel(
+        model,
+        {
+          input: 'u',
+          modelSettings: { providerData },
+          tools: [],
+          outputType: 'text',
+          handoffs: [],
+          tracing: false,
+        },
+        mode,
+      );
+
+      const [requestData] = client.chat.completions.create.mock.calls[0];
+      expect(requestData).not.toHaveProperty('parallel_tool_calls');
+      expect(requestData.custom_option).toBe('keep');
+      expect(providerData).toEqual({
+        parallel_tool_calls: true,
+        custom_option: 'keep',
+      });
+    },
+  );
+
+  it.each(['non-streaming', 'streaming'] as const)(
+    'preserves providerData parallel_tool_calls with providerData tools for %s requests',
+    async (mode) => {
+      const client = new FakeClient();
+      const response = {
+        id: 'r',
+        choices: [{ message: { content: 'done' } }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      } as any;
+      client.chat.completions.create.mockResolvedValue(
+        mode === 'streaming'
+          ? (async function* () {
+              yield { id: 'c' } as any;
+            })()
+          : response,
+      );
+
+      const rawTools = [
+        {
+          type: 'function',
+          function: {
+            name: 'raw_lookup',
+            description: 'Look up a record.',
+            parameters: { type: 'object', properties: {} },
+          },
+        },
+      ];
+      const providerData = {
+        tools: rawTools,
+        parallel_tool_calls: true,
+      };
+      const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+      await callModel(
+        model,
+        {
+          input: 'u',
+          modelSettings: { providerData },
+          tools: [],
+          outputType: 'text',
+          handoffs: [],
+          tracing: false,
+        },
+        mode,
+      );
+
+      const [requestData] = client.chat.completions.create.mock.calls[0];
+      expect(requestData.tools).toEqual(rawTools);
+      expect(requestData.parallel_tool_calls).toBe(true);
+      expect(providerData).toEqual({
+        tools: rawTools,
+        parallel_tool_calls: true,
+      });
+    },
+  );
+
+  it('preserves providerData parallel_tool_calls precedence with tools', async () => {
     const client = new FakeClient();
+    client.chat.completions.create.mockResolvedValue({
+      id: 'r',
+      choices: [{ message: { content: 'done' } }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+    const providerData = { parallel_tool_calls: true };
     const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
-    const req: any = {
-      input: 'u',
-      modelSettings: { parallelToolCalls: true },
-      tools: [],
-      outputType: 'text',
-      handoffs: [],
-      tracing: false,
-    };
-    await expect(withTrace('t', () => model.getResponse(req))).rejects.toThrow(
-      'Parallel tool calls are not supported without tools',
+
+    await callModel(
+      model,
+      {
+        input: 'u',
+        modelSettings: { parallelToolCalls: false, providerData },
+        tools: [functionTool],
+        outputType: 'text',
+        handoffs: [],
+        tracing: false,
+      },
+      'non-streaming',
     );
+
+    const [requestData] = client.chat.completions.create.mock.calls[0];
+    expect(requestData.parallel_tool_calls).toBe(true);
+    expect(providerData).toEqual({ parallel_tool_calls: true });
   });
 
   it('getStreamedResponse propagates streamed events', async () => {
@@ -1388,7 +2241,7 @@ describe('OpenAIChatCompletionsModel', () => {
     const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
     const req: any = {
       input: 'hi',
-      modelSettings: {},
+      modelSettings: { preserveRawUsage: true },
       tools: [],
       outputType: 'text',
       handoffs: [],
@@ -1408,8 +2261,58 @@ describe('OpenAIChatCompletionsModel', () => {
     expect(convertChatCompletionsStreamToResponses).toHaveBeenCalled();
     expect(
       vi.mocked(convertChatCompletionsStreamToResponses).mock.calls[0]?.[2],
-    ).toEqual({ strictFeatureValidation: false });
+    ).toEqual({ strictFeatureValidation: false, preserveRawUsage: true });
     expect(events).toEqual([{ type: 'first' }, { type: 'second' }]);
+  });
+
+  it('propagates the request ID in a streamed response', async () => {
+    vi.mocked(convertChatCompletionsStreamToResponses).mockImplementationOnce(
+      async function* () {
+        yield {
+          type: 'response_done',
+          response: {
+            id: 'r',
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            output: [],
+          },
+        } as any;
+      },
+    );
+
+    const client = new FakeClient();
+    async function* fakeStream() {
+      yield { id: 'c' } as any;
+    }
+    const stream = fakeStream();
+    const completionPromise = Promise.resolve(stream);
+    const withResponse = vi.fn().mockResolvedValue({
+      data: stream,
+      request_id: 'req_streamed_456',
+    });
+    Object.assign(completionPromise, { withResponse });
+    client.chat.completions.create.mockReturnValue(completionPromise);
+
+    const model = new OpenAIChatCompletionsModel(client as any, 'gpt');
+    const req: any = {
+      input: 'hi',
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+    };
+    const events: any[] = [];
+
+    await withTrace('t', async () => {
+      for await (const event of model.getStreamedResponse(req)) {
+        events.push(event);
+      }
+    });
+
+    expect(client.chat.completions.create).toHaveBeenCalledTimes(1);
+    expect(withResponse).toHaveBeenCalledTimes(1);
+    const responseDone = events.find((event) => event.type === 'response_done');
+    expect(responseDone?.response.requestId).toBe('req_streamed_456');
   });
 
   it('passes strict feature validation to the stream converter', async () => {
@@ -1556,5 +2459,7 @@ describe('OpenAIChatCompletionsModel', () => {
     const responseDone = events.find((e) => e.type === 'response_done');
     expect(responseDone).toBeDefined();
     expect(responseDone.response.usage.totalTokens).toBe(15);
+    expect(responseDone.response.requestId).toBeUndefined();
+    expect(client.chat.completions.create).toHaveBeenCalledTimes(1);
   });
 });

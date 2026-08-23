@@ -7,16 +7,30 @@ description: Run the mandatory verification stack when changes affect runtime co
 
 ## Overview
 
-Ensure work is only marked complete after installing dependencies, building, linting, type checking (including generated declarations), and tests pass. Use this skill when changes affect runtime code, tests, or build/test configuration.
+Ensure work is only marked complete after installing dependencies, building, linting, type checking (including generated declarations), and tests pass. Use this skill when changes affect runtime code, tests, or build/test configuration. This is a post-review final gate: when `$implementation-final-review` applies, do not invoke the broad stack until its clean-review condition applies to the stable task diff.
 
 ## Quick start
 
 1. Keep this skill at `./.agents/skills/code-change-verification` so it loads automatically for the repository.
 2. Run the skill in the user's selected checkout without changing worktrees or branches.
-3. macOS/Linux: `bash .agents/skills/code-change-verification/scripts/run.sh`.
-4. Windows: `powershell -ExecutionPolicy Bypass -File .agents/skills/code-change-verification/scripts/run.ps1`.
-5. If any command fails, fix the issue, rerun the script, and report the failing output.
-6. Confirm completion only when all commands succeed with no remaining issues.
+3. Codex on macOS/Linux: `/usr/bin/env -u OPENAI_API_KEY bash .agents/skills/code-change-verification/scripts/run.sh`.
+4. Other macOS/Linux environments: `bash .agents/skills/code-change-verification/scripts/run.sh`.
+5. Windows: `powershell -ExecutionPolicy Bypass -File .agents/skills/code-change-verification/scripts/run.ps1`.
+6. If any command fails, fix the issue, rerun the script, and report the failing output.
+7. Confirm completion only when all commands succeed with no remaining issues.
+
+## Start condition and host capacity
+
+- During iterative review, use only focused tests and a narrowly targeted static check when the changed typing boundary requires one. Defer repository-wide `pnpm -r build-check` and the rest of this complete stack until review is clean.
+- Immediately before starting the complete stack, use available read-only task or process evidence to check whether another repository-wide test, typecheck, build, examples runner, or integration command is already active on the same host.
+- When concrete contention is visible, continue useful non-heavy work such as review, remediation, evidence preparation, or focused checks, then check again later. Do not create or wait on a repository lock, host-wide mutex, or sentinel file.
+- Start automatically once review is clean, the diff is stable, and observable host capacity is available. Do not require a user-triggered `finalize` message. If host telemetry is unavailable, do not block solely because capacity cannot be measured.
+
+## Codex execution policy
+
+Repository verification and all child processes must remain in the normal Codex workspace sandbox. Never request elevated sandbox permissions for verification, and never retry with broader host access after a failure.
+
+On macOS/Linux, use the exact Codex command from Quick start so an inherited `OPENAI_API_KEY` is removed before the repository-controlled wrapper starts. Investigate failures inside the workspace sandbox and report any coverage that the sandbox cannot provide instead of weakening the sandbox boundary.
 
 ## Manual workflow
 

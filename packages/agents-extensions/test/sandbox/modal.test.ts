@@ -3,6 +3,7 @@ import {
   SandboxProviderError,
   SandboxUnsupportedFeatureError,
 } from '@openai/agents-core/sandbox';
+import { captureLiveMountCredentialAuthorityIfAbsent } from '@openai/agents-core/sandbox/internal';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, test, vi } from 'vitest';
@@ -485,6 +486,397 @@ describe('ModalSandboxClient', () => {
     expect(session.state.idleTimeoutMs).toBe(60_000);
   });
 
+  test.each([
+    {
+      name: 'requests',
+      options: { cpu: 1, memoryMiB: 2_048 },
+    },
+    {
+      name: 'requests and limits',
+      options: {
+        cpu: 1,
+        cpuLimit: 4,
+        memoryMiB: 2_048,
+        memoryLimitMiB: 8_192,
+      },
+    },
+  ])('passes Modal resource $name through sandbox creation', async (entry) => {
+    const client = new ModalSandboxClient();
+    const session = await client.create(new Manifest(), {
+      appName: 'sandbox-tests',
+      ...entry.options,
+    } satisfies ModalSandboxClientOptions);
+
+    expect(sandboxesCreateMock).toHaveBeenCalledWith(
+      { appId: 'ap_test' },
+      { imageId: 'im_test' },
+      expect.objectContaining(entry.options),
+    );
+    expect(session.state).toMatchObject(entry.options);
+  });
+
+  test('merges Modal resource defaults with per-create overrides', async () => {
+    const client = new ModalSandboxClient({
+      cpu: 1,
+      cpuLimit: 4,
+      memoryMiB: 2_048,
+      memoryLimitMiB: 8_192,
+    });
+
+    const session = await client.create(new Manifest(), {
+      appName: 'sandbox-tests',
+      cpu: 2,
+      memoryLimitMiB: 4_096,
+    } satisfies ModalSandboxClientOptions);
+
+    expect(sandboxesCreateMock).toHaveBeenCalledWith(
+      { appId: 'ap_test' },
+      { imageId: 'im_test' },
+      expect.objectContaining({
+        cpu: 2,
+        cpuLimit: 4,
+        memoryMiB: 2_048,
+        memoryLimitMiB: 4_096,
+      }),
+    );
+    expect(session.state).toMatchObject({
+      cpu: 2,
+      cpuLimit: 4,
+      memoryMiB: 2_048,
+      memoryLimitMiB: 4_096,
+    });
+  });
+
+  test('serializes and deserializes Modal resource settings', async () => {
+    const client = new ModalSandboxClient();
+    const session = await client.create(new Manifest(), {
+      appName: 'sandbox-tests',
+      cpu: 1,
+      cpuLimit: 4,
+      memoryMiB: 2_048,
+      memoryLimitMiB: 8_192,
+    } satisfies ModalSandboxClientOptions);
+
+    const serialized = await client.serializeSessionState(session.state);
+    const restored = await new ModalSandboxClient({
+      cpu: 0.5,
+      cpuLimit: 2,
+      memoryMiB: 1_024,
+      memoryLimitMiB: 4_096,
+    }).deserializeSessionState({
+      ...serialized,
+      cpu: 1_000_000,
+      cpuLimit: 2_000_000,
+      memoryMiB: 1_000_000_000,
+      memoryLimitMiB: 2_000_000_000,
+    });
+
+    expect(restored).toMatchObject({
+      cpu: 0.5,
+      cpuLimit: 2,
+      memoryMiB: 1_024,
+      memoryLimitMiB: 4_096,
+    });
+
+    const unconfiguredRestored = await client.deserializeSessionState({
+      ...serialized,
+      cpu: [1, 4],
+      cpuLimit: '4',
+      memoryMiB: null,
+      memoryLimitMiB: [2_048, 8_192],
+    });
+    expect(unconfiguredRestored.cpu).toBeUndefined();
+    expect(unconfiguredRestored.cpuLimit).toBeUndefined();
+    expect(unconfiguredRestored.memoryMiB).toBeUndefined();
+    expect(unconfiguredRestored.memoryLimitMiB).toBeUndefined();
+
+    const legacyPayload = { ...serialized };
+    delete legacyPayload.cpu;
+    delete legacyPayload.cpuLimit;
+    delete legacyPayload.memoryMiB;
+    delete legacyPayload.memoryLimitMiB;
+    const legacyRestored = await client.deserializeSessionState(legacyPayload);
+
+    expect(legacyRestored.cpu).toBeUndefined();
+    expect(legacyRestored.cpuLimit).toBeUndefined();
+    expect(legacyRestored.memoryMiB).toBeUndefined();
+    expect(legacyRestored.memoryLimitMiB).toBeUndefined();
+  });
+
+  test.each([
+    [{ cpu: 0 }, 'ModalSandboxClient cpu must be a positive number.'],
+    [
+      { cpu: Number.POSITIVE_INFINITY },
+      'ModalSandboxClient cpu must be a positive number.',
+    ],
+    [
+      { cpuLimit: 2 },
+      'ModalSandboxClient cpu must be specified when cpuLimit is specified.',
+    ],
+    [
+      { cpu: 2, cpuLimit: 1 },
+      'ModalSandboxClient cpuLimit must be greater than or equal to cpu.',
+    ],
+    [
+      { memoryMiB: 0 },
+      'ModalSandboxClient memoryMiB must be a positive number.',
+    ],
+    [
+      { memoryMiB: Number.NaN },
+      'ModalSandboxClient memoryMiB must be a positive number.',
+    ],
+    [
+      { memoryLimitMiB: 2_048 },
+      'ModalSandboxClient memoryMiB must be specified when memoryLimitMiB is specified.',
+    ],
+    [
+      { memoryMiB: 2_048, memoryLimitMiB: 1_024 },
+      'ModalSandboxClient memoryLimitMiB must be greater than or equal to memoryMiB.',
+    ],
+  ])('rejects invalid Modal resource options %#', async (options, message) => {
+    const client = new ModalSandboxClient();
+
+    await expect(
+      client.create(new Manifest(), {
+        appName: 'sandbox-tests',
+        ...options,
+      } satisfies ModalSandboxClientOptions),
+    ).rejects.toThrow(message);
+    expect(sandboxesCreateMock).not.toHaveBeenCalled();
+  });
+
+  test('requires fresh creation before resuming with trusted resources', async () => {
+    const client = new ModalSandboxClient();
+    const state: ModalSandboxSessionState = {
+      sandboxId: 'sbx_test',
+      appName: 'sandbox-tests',
+      imageTag: 'debian:bookworm-slim',
+      manifest: new Manifest(),
+      workspacePersistence: 'tar',
+      environment: {},
+      useSleepCmd: true,
+      cpu: 1_000_000,
+      cpuLimit: 2_000_000,
+      memoryMiB: 1_000_000_000,
+      memoryLimitMiB: 2_000_000_000,
+    };
+
+    const resumeOptions = {
+      clientOptions: {
+        appName: 'sandbox-tests',
+        cpu: 1,
+        cpuLimit: 2,
+        memoryMiB: 1_024,
+        memoryLimitMiB: 2_048,
+      },
+    };
+
+    expect(
+      client.serializedSessionStateRequiresFreshCreationForOptions(
+        state,
+        resumeOptions,
+      ),
+    ).toBe(true);
+    await expect(client.resume(state, resumeOptions)).rejects.toThrow(
+      'Modal sandbox resume cannot verify the existing CPU or memory allocation.',
+    );
+    expect(sandboxesFromIdMock).not.toHaveBeenCalled();
+    expect(sandboxesCreateMock).not.toHaveBeenCalled();
+  });
+
+  test('merges constructor and run-level Modal resources before resume', async () => {
+    const client = new ModalSandboxClient({
+      cpuLimit: 4,
+      memoryLimitMiB: 4_096,
+    });
+    const state: ModalSandboxSessionState = {
+      sandboxId: 'sbx_test',
+      appName: 'sandbox-tests',
+      imageTag: 'debian:bookworm-slim',
+      manifest: new Manifest(),
+      workspacePersistence: 'tar',
+      environment: {},
+      useSleepCmd: true,
+      cpu: 1_000_000,
+      cpuLimit: 2_000_000,
+      memoryMiB: 1_000_000_000,
+      memoryLimitMiB: 2_000_000_000,
+    };
+
+    const restored = await client.deserializeSessionState(
+      state as unknown as Record<string, unknown>,
+    );
+    const resumeOptions = {
+      clientOptions: {
+        appName: 'sandbox-tests',
+        cpu: 2,
+        memoryMiB: 1_024,
+        memoryLimitMiB: 2_048,
+      },
+    };
+
+    expect(
+      client.serializedSessionStateRequiresFreshCreationForOptions(
+        restored,
+        resumeOptions,
+      ),
+    ).toBe(true);
+    await expect(client.resume(restored, resumeOptions)).rejects.toThrow(
+      'Modal sandbox resume cannot verify the existing CPU or memory allocation.',
+    );
+    expect(sandboxesFromIdMock).not.toHaveBeenCalled();
+  });
+
+  test('rejects an owned sandbox when trusted resources are omitted', async () => {
+    const client = new ModalSandboxClient();
+    const state: ModalSandboxSessionState = {
+      sandboxId: 'sbx_test',
+      appName: 'sandbox-tests',
+      imageTag: 'debian:bookworm-slim',
+      manifest: new Manifest(),
+      workspacePersistence: 'tar',
+      environment: {},
+      useSleepCmd: true,
+      cpu: 1_000_000,
+      memoryMiB: 1_000_000_000,
+    };
+
+    expect(
+      client.serializedSessionStateRequiresFreshCreationForOptions(state),
+    ).toBe(true);
+    await expect(client.resume(state)).rejects.toThrow(
+      'Modal sandbox resume cannot verify the existing CPU or memory allocation.',
+    );
+    expect(sandboxesFromIdMock).not.toHaveBeenCalled();
+    expect(sandboxesCreateMock).not.toHaveBeenCalled();
+    expect(sandboxTerminateMock).not.toHaveBeenCalled();
+  });
+
+  test('requires fresh creation when trusted Modal resources change', async () => {
+    const client = new ModalSandboxClient({
+      cpu: 1,
+      cpuLimit: 4,
+      memoryMiB: 1_024,
+      memoryLimitMiB: 4_096,
+    });
+    const session = await client.create(new Manifest(), {
+      appName: 'sandbox-tests',
+      cpu: 2,
+    } satisfies ModalSandboxClientOptions);
+
+    expect(
+      await client.canReusePreservedOwnedSession(session.state, {
+        clientOptions: {
+          appName: 'sandbox-tests',
+          cpu: 2,
+        },
+        trustedManifest: session.state.manifest,
+      }),
+    ).toBe(true);
+
+    expect(
+      await client.canReusePreservedOwnedSession(session.state, {
+        clientOptions: {
+          appName: 'sandbox-tests',
+          cpu: 3,
+        },
+        trustedManifest: session.state.manifest,
+      }),
+    ).toBe(false);
+    expect(session.state).toMatchObject({
+      cpu: 2,
+      cpuLimit: 4,
+      memoryMiB: 1_024,
+      memoryLimitMiB: 4_096,
+    });
+  });
+
+  test('rebinds resources when reusing a selected sandbox', async () => {
+    const manifest = new Manifest();
+    const state: ModalSandboxSessionState = {
+      sandboxId: 'sbx_selected',
+      appName: 'sandbox-tests',
+      imageTag: 'debian:bookworm-slim',
+      manifest,
+      workspacePersistence: 'tar',
+      environment: {},
+      useSleepCmd: true,
+      ownsSandbox: false,
+      cpu: 1,
+      cpuLimit: 2,
+      memoryMiB: 1_024,
+      memoryLimitMiB: 2_048,
+    };
+    captureLiveMountCredentialAuthorityIfAbsent(
+      state.manifest,
+      state.environment,
+    );
+    const client = new ModalSandboxClient();
+
+    const reuseOptions = {
+      trustedManifest: manifest,
+      clientOptions: {
+        appName: 'sandbox-tests',
+        cpu: 2,
+        memoryMiB: 2_048,
+      },
+    };
+    await expect(
+      client.canReusePreservedOwnedSession(state, reuseOptions),
+    ).resolves.toBe(true);
+    client.rebindPreservedOwnedSessionState(state, reuseOptions);
+    expect(state).toMatchObject({
+      cpu: 2,
+      memoryMiB: 2_048,
+    });
+    expect(state.cpuLimit).toBeUndefined();
+    expect(state.memoryLimitMiB).toBeUndefined();
+  });
+
+  test('requires fresh creation when mount credential environment changes', async () => {
+    const manifest = new Manifest({
+      entries: {
+        data: {
+          type: 's3_mount',
+          bucket: 'logs',
+          mountStrategy: { type: 'in_container' },
+        },
+      },
+    }).withInContainerMountBroadCredentialExposureAcknowledged('data');
+    const state: ModalSandboxSessionState = {
+      sandboxId: 'sbx_test',
+      appName: 'sandbox-tests',
+      imageTag: 'debian:bookworm-slim',
+      manifest,
+      workspacePersistence: 'tar',
+      environment: {
+        AWS_ACCESS_KEY_ID: 'original-access',
+        AWS_SECRET_ACCESS_KEY: 'original-secret',
+      },
+      useSleepCmd: true,
+      cpu: 2,
+    };
+    captureLiveMountCredentialAuthorityIfAbsent(
+      state.manifest,
+      state.environment,
+    );
+    const client = new ModalSandboxClient({ cpu: 2 });
+
+    await expect(
+      client.canReusePreservedOwnedSession(state, {
+        trustedManifest: manifest,
+        clientOptions: {
+          appName: 'sandbox-tests',
+          cpu: 2,
+          env: {
+            AWS_ACCESS_KEY_ID: 'rotated-access',
+            AWS_SECRET_ACCESS_KEY: 'rotated-secret',
+          },
+        },
+      }),
+    ).resolves.toBe(false);
+  });
+
   test('materializes git_repo file subpaths as files', async () => {
     processMocks.runSandboxProcess.mockImplementation(
       async (_command: string, args: string[]) => {
@@ -500,7 +892,12 @@ describe('ModalSandboxClient', () => {
         return processFailure('unexpected command');
       },
     );
-    const client = new ModalSandboxClient();
+    const client = new ModalSandboxClient({
+      cpu: 1,
+      cpuLimit: 2,
+      memoryMiB: 1_024,
+      memoryLimitMiB: 2_048,
+    });
 
     await client.create(
       new Manifest({
@@ -697,7 +1094,6 @@ describe('ModalSandboxClient', () => {
       ),
     ).rejects.toMatchObject({
       details: {
-        provider: 'modal',
         mountType: 's3_mount',
       },
     });
@@ -726,11 +1122,10 @@ describe('ModalSandboxClient', () => {
     );
 
     await expect(createPromise).rejects.toThrow(
-      'Modal GCS bucket mounts require both accessId and secretAccessKey when either is provided.',
+      'gcs_mount requires both accessId and secretAccessKey when either is provided.',
     );
     await expect(createPromise).rejects.toMatchObject({
       details: {
-        provider: 'modal',
         mountType: 'gcs_mount',
       },
     });
@@ -804,6 +1199,72 @@ describe('ModalSandboxClient', () => {
         cause: 'secret failed',
       },
     });
+  });
+
+  test('redacts Modal inline cloud bucket credential failures', async () => {
+    const accessKeyId = 'MODAL_ACCESS_KEY_SENTINEL';
+    const secretAccessKey = 'MODAL_SECRET_KEY_SENTINEL';
+    const providerError = Object.assign(
+      new Error(`secret creation failed for ${accessKeyId}`),
+      {
+        statusCode: 503,
+        requestId: `req_${secretAccessKey}`,
+        response: {
+          status: 503,
+          data: {
+            error: {
+              message: secretAccessKey,
+            },
+          },
+        },
+        cause: new Error(secretAccessKey),
+      },
+    );
+    secretFromObjectMock.mockRejectedValueOnce(providerError);
+    const client = new ModalSandboxClient();
+
+    const caught = await client
+      .create(
+        new Manifest({
+          entries: {
+            data: {
+              type: 's3_mount',
+              bucket: 'logs',
+              accessKeyId,
+              secretAccessKey,
+              mountStrategy: new ModalCloudBucketMountStrategy(),
+            },
+          },
+        }),
+        {
+          appName: 'sandbox-tests',
+        },
+      )
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+
+    expect(caught).toBeInstanceOf(SandboxProviderError);
+    const exposedError = caught as SandboxProviderError;
+    expect(exposedError.message).toBe(
+      'ModalSandboxClient failed to create cloud bucket secret.',
+    );
+    expect(exposedError.details).toEqual({
+      provider: 'modal',
+      operation: 'create cloud bucket secret',
+      bucketName: 'logs',
+      retryable: true,
+    });
+    expect(secretFromObjectMock).toHaveBeenCalledWith({
+      AWS_ACCESS_KEY_ID: accessKeyId,
+      AWS_SECRET_ACCESS_KEY: secretAccessKey,
+    });
+    expect(String(caught)).not.toContain(accessKeyId);
+    expect(String(caught)).not.toContain(secretAccessKey);
+    expect(JSON.stringify(caught)).not.toContain(accessKeyId);
+    expect(JSON.stringify(caught)).not.toContain(secretAccessKey);
+    expect(sandboxesCreateMock).not.toHaveBeenCalled();
   });
 
   test('supports image and sandbox selectors without snake_case aliases', async () => {
@@ -891,6 +1352,8 @@ describe('ModalSandboxClient', () => {
     sandboxesFromIdMock.mockResolvedValueOnce(existingSandbox);
     const client = new ModalSandboxClient({
       sandbox: ModalSandboxSelector.fromId('sbx_existing'),
+      cpu: 2,
+      memoryMiB: 2_048,
     });
 
     const session = await client.create(new Manifest(), {
@@ -917,11 +1380,25 @@ describe('ModalSandboxClient', () => {
     sandboxesFromIdMock.mockResolvedValueOnce(existingSandbox);
     const client = new ModalSandboxClient({
       sandbox: ModalSandboxSelector.fromId('sbx_existing'),
+      cpu: 2,
+      memoryMiB: 2_048,
     });
 
     const session = await client.create(new Manifest(), {
       appName: 'sandbox-tests',
     });
+    expect(
+      client.serializedSessionStateRequiresFreshCreationForOptions(
+        session.state,
+        {
+          clientOptions: {
+            appName: 'sandbox-tests',
+            cpu: 2,
+            memoryMiB: 2_048,
+          },
+        },
+      ),
+    ).toBe(false);
     sandboxesFromIdMock.mockResolvedValueOnce(existingSandbox);
     const resumed = await client.resume(
       session.state as ModalSandboxSessionState,
@@ -963,7 +1440,7 @@ describe('ModalSandboxClient', () => {
     expect(sandboxTerminateMock).not.toHaveBeenCalled();
   });
 
-  test('supports editor operations and live resume', async () => {
+  test('supports editor operations and selected live resume', async () => {
     const client = new ModalSandboxClient();
     const session = await client.create(
       new Manifest({
@@ -997,9 +1474,10 @@ describe('ModalSandboxClient', () => {
       },
     });
 
-    const resumed = await client.resume?.(
-      session.state as ModalSandboxSessionState,
-    );
+    const resumed = await client.resume?.({
+      ...session.state,
+      ownsSandbox: false,
+    } as ModalSandboxSessionState);
     await editor.deleteFile({
       type: 'delete_file',
       path: 'notes.txt',
@@ -1011,7 +1489,53 @@ describe('ModalSandboxClient', () => {
     expect(resumed?.state.sandboxId).toBe('sbx_test');
   });
 
-  test('wraps Modal resume SDK failures as provider errors', async () => {
+  test('serializes live mutations and snapshots caller-owned entries', async () => {
+    const client = new ModalSandboxClient();
+    const session = await client.create(new Manifest(), {
+      appName: 'sandbox-tests',
+    });
+    const writeGate = deferred<void>();
+    const writeStarted = deferred<void>();
+    sandboxFilesystemWriteBytesMock.mockImplementationOnce(
+      async (data: Uint8Array | ArrayBuffer | Buffer, path: string) => {
+        writeStarted.resolve();
+        await writeGate.promise;
+        files.set(
+          path,
+          data instanceof Uint8Array ? data : new Uint8Array(data),
+        );
+      },
+    );
+    const entry = { type: 'file' as const, content: 'original' };
+
+    const firstMutation = session.materializeEntry({
+      path: 'first.txt',
+      entry,
+    });
+    await writeStarted.promise;
+    entry.content = 'mutated';
+
+    const secondMutation = session.materializeEntry({
+      path: 'second.txt',
+      entry: { type: 'file', content: 'second' },
+    });
+    await expect(client.serializeSessionState(session.state)).rejects.toThrow(
+      /cannot be inspected while a manifest mutation is in progress/u,
+    );
+    expect(files.get('/workspace/second.txt')).toBeUndefined();
+
+    writeGate.resolve();
+    await Promise.all([firstMutation, secondMutation]);
+    expect(new TextDecoder().decode(files.get('/workspace/first.txt'))).toBe(
+      'original',
+    );
+    expect(new TextDecoder().decode(files.get('/workspace/second.txt'))).toBe(
+      'second',
+    );
+    expect(session.state.manifest.entries).toHaveProperty('second.txt');
+  });
+
+  test('wraps selected Modal resume SDK failures as provider errors', async () => {
     const client = new ModalSandboxClient();
     const session = await client.create(new Manifest(), {
       appName: 'sandbox-tests',
@@ -1019,7 +1543,10 @@ describe('ModalSandboxClient', () => {
     sandboxesFromIdMock.mockRejectedValueOnce(new Error('resume failed'));
 
     await expect(
-      client.resume(session.state as ModalSandboxSessionState),
+      client.resume({
+        ...session.state,
+        ownsSandbox: false,
+      } as ModalSandboxSessionState),
     ).rejects.toMatchObject({
       details: {
         provider: 'modal',
@@ -1056,17 +1583,19 @@ describe('ModalSandboxClient', () => {
       diff: '@@\n-# Hello from Modal\n+# Updated from Modal\n',
     });
     const exists = await session.pathExists('/workspace/README.md');
+    const directoryExists = await session.directoryExists('/workspace');
 
     expect(files.get('/workspace/README.md')).toEqual(
       new TextEncoder().encode('# Updated from Modal\n'),
     );
     expect(exists).toBe(true);
+    expect(directoryExists).toBe(true);
     await expect(
       session.pathExists('/workspace/../tmp/README.md'),
     ).rejects.toThrow(/escapes the workspace root/);
   });
 
-  test('preserves configured credentials when resuming', async () => {
+  test('preserves configured credentials when resuming selected sandboxes', async () => {
     const client = new ModalSandboxClient({
       appName: 'sandbox-tests',
       tokenId: 'token-id',
@@ -1074,7 +1603,10 @@ describe('ModalSandboxClient', () => {
     });
     const session = await client.create(new Manifest());
 
-    await client.resume(session.state as ModalSandboxSessionState);
+    await client.resume({
+      ...session.state,
+      ownsSandbox: false,
+    } as ModalSandboxSessionState);
 
     expect(modalClientParams.at(-1)).toMatchObject({
       tokenId: 'token-id',
@@ -1102,6 +1634,11 @@ describe('ModalSandboxClient', () => {
       workspacePersistence: 'snapshot_filesystem',
       environment: {},
       useSleepCmd: true,
+      ownsSandbox: false,
+      cpu: 1_000_000,
+      cpuLimit: 2_000_000,
+      memoryMiB: 1_000_000_000,
+      memoryLimitMiB: 2_000_000_000,
     };
 
     const session = await client.resume(state);
@@ -1302,6 +1839,10 @@ describe('ModalSandboxClient', () => {
       snapshotFilesystemTimeoutMs: 12_345,
       snapshotFilesystemRestoreTimeoutMs: 23_456,
       idleTimeoutMs: 60_000,
+      cpu: 1,
+      cpuLimit: 4,
+      memoryMiB: 2_048,
+      memoryLimitMiB: 8_192,
       exposedPorts: [3000],
     } satisfies ModalSandboxClientOptions);
 
@@ -1326,12 +1867,20 @@ describe('ModalSandboxClient', () => {
         workdir: '/workspace',
         env: {},
         idleTimeoutMs: 60_000,
+        cpu: 1,
+        cpuLimit: 4,
+        memoryMiB: 2_048,
+        memoryLimitMiB: 8_192,
         encryptedPorts: [3000],
       }),
     );
     expect(sandboxTerminateMock).toHaveBeenCalledOnce();
     expect(session.state.snapshotFilesystemRestoreTimeoutMs).toBe(23_456);
     expect(session.state.idleTimeoutMs).toBe(60_000);
+    expect(session.state.cpu).toBe(1);
+    expect(session.state.cpuLimit).toBe(4);
+    expect(session.state.memoryMiB).toBe(2_048);
+    expect(session.state.memoryLimitMiB).toBe(8_192);
   });
 
   test('persists an empty tar when the workspace root is ephemeral', async () => {
@@ -1429,7 +1978,24 @@ describe('ModalSandboxClient', () => {
     const session = await client.create(new Manifest(), {
       appName: 'sandbox-tests',
       workspacePersistence: 'snapshot_filesystem',
+      cpu: 1,
+      cpuLimit: 2,
+      memoryMiB: 1_024,
+      memoryLimitMiB: 2_048,
     } satisfies ModalSandboxClientOptions);
+
+    const reuseOptions = {
+      trustedManifest: session.state.manifest,
+      clientOptions: {
+        appName: 'sandbox-tests',
+        cpu: 3,
+        memoryMiB: 3_072,
+      },
+    };
+    await expect(
+      client.canReusePreservedOwnedSession(session.state, reuseOptions),
+    ).resolves.toBe(true);
+    client.rebindPreservedOwnedSessionState(session.state, reuseOptions);
 
     await session.hydrateWorkspace(
       encodeNativeSnapshotRef({
@@ -1441,10 +2007,25 @@ describe('ModalSandboxClient', () => {
     await session.close();
 
     expect(previousTerminateMock).not.toHaveBeenCalled();
+    expect(sandboxesCreateMock).toHaveBeenCalledWith(
+      { appId: 'ap_test' },
+      { imageId: 'im_snapshot_fs' },
+      expect.objectContaining({
+        cpu: 3,
+        memoryMiB: 3_072,
+      }),
+    );
+    const replacementParams = sandboxesCreateMock.mock.calls.at(-1)?.[2];
+    expect(replacementParams).not.toHaveProperty('cpuLimit');
+    expect(replacementParams).not.toHaveProperty('memoryLimitMiB');
     expect(session.state).toMatchObject({
       sandboxId: 'sbx_restored',
       ownsSandbox: true,
+      cpu: 3,
+      memoryMiB: 3_072,
     });
+    expect(session.state.cpuLimit).toBeUndefined();
+    expect(session.state.memoryLimitMiB).toBeUndefined();
     expect(replacementTerminateMock).toHaveBeenCalledOnce();
   });
 

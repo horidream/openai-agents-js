@@ -1,12 +1,13 @@
 import { Agent, AgentOutputType } from '../agent';
 import { UserError } from '../errors';
-import { RunItem } from '../items';
+import { RunInputItem, RunItem } from '../items';
 import { ModelResponse } from '../model';
 import { RunContext } from '../runContext';
 import { AgentInputItem } from '../types';
 import { addErrorToCurrentSpan } from '../tracing/context';
 import {
   buildAgentInputPool,
+  deduplicateAgentInputItemsPreferringLatest,
   extractOutputItemsFromRunItems,
   getAgentInputItemKey,
   removeAgentInputFromPool,
@@ -34,17 +35,26 @@ export type CallModelInputFilterArgs<TContext = unknown> = {
   context: TContext | undefined;
 };
 
-export type CallModelInputFilter<TContext = unknown> = (
+export type CallModelInputFilter<TContext = unknown> = ((
   args: CallModelInputFilterArgs<TContext>,
-) => ModelInputData | Promise<ModelInputData>;
+) => ModelInputData | Promise<ModelInputData>) & {
+  /**
+   * Preserve prepared input item identities by passing a shallow-copied array
+   * to the filter. The SDK does not freeze these items; enable this only when
+   * the filter and every helper it calls treat each input item and its nested
+   * values as immutable. Model and session inputs remain isolated copies after
+   * the filter returns.
+   */
+  preserveInputIdentity?: boolean;
+};
 
 /**
  * Result of applying a `callModelInputFilter`.
  * - `modelInput` is the payload that goes to the model.
  * - `sourceItems` maps each filtered item back to the original turn item (or `undefined` when none).
  *   This lets the conversation tracker know which originals reached the model.
- * - `persistedItems` are the filtered clones we should commit to session memory so the stored
- *   history reflects any redactions or truncation introduced by the filter.
+ * - `persistedItems` are the normalized clones we should commit to session memory so the stored
+ *   history reflects identity-aware replacement plus any redactions or truncation from the filter.
  * - `filterApplied` signals whether a filter ran so callers can distinguish empty filtered results
  *   from the filter being skipped entirely.
  */
@@ -52,8 +62,38 @@ export type FilterApplicationResult = {
   modelInput: { input: AgentInputItem[]; instructions?: string };
   sourceItems: (AgentInputItem | undefined)[];
   persistedItems: AgentInputItem[];
+  sourceMatchKinds: Array<'identity' | 'content' | 'fallback' | 'injected'>;
   filterApplied: boolean;
+  preserveInputIdentity: boolean;
 };
+
+export type ServerConversationOwner =
+  | { type: 'conversation'; id: string }
+  | { type: 'previous_response'; id: string };
+
+/**
+ * Resolves the single server-side continuation owner for an accepted response.
+ */
+export function getServerConversationOwner(
+  conversationId: string | undefined,
+  previousResponseId: string | undefined,
+): ServerConversationOwner | undefined {
+  if (
+    typeof conversationId === 'string' &&
+    conversationId.length > 0 &&
+    previousResponseId === undefined
+  ) {
+    return { type: 'conversation', id: conversationId };
+  }
+  if (
+    typeof previousResponseId === 'string' &&
+    previousResponseId.length > 0 &&
+    conversationId === undefined
+  ) {
+    return { type: 'previous_response', id: previousResponseId };
+  }
+  return undefined;
+}
 
 /**
  * Applies the optional callModelInputFilter and returns the filtered input alongside the original
@@ -78,48 +118,39 @@ export async function applyCallModelInputFilter<TContext>(
       return cloned;
     });
 
-  // Record the relationship between the cloned array passed to filters and the original inputs.
+  // Record the relationship between the array passed to filters and the original inputs.
   const cloneMap = new WeakMap<object, AgentInputItem>();
-  const originalPool = buildAgentInputPool(inputItems);
-  const fallbackOriginals: AgentInputItem[] = [];
-  // Track any original object inputs so filtered replacements can still mark them as delivered.
-  for (const item of inputItems) {
-    if (item && typeof item === 'object') {
-      fallbackOriginals.push(item);
+
+  // Identity-preserving filters may opt into stable item identities. Other filters still
+  // receive deep copies so their mutations cannot affect the cached turn state.
+  const preserveInputIdentity =
+    callModelInputFilter?.preserveInputIdentity === true;
+  const clonedBaseInput = preserveInputIdentity
+    ? [...inputItems]
+    : cloneInputItems(inputItems, cloneMap);
+  if (preserveInputIdentity) {
+    for (const item of inputItems) {
+      if (item && typeof item === 'object') {
+        cloneMap.set(item as object, item);
+      }
     }
   }
-  const removeFromFallback = (candidate: AgentInputItem | undefined) => {
-    if (!candidate || typeof candidate !== 'object') {
-      return;
-    }
-    const index = fallbackOriginals.findIndex(
-      (original) => original === candidate,
-    );
-    if (index !== -1) {
-      fallbackOriginals.splice(index, 1);
-    }
-  };
-  const takeFallbackOriginal = (): AgentInputItem | undefined => {
-    const next = fallbackOriginals.shift();
-    if (next) {
-      removeAgentInputFromPool(originalPool, next);
-    }
-    return next;
-  };
-
-  // Always create a deep copy so downstream mutations inside filters cannot affect
-  // the cached turn state.
-  const clonedBaseInput = cloneInputItems(inputItems, cloneMap);
   const base = {
     input: clonedBaseInput,
     instructions: systemInstructions,
   };
   if (!callModelInputFilter) {
+    const normalizedInput =
+      deduplicateAgentInputItemsPreferringLatest(clonedBaseInput);
     return {
-      modelInput: base,
-      sourceItems: [...inputItems],
-      persistedItems: [],
+      modelInput: { ...base, input: normalizedInput },
+      sourceItems: normalizedInput.map(
+        (item) => cloneMap.get(item as object) ?? item,
+      ),
+      persistedItems: cloneInputItems(normalizedInput),
+      sourceMatchKinds: normalizedInput.map(() => 'identity'),
       filterApplied: false,
+      preserveInputIdentity,
     };
   }
 
@@ -136,32 +167,120 @@ export async function applyCallModelInputFilter<TContext>(
       );
     }
 
+    const normalizedBaseSources = deduplicateAgentInputItemsPreferringLatest(
+      clonedBaseInput,
+    ).map((item) => cloneMap.get(item as object) ?? item);
+    const originalPool = buildAgentInputPool(normalizedBaseSources);
+    const fallbackOriginals = normalizedBaseSources.filter(
+      (item) => item && typeof item === 'object',
+    );
+    const removeFromFallback = (candidate: AgentInputItem | undefined) => {
+      if (!candidate || typeof candidate !== 'object') {
+        return;
+      }
+      const index = fallbackOriginals.findIndex(
+        (original) => original === candidate,
+      );
+      if (index !== -1) {
+        fallbackOriginals.splice(index, 1);
+      }
+    };
+    const takeFallbackOriginal = (): AgentInputItem | undefined => {
+      const next = fallbackOriginals.shift();
+      if (next) {
+        removeAgentInputFromPool(originalPool, next);
+      }
+      return next;
+    };
+
+    const normalizedInput = deduplicateAgentInputItemsPreferringLatest(
+      result.input,
+    );
+    const availableExactOccurrences = new WeakMap<object, number>();
+    for (const item of clonedBaseInput) {
+      if (item && typeof item === 'object') {
+        availableExactOccurrences.set(
+          item as object,
+          (availableExactOccurrences.get(item as object) ?? 0) + 1,
+        );
+      }
+    }
+    const consumedExactOccurrences = new WeakMap<object, number>();
+    const injectedExactCloneIndexes = new Set<number>();
+
     // Preserve a pointer to the original object backing each filtered clone so downstream
     // trackers can keep their bookkeeping consistent even after redaction.
-    const sourceItems = result.input.map((item) => {
-      if (!item || typeof item !== 'object') {
-        return undefined;
-      }
-      const original = cloneMap.get(item as object);
-      if (original) {
+    const sourceItems: (AgentInputItem | undefined)[] = normalizedInput.map(
+      (item, index) => {
+        if (!item || typeof item !== 'object') {
+          return undefined;
+        }
+        const original = cloneMap.get(item as object);
+        if (!original) {
+          return undefined;
+        }
+        const consumedOccurrences =
+          consumedExactOccurrences.get(item as object) ?? 0;
+        if (
+          consumedOccurrences >=
+          (availableExactOccurrences.get(item as object) ?? 0)
+        ) {
+          injectedExactCloneIndexes.add(index);
+          return undefined;
+        }
+        consumedExactOccurrences.set(item as object, consumedOccurrences + 1);
         removeFromFallback(original);
         removeAgentInputFromPool(originalPool, original);
         return original;
+      },
+    );
+    const sourceMatchKinds: FilterApplicationResult['sourceMatchKinds'] =
+      sourceItems.map((source) =>
+        source === undefined ? 'injected' : 'identity',
+      );
+
+    // Reserve all exact clone matches before considering equal-content items. A prepended clone
+    // that happens to equal a later unchanged item must remain an injected item.
+    for (let index = 0; index < sourceItems.length; index++) {
+      if (sourceItems[index] !== undefined) {
+        continue;
+      }
+      if (injectedExactCloneIndexes.has(index)) {
+        continue;
+      }
+      const item = normalizedInput[index];
+      if (!item || typeof item !== 'object') {
+        continue;
       }
       const key = getAgentInputItemKey(item as AgentInputItem);
       const matchedByContent = takeAgentInputFromPool(originalPool, key);
       if (matchedByContent) {
         removeFromFallback(matchedByContent);
-        return matchedByContent;
+        sourceItems[index] = matchedByContent;
+        sourceMatchKinds[index] = 'content';
+      }
+    }
+
+    // Assign replacement fallbacks only after every exact and content match has been reserved.
+    for (let index = 0; index < sourceItems.length; index++) {
+      if (sourceItems[index] !== undefined) {
+        continue;
+      }
+      if (injectedExactCloneIndexes.has(index)) {
+        continue;
+      }
+      const item = normalizedInput[index];
+      if (!item || typeof item !== 'object') {
+        continue;
       }
       const fallback = takeFallbackOriginal();
       if (fallback) {
-        return fallback;
+        sourceItems[index] = fallback;
+        sourceMatchKinds[index] = 'fallback';
       }
-      return undefined;
-    });
+    }
 
-    const clonedFilteredInput = cloneInputItems(result.input);
+    const clonedFilteredInput = cloneInputItems(normalizedInput);
     return {
       modelInput: {
         input: clonedFilteredInput,
@@ -172,7 +291,9 @@ export async function applyCallModelInputFilter<TContext>(
       },
       sourceItems,
       persistedItems: clonedFilteredInput.map((item) => structuredClone(item)),
+      sourceMatchKinds,
       filterApplied: true,
+      preserveInputIdentity,
     };
   } catch (error) {
     addErrorToCurrentSpan({
@@ -332,6 +453,10 @@ export class ServerConversationTracker {
           continue;
         }
         const rawItemKey = getAgentInputItemKey(rawItem as AgentInputItem);
+        if (item instanceof RunInputItem) {
+          this.sentItems.add(rawItem);
+          continue;
+        }
         if (this.serverItems.has(rawItem) || serverItemKeys.has(rawItemKey)) {
           this.sentItems.add(rawItem);
           continue;
@@ -377,9 +502,11 @@ export class ServerConversationTracker {
     originalInput: string | AgentInputItem[],
     generatedItems: RunItem[],
     supplementalGeneratedItems: AgentInputItem[] = [],
+    pendingInputItems: RunInputItem[] = [],
   ): AgentInputItem[] {
     const inputItems: AgentInputItem[] = [];
     const generatedItemsForInput: RunItem[] = [];
+    const pendingInputItemSet = new Set<RunItem>(pendingInputItems);
 
     if (!this.sentInitialInput) {
       const initialItems = toAgentInputList(originalInput);
@@ -412,7 +539,10 @@ export class ServerConversationTracker {
       if (!rawItem || typeof rawItem !== 'object') {
         continue;
       }
-      if (this.sentItems.has(rawItem) || this.serverItems.has(rawItem)) {
+      if (
+        !pendingInputItemSet.has(item) &&
+        (this.sentItems.has(rawItem) || this.serverItems.has(rawItem))
+      ) {
         continue;
       }
       generatedItemsForInput.push(item);

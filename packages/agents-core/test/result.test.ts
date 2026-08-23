@@ -159,6 +159,40 @@ describe('StreamedRunResult', () => {
     expect(sr.error).toBe(null);
   });
 
+  it('currentTurn starts at 0 for a fresh run and stays a writable field', () => {
+    const state = createState();
+    const sr = new StreamedRunResult({ state });
+    expect(sr.currentTurn).toBe(0);
+    // Deliberately a writable data property, not a getter: `currentTurn` is a
+    // released public field, and turning it into a getter-only property would
+    // change the shape callers already depend on. The streaming runner assigns
+    // it once a turn is admitted.
+    sr.currentTurn = 2;
+    expect(sr.currentTurn).toBe(2);
+    const descriptor = Object.getOwnPropertyDescriptor(sr, 'currentTurn');
+    expect(descriptor?.writable).toBe(true);
+    expect(descriptor?.get).toBeUndefined();
+  });
+
+  it('currentTurn is seeded from a resumed state rather than reset to 0', () => {
+    // A state carried in from a serialized run has already spent turns; the
+    // result must not restart the public counter.
+    const state = createState();
+    state._currentTurn = 3;
+    const sr = new StreamedRunResult({ state });
+    expect(sr.currentTurn).toBe(3);
+  });
+
+  it('currentTurn does NOT track later mutations of the private state counter', () => {
+    // The private counter is bumped at the START of a turn -- before the maxTurns
+    // check and before blocking input guardrails, either of which can reject that
+    // turn. Tracking it live is exactly the over-reporting this field avoids.
+    const state = createState();
+    const sr = new StreamedRunResult({ state });
+    state._currentTurn = 7;
+    expect(sr.currentTurn).toBe(0);
+  });
+
   it('records errors and rejects completed promise', async () => {
     const state = createState();
     const sr = new StreamedRunResult({ state });
@@ -166,6 +200,136 @@ describe('StreamedRunResult', () => {
     sr._raiseError(err);
     await expect(sr.completed).rejects.toBe(err);
     expect(sr.error).toBe(err);
+  });
+
+  it('drains preserved events before retaining the first stream error', async () => {
+    const state = createState();
+    const sr = new StreamedRunResult({ state });
+    const persistenceError = new Error('persistence failed');
+    const cleanupError = new Error('cleanup failed');
+    sr._addItem(
+      new RunRawModelStreamEvent({ type: 'output_text_delta', delta: 'x' }),
+    );
+
+    sr._raiseError(persistenceError, { preserveQueuedItems: true });
+    sr._raiseError(cleanupError);
+
+    await expect(sr.completed).rejects.toBe(persistenceError);
+    const events: RunRawModelStreamEvent[] = [];
+    await expect(
+      (async () => {
+        for await (const event of sr) {
+          events.push(event as RunRawModelStreamEvent);
+        }
+      })(),
+    ).rejects.toBe(persistenceError);
+    expect(events).toHaveLength(1);
+    expect(sr.error).toBe(persistenceError);
+  });
+
+  it('retains a null preserved error across secondary failures', async () => {
+    const state = createState();
+    const sr = new StreamedRunResult({ state });
+    const cleanupError = new Error('cleanup failed');
+    sr._addItem(
+      new RunRawModelStreamEvent({ type: 'output_text_delta', delta: 'x' }),
+    );
+
+    sr._raiseError(null, { preserveQueuedItems: true });
+    sr._raiseError(cleanupError);
+
+    await expect(sr.completed).rejects.toBeNull();
+    await expect(
+      (async () => {
+        for await (const _event of sr) {
+          // Drain the preserved event before observing the terminal error.
+        }
+      })(),
+    ).rejects.toBeNull();
+    expect(sr.error).toBeNull();
+  });
+
+  it('drains committed events before a later cleanup error', async () => {
+    const state = createState();
+    const sr = new StreamedRunResult({ state });
+    const cleanupError = new Error('cleanup failed');
+    sr._addItem(
+      new RunRawModelStreamEvent({ type: 'output_text_delta', delta: 'x' }),
+    );
+    sr._preserveQueuedItemsOnError();
+
+    sr._raiseError(cleanupError);
+
+    await expect(sr.completed).rejects.toBe(cleanupError);
+    const events: RunRawModelStreamEvent[] = [];
+    await expect(
+      (async () => {
+        for await (const event of sr) {
+          events.push(event as RunRawModelStreamEvent);
+        }
+      })(),
+    ).rejects.toBe(cleanupError);
+    expect(events).toHaveLength(1);
+  });
+
+  it('drains a large queued stream in order', async () => {
+    const state = createState();
+    const sr = new StreamedRunResult({ state });
+    const eventCount = 4096;
+    for (let index = 0; index < eventCount; index += 1) {
+      sr._addItem(
+        new RunRawModelStreamEvent({
+          type: 'output_text_delta',
+          delta: String(index),
+        }),
+      );
+    }
+    sr._done();
+
+    let receivedCount = 0;
+    for await (const _event of sr) {
+      receivedCount += 1;
+    }
+
+    expect(receivedCount).toBe(eventCount);
+  });
+
+  it('clears delayed terminal buffering when the consumer cancels', async () => {
+    const state = createState();
+    const sr = new StreamedRunResult({ state });
+    for (let index = 0; index < 4096; index += 1) {
+      sr._addItem(
+        new RunRawModelStreamEvent({
+          type: 'output_text_delta',
+          delta: String(index),
+        }),
+      );
+    }
+    sr._done();
+
+    const reader = (sr.toStream() as any).getReader();
+    await reader.cancel();
+
+    expect(sr.cancelled).toBe(true);
+  });
+
+  it('propagates consumer cancellation before fallback cleanup', async () => {
+    vi.spyOn(
+      AbortSignal as typeof AbortSignal & { any: typeof AbortSignal.any },
+      'any',
+    ).mockImplementation(() => {
+      throw new Error('AbortSignal.any failed');
+    });
+    const state = createState();
+    const sr = new StreamedRunResult({ state });
+    const signal = sr._getAbortSignal();
+    const reader = (sr.toStream() as any).getReader();
+
+    await reader.cancel();
+
+    expect(signal?.aborted).toBe(true);
+    expect(sr.cancelled).toBe(true);
+    vi.restoreAllMocks();
   });
 
   it.each([

@@ -48,6 +48,16 @@ If you do not provide `message`, the SDK falls back to the configured `toolError
 
 You do not need to resolve every pending approval in the same pass. If you rerun after approving or rejecting only some items, those resolved calls can continue while unresolved ones remain in `interruptions` and pause the run again.
 
+Sticky decisions created with `alwaysApprove: true` or `alwaysReject: true` provide the default for later calls to the same tool. An exact decision for one call ID takes precedence over that sticky default: you can reject one call under sticky approval or approve one call under sticky rejection without changing the default for other calls. If you later replace that exact decision, the new exact decision applies to that call while the sticky default remains available for the rest.
+
+### Add input before resuming
+
+Use `RunState.addInput()` when new user input arrives while a run is paused and should be admitted before the next resumed model call. Add the input before resolving approvals and passing the same state back to `Runner.run()`. The staged input is part of the serialized state, so it survives `toString()` / `fromString()` even if unresolved approvals or local tool work delay that model call.
+
+Read `state.pendingInput` to inspect a cloned snapshot of the staged items, or call `state.clearPendingInput()` before resuming to remove all of them. `addInput()` accepts either a string or an array of input items. It raises a `UserError` when the state cannot safely reach another model call, such as a terminal state, a state with no remaining turns, or an interruption whose tool result may end the run.
+
+Once admitted, each staged occurrence becomes a [`RunInputItem`](/openai-agents-js/openai/agents/classes/runinputitem) in the run's `newItems`, while its raw input item is included in `history`. With a local `session`, the SDK persists admitted input once before starting the model request. With `conversationId` or `previousResponseId`, it remains pending until the server accepts the response, so a failure known to occur before acceptance can be resumed without losing the input. If the provider reports that the request may already have been accepted, the SDK checkpoints that occurrence and fails closed instead of silently replaying it. See [Model retries](/openai-agents-js/guides/models#model-retries) for the separate, explicit unsafe-replay override.
+
 ### Automatic approval decisions
 
 Manual `interruptions` are the most general pattern, but they are not the only one:
@@ -81,6 +91,8 @@ See [the full example script](https://github.com/openai/openai-agents-js/tree/ma
 The human-in-the-loop flow is designed to be interruptible for longer periods of time without keeping your server running. If you need to shut down the request and continue later on you can serialize the state and resume later.
 
 You can serialize the state using `result.state.toString()` (or `JSON.stringify(result.state)`) and resume later on by passing the serialized state into `RunState.fromString(agent, serializedState)` where `agent` is the instance of the agent that triggered the overall run.
+
+Output guardrails impose a stricter resume boundary when an approved function-tool result can become the run's final output. A live `RunState` can retain output ownership information that is not available after serialization. If a serialized checkpoint cannot prove which response owns the pending output, or an ambiguous output-bearing checkpoint is resumed with a session attached, the SDK fails closed with a `UserError` before further model, tool, or session side effects. Start a new run from safe input when this happens. Rebuild the same agent graph and preserve the original `toolUseBehavior`; do not assume that every output-bearing partial approval can round-trip through serialized state.
 
 When `RunState` is serialized, the SDK records stable agent identities for the handoff and `Agent.asTool()` graph. This lets paused runs resume even when distinct agents share the same `name`, as long as the process that resumes the run rebuilds the same agent graph.
 

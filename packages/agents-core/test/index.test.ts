@@ -9,6 +9,9 @@ import type {
   AgentToolOptionsWithDefault,
   AgentToolOptionsWithParameters,
   RunHookEvents,
+  SessionHistoryTransactionArgs,
+  SessionHistoryTransactionAwareSession,
+  ToolNameCollisionPolicy,
 } from '../src/index';
 import * as Sandbox from '../src/sandbox';
 import * as LocalSandbox from '../src/sandbox/local';
@@ -22,6 +25,11 @@ describe('index.ts', () => {
     expect(agent).toBeDefined();
     expect(agent.name).toEqual('TestAgent');
     expect(typeof AgentsCore.setSensitiveDataLoggingEnabled).toBe('function');
+    expect(typeof AgentsCore.RunCompactionItem).toBe('function');
+    expect(typeof AgentsCore.RunInputItem).toBe('function');
+    expect(typeof AgentsCore.isSessionHistoryTransactionAwareSession).toBe(
+      'function',
+    );
   });
 
   test('exposes public lifecycle and agent tool types', () => {
@@ -34,6 +42,9 @@ describe('index.ts', () => {
       AgentToolOptionsWithDefault<undefined, TestAgent>,
       AgentToolOptionsWithParameters<undefined, TestAgent, typeof _parameters>,
       AgentTool<undefined, TestAgent, typeof _parameters>,
+      SessionHistoryTransactionArgs,
+      SessionHistoryTransactionAwareSession,
+      ToolNameCollisionPolicy,
     ];
 
     expectTypeOf<PublicTypes>().not.toBeNever();
@@ -50,6 +61,14 @@ describe('index.ts', () => {
     expect(typeof Sandbox.Capabilities.default).toBe('function');
     expect(typeof Sandbox.filesystem).toBe('function');
     expect(typeof Sandbox.shell).toBe('function');
+    expect(
+      'manifestAcknowledgesInContainerMountCredentialExposure' in Sandbox,
+    ).toBe(false);
+    expect('MOUNT_CREDENTIAL_EXPOSURE_POLICY_KEYS' in Sandbox).toBe(false);
+    expect('copyManifestMountCredentialExposurePolicy' in Sandbox).toBe(false);
+    expect('replaceManifestMountCredentialExposurePolicy' in Sandbox).toBe(
+      false,
+    );
     expect('UnixLocalSandboxClient' in Sandbox).toBe(false);
     expect('DockerSandboxClient' in Sandbox).toBe(false);
     expect(typeof LocalSandbox.UnixLocalSandboxClient).toBe('function');

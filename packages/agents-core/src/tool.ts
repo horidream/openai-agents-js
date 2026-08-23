@@ -8,20 +8,33 @@ import {
   JsonObjectSchemaStrict,
   UnknownContext,
 } from './types';
-import { safeExecute } from './utils/safeExecute';
 import { toFunctionToolName } from './utils/tools';
 import { getSchemaAndParserFromInputType } from './utils/tools';
 import { isZodObject } from './utils/typeGuards';
-import { combineAbortSignals, isAbortError } from './utils/abortSignals';
+import {
+  combineAbortSignals,
+  isAbortError,
+  isSiblingCancellationSignal,
+} from './utils/abortSignals';
 import { RunContext } from './runContext';
 import type { RunConfig } from './run';
 import type { RunResult } from './result';
+import { ToolTimeoutError, UserError } from './errors';
 import {
-  InvalidToolInputError,
-  InvalidToolOutputError,
-  ToolTimeoutError,
-  UserError,
-} from './errors';
+  createInvalidToolInputDisposition,
+  createInvalidToolInputFailure,
+  getInvalidToolInputFailure,
+  type InvalidToolInputDisposition,
+  isRedactedInvalidToolInputError,
+  refreshInvalidToolInputFailure,
+} from './toolInputError';
+import {
+  createInvalidToolOutputError,
+  getInvalidToolOutputFailure,
+  type InvalidToolOutputFailure,
+  isRedactedInvalidToolOutputError,
+  refreshInvalidToolOutputFailure,
+} from './toolOutputError';
 import logger, { logToolActionWarning } from './logger';
 import { getCurrentSpan } from './tracing';
 import { RunToolApprovalItem, RunToolCallOutputItem } from './items';
@@ -30,9 +43,18 @@ import { normalizeHostedMcpRequireApproval } from './utils/mcpApproval';
 import * as ProviderData from './types/providerData';
 import * as protocol from './types/protocol';
 import type { ZodInfer, ZodObjectLike } from './utils/zodCompat';
+import type {
+  StandardSchemaOutput,
+  StandardSchemaWithJSON,
+} from './utils/standardSchema';
+import {
+  isAsyncStandardSchemaValidationError,
+  isStandardSchemaWithJSON,
+} from './utils/standardSchema';
 import {
   FUNCTION_TOOL_NAMESPACE,
   FUNCTION_TOOL_NAMESPACE_DESCRIPTION,
+  getFunctionToolLookupKeyForTool,
   getFunctionToolQualifiedName,
 } from './toolIdentity';
 import {
@@ -81,12 +103,99 @@ export type ToolApprovalFunction<TParameters extends ToolInputParameters> = (
 export const FUNCTION_TOOL_PARSED_INPUT_CALLBACK = Symbol(
   'openai.agents.functionToolParsedInputCallback',
 );
+export const FUNCTION_TOOL_INVALID_OUTPUT_FAILURE_CALLBACK = Symbol(
+  'openai.agents.functionToolInvalidOutputFailureCallback',
+);
 const FUNCTION_TOOL_OUTPUT_VALIDATOR = Symbol(
   'openai.agents.functionToolOutputValidator',
 );
 const STATIC_FUNCTION_TOOL_APPROVAL_POLICIES = new WeakSet<
   ToolApprovalFunction<any>
 >();
+type FunctionToolInputParserRegistration = {
+  parser: (input: string) => any;
+  token: object;
+  validationMode: 'standard' | 'other';
+};
+
+type FunctionToolInputParseResult =
+  { success: true; value: any } | { success: false; error: unknown };
+
+export type FunctionToolPreparedInput = {
+  consumed: boolean;
+  input: string;
+  token: object;
+  validationMode: 'standard' | 'other';
+  disposition?: InvalidToolInputDisposition;
+  result: { success: true; value: any } | { success: false; error: unknown };
+};
+
+const functionToolInputParsers = new WeakMap<
+  object,
+  FunctionToolInputParserRegistration
+>();
+const functionToolPreparedInputs = new WeakMap<
+  object,
+  FunctionToolPreparedInput
+>();
+
+function parseFunctionToolInput(
+  parser: (input: string) => any,
+  input: string,
+): FunctionToolInputParseResult {
+  try {
+    return { success: true, value: parser(input) };
+  } catch (error) {
+    return { success: false, error };
+  }
+}
+
+/** @internal */
+export function prepareFunctionToolInput(
+  tool: Pick<FunctionTool<any, any, any>, 'invoke'>,
+  input: string,
+): FunctionToolPreparedInput | undefined {
+  const registration = functionToolInputParsers.get(tool.invoke);
+  if (!registration) {
+    return undefined;
+  }
+  const result = parseFunctionToolInput(registration.parser, input);
+  const base = {
+    consumed: false,
+    input,
+    token: registration.token,
+    validationMode: registration.validationMode,
+  };
+  if (result.success) {
+    return { ...base, result };
+  }
+  return {
+    ...base,
+    result,
+    disposition: createInvalidToolInputDisposition(),
+  };
+}
+
+/** @internal */
+export function setFunctionToolPreparedInput(
+  details: object,
+  preparedInput: FunctionToolPreparedInput,
+): void {
+  functionToolPreparedInputs.set(details, preparedInput);
+}
+
+function copyFunctionToolPreparedInput(
+  source: object | undefined,
+  target: object | undefined,
+): void {
+  if (!source || !target) {
+    return;
+  }
+  const preparedInput = functionToolPreparedInputs.get(source);
+  if (preparedInput) {
+    functionToolPreparedInputs.set(target, preparedInput);
+  }
+}
 
 export function hasDynamicFunctionToolApprovalPolicy(
   tool: Pick<FunctionTool<any, any, any>, 'needsApproval'>,
@@ -105,6 +214,9 @@ export type ToolCallDetails = {
   resumeState?: string;
   signal?: AbortSignal;
   [FUNCTION_TOOL_PARSED_INPUT_CALLBACK]?: (input: unknown) => void;
+  [FUNCTION_TOOL_INVALID_OUTPUT_FAILURE_CALLBACK]?: (
+    failure: InvalidToolOutputFailure,
+  ) => void;
   /**
    * Internal: parent runner config for nested agent-tool runs (Agent.asTool).
    */
@@ -1325,6 +1437,16 @@ export function getToolSearchRuntimeToolKey<Context = UnknownContext>(
   return undefined;
 }
 
+/** @internal */
+export function getToolSearchRuntimeRoutingKey<Context = UnknownContext>(
+  tool: Tool<Context>,
+): string | undefined {
+  if (tool.type === 'function') {
+    return getFunctionToolLookupKeyForTool(tool);
+  }
+  return getToolSearchRuntimeToolKey(tool);
+}
+
 /**
  * A tool that can be called by the model.
  * @template Context The context passed to the tool
@@ -1404,32 +1526,38 @@ export type FunctionToolResult<
 /**
  * The parameters of a tool.
  *
- * This can be a Zod schema, a JSON schema or undefined.
+ * This can be a supported Standard Schema, a Zod schema, a JSON schema or undefined.
  *
- * If a Zod schema is provided, the arguments to the tool will automatically be parsed and validated
- * against the schema.
+ * If a supported Standard Schema or Zod schema is provided, the arguments to the tool will
+ * automatically be parsed and validated against the schema.
  *
  * If a JSON schema is provided, the arguments to the tool will be passed as is.
  *
  * If undefined is provided, the arguments to the tool will be passed as a string.
  */
 export type ToolInputParameters =
-  undefined | ZodObjectLike | JsonObjectSchema<any>;
+  | undefined
+  | ZodObjectLike
+  | StandardSchemaWithJSON<any, any>
+  | JsonObjectSchema<any>;
 
 /**
  * The parameters of a tool that has strict mode enabled.
  *
- * This can be a Zod schema, a JSON schema or undefined.
+ * This can be a supported Standard Schema, a Zod schema, a JSON schema or undefined.
  *
- * If a Zod schema is provided, the arguments to the tool will automatically be parsed and validated
- * against the schema.
+ * If a supported Standard Schema or Zod schema is provided, the arguments to the tool will
+ * automatically be parsed and validated against the schema.
  *
  * If a JSON schema is provided, the arguments to the tool will be parsed as JSON but not validated.
  *
  * If undefined is provided, the arguments to the tool will be passed as a string.
  */
 export type ToolInputParametersStrict =
-  undefined | ZodObjectLike | JsonObjectSchemaStrict<any>;
+  | undefined
+  | ZodObjectLike
+  | StandardSchemaWithJSON<any, any>
+  | JsonObjectSchemaStrict<any>;
 
 /**
  * The parameters of a tool that has strict mode disabled.
@@ -1468,15 +1596,17 @@ type ToolFallbackResult<TOutputSchema extends ToolOutputSchema | undefined> =
  *
  * The type of the arguments are derived from the parameters passed to the tool definition.
  *
- * If the parameters are passed as a JSON schema the type is `unknown`. For Zod schemas it will
- * match the inferred Zod type. Otherwise the type is `string`
+ * If the parameters are passed as a JSON schema the type is `unknown`. For Standard Schema and
+ * Zod schemas it will match the inferred validation output type. Otherwise the type is `string`.
  */
 export type ToolExecuteArgument<TParameters extends ToolInputParameters> =
-  TParameters extends ZodObjectLike
-    ? ZodInfer<TParameters>
-    : TParameters extends JsonObjectSchema<any>
-      ? unknown
-      : string;
+  TParameters extends StandardSchemaWithJSON<any, any>
+    ? StandardSchemaOutput<TParameters>
+    : TParameters extends ZodObjectLike
+      ? ZodInfer<TParameters>
+      : TParameters extends JsonObjectSchema<any>
+        ? unknown
+        : string;
 
 /**
  * The function to invoke when the tool is called.
@@ -1611,9 +1741,8 @@ type StrictToolOptionsBase<
   description: string;
 
   /**
-   * A Zod schema or JSON schema describing the parameters of the tool.
-   * If a Zod schema is provided, the arguments to the tool will automatically be parsed and validated
-   * against the schema.
+   * A supported Standard Schema, Zod schema, or JSON schema describing the parameters of the tool.
+   * Standard Schema and Zod parameters are automatically parsed and validated synchronously.
    */
   parameters: TParameters;
 
@@ -1982,14 +2111,19 @@ async function invokeFunctionToolWithTimeout<
         })
       : { signal: invocationSignal }
     : details;
+  copyFunctionToolPreparedInput(details, invokeDetails);
   const timeoutError = new ToolTimeoutError({
     toolName,
     timeoutMs,
   });
 
+  let invocationPromise: Promise<string | Result> | undefined;
   try {
-    return await Promise.race([
+    invocationPromise = Promise.resolve(
       invoke(runContext, input, invokeDetails),
+    );
+    return await Promise.race([
+      invocationPromise,
       new Promise<never>((_, reject) => {
         timeoutId = setTimeout(() => {
           timeoutTriggered = true;
@@ -2006,12 +2140,33 @@ async function invokeFunctionToolWithTimeout<
       throw error;
     }
 
+    const siblingCancellationSignal = details?.signal;
+    if (
+      siblingCancellationSignal &&
+      isSiblingCancellationSignal(siblingCancellationSignal)
+    ) {
+      throw siblingCancellationSignal.reason;
+    }
+
     if (timeoutBehavior === 'raise_exception') {
       throw timeoutError;
     }
 
     if (timeoutErrorFunction) {
-      return timeoutErrorFunction(runContext, timeoutError, details);
+      try {
+        return await timeoutErrorFunction(runContext, timeoutError, details);
+      } catch (error) {
+        const invalidOutputFailure = getInvalidToolOutputFailure(error);
+        if (invalidOutputFailure) {
+          details?.[FUNCTION_TOOL_INVALID_OUTPUT_FAILURE_CALLBACK]?.(
+            invalidOutputFailure,
+          );
+          if (refreshInvalidToolOutputFailure(invalidOutputFailure)) {
+            throw invalidOutputFailure.error;
+          }
+        }
+        throw error;
+      }
     }
 
     return defaultFunctionToolTimeoutErrorMessage({
@@ -2069,6 +2224,7 @@ export async function invokeFunctionTool<
         : cloneObjectWithDescriptorsAndOverrides(invocationDetails, {
             [FUNCTION_TOOL_TIMEOUT_ALREADY_ENFORCED]: true as const,
           });
+    copyFunctionToolPreparedInput(invocationDetails, detailsWithFlag);
 
     return tool.invoke(invocationRunContext, invocationInput, detailsWithFlag);
   };
@@ -2116,6 +2272,11 @@ export function tool<
   if (!strictMode && isZodObject(options.parameters)) {
     throw new UserError('Strict mode is required for Zod parameters');
   }
+  if (!strictMode && isStandardSchemaWithJSON(options.parameters)) {
+    throw new UserError(
+      'Strict mode is required for Standard Schema parameters',
+    );
+  }
   const hasOutputSchema = typeof options.outputSchema !== 'undefined';
   const toolErrorFunction =
     typeof options.errorFunction === 'undefined'
@@ -2159,6 +2320,7 @@ export function tool<
     name,
     { strict: strictMode },
   );
+  const inputParserToken = {};
   const zodOutputSchema = isZodObject(options.outputSchema)
     ? options.outputSchema
     : undefined;
@@ -2183,9 +2345,8 @@ export function tool<
         Result
       >;
     } catch (error) {
-      throw new InvalidToolOutputError(
+      throw createInvalidToolOutputError(
         `Invalid output for function tool '${name}'.`,
-        undefined,
         error,
         { runContext, output, details },
       );
@@ -2210,23 +2371,43 @@ export function tool<
     input: string,
     details?: ToolCallDetails,
   ): Promise<ToolExecuteResult<TOutputSchema, Result>> {
-    const [error, parsed] = await safeExecute(() => parser(input));
-    if (error !== null) {
-      if (logger.dontLogToolData) {
+    const preparedInput = details
+      ? functionToolPreparedInputs.get(details)
+      : undefined;
+    const canUsePreparedInput =
+      preparedInput !== undefined &&
+      !preparedInput.consumed &&
+      preparedInput.input === input &&
+      preparedInput.token === inputParserToken;
+    if (canUsePreparedInput) {
+      preparedInput.consumed = true;
+    }
+    const parseResult =
+      canUsePreparedInput && preparedInput
+        ? preparedInput.result
+        : parseFunctionToolInput(parser, input);
+    if (!parseResult.success) {
+      // supply the same context as options.execute for consuming
+      // downstream code to implement self-healing and/or tracing
+      const failure = createInvalidToolInputFailure({
+        message: 'Invalid JSON input for tool',
+        originalError: parseResult.error,
+        toolInvocation: { runContext, input, details },
+        disposition:
+          canUsePreparedInput && preparedInput
+            ? preparedInput.disposition
+            : undefined,
+        fatal: isAsyncStandardSchemaValidationError(parseResult.error),
+      });
+      if (failure.redacted || logger.dontLogToolData) {
+        refreshInvalidToolInputFailure(failure);
         logger.debug(`Invalid JSON input for tool ${name}`);
       } else {
         logger.debug(`Invalid JSON input for tool ${name}: ${input}`);
       }
-
-      // supply the same context as options.execute for consuming
-      // downstream code to implement self-healing and/or tracing
-      throw new InvalidToolInputError(
-        'Invalid JSON input for tool',
-        undefined, // no RunState available in this context
-        error,
-        { runContext, input, details },
-      );
+      throw failure.error;
     }
+    const parsed = parseResult.value;
 
     if (logger.dontLogToolData) {
       logger.debug(`Invoking tool ${name}`);
@@ -2259,31 +2440,123 @@ export function tool<
     return _invoke(runContext, input, details).catch(async (error) => {
       if (
         details?.signal?.aborted &&
-        (error === details.signal.reason ||
+        (isSiblingCancellationSignal(details.signal) ||
+          error === details.signal.reason ||
           isAbortError(error) ||
           details.signal.reason instanceof ToolTimeoutError)
       ) {
         throw error;
       }
 
-      if (toolErrorFunction) {
-        const currentSpan = getCurrentSpan();
-        currentSpan?.setError({
-          message: 'Error running tool (non-fatal)',
-          data: {
-            tool_name: name,
-            error: error.toString(),
-          },
-        });
-        return validateOutput(
-          await toolErrorFunction(runContext, error, details),
-          runContext,
-          details,
-        );
+      if (getInvalidToolInputFailure(error)?.fatal) {
+        throw error;
       }
 
-      throw error;
+      return resolveToolFailure(runContext, error, details);
     });
+  }
+
+  async function resolveToolFailure(
+    runContext: RunContext<Context>,
+    error: any,
+    details?: ToolCallDetails,
+  ): Promise<ToolExecuteResult<TOutputSchema, Result>> {
+    const invalidOutputFailure = getInvalidToolOutputFailure(error);
+    if (invalidOutputFailure) {
+      details?.[FUNCTION_TOOL_INVALID_OUTPUT_FAILURE_CALLBACK]?.(
+        invalidOutputFailure,
+      );
+    }
+    if (!toolErrorFunction) {
+      if (
+        invalidOutputFailure &&
+        refreshInvalidToolOutputFailure(invalidOutputFailure)
+      ) {
+        throw invalidOutputFailure.error;
+      }
+      throw error;
+    }
+    const invalidInputFailure = getInvalidToolInputFailure(error);
+    const redactedInputBeforeCallback = invalidInputFailure
+      ? refreshInvalidToolInputFailure(invalidInputFailure)
+      : isRedactedInvalidToolInputError(error);
+    const redactedOutputBeforeCallback = invalidOutputFailure
+      ? refreshInvalidToolOutputFailure(invalidOutputFailure)
+      : isRedactedInvalidToolOutputError(error);
+    const redactedBeforeCallback =
+      redactedInputBeforeCallback || redactedOutputBeforeCallback;
+    const callbackError =
+      invalidInputFailure?.error ?? invalidOutputFailure?.error ?? error;
+    const errorDetails = redactedBeforeCallback ? undefined : details;
+    const currentSpan = getCurrentSpan();
+    currentSpan?.setError({
+      message: 'Error running tool (non-fatal)',
+      data: {
+        tool_name: name,
+        error: callbackError.toString(),
+      },
+    });
+    try {
+      const output = await toolErrorFunction(
+        runContext,
+        callbackError,
+        errorDetails,
+      );
+      if (
+        invalidInputFailure &&
+        !redactedInputBeforeCallback &&
+        refreshInvalidToolInputFailure(invalidInputFailure)
+      ) {
+        throw invalidInputFailure.error;
+      }
+      if (
+        invalidOutputFailure &&
+        !redactedOutputBeforeCallback &&
+        refreshInvalidToolOutputFailure(invalidOutputFailure)
+      ) {
+        throw invalidOutputFailure.error;
+      }
+      const validatedOutput = validateOutput(output, runContext, errorDetails);
+      if (
+        invalidInputFailure &&
+        !redactedInputBeforeCallback &&
+        refreshInvalidToolInputFailure(invalidInputFailure)
+      ) {
+        throw invalidInputFailure.error;
+      }
+      if (
+        invalidOutputFailure &&
+        !redactedOutputBeforeCallback &&
+        refreshInvalidToolOutputFailure(invalidOutputFailure)
+      ) {
+        throw invalidOutputFailure.error;
+      }
+      return validatedOutput;
+    } catch (callbackFailure) {
+      if (
+        invalidInputFailure &&
+        refreshInvalidToolInputFailure(invalidInputFailure)
+      ) {
+        throw invalidInputFailure.error;
+      }
+      if (
+        invalidOutputFailure &&
+        refreshInvalidToolOutputFailure(invalidOutputFailure)
+      ) {
+        throw invalidOutputFailure.error;
+      }
+      const callbackInvalidOutputFailure =
+        getInvalidToolOutputFailure(callbackFailure);
+      if (callbackInvalidOutputFailure) {
+        details?.[FUNCTION_TOOL_INVALID_OUTPUT_FAILURE_CALLBACK]?.(
+          callbackInvalidOutputFailure,
+        );
+        if (refreshInvalidToolOutputFailure(callbackInvalidOutputFailure)) {
+          throw callbackInvalidOutputFailure.error;
+        }
+      }
+      throw callbackFailure;
+    }
   }
 
   async function invoke(
@@ -2322,6 +2595,15 @@ export function tool<
   if (typeof options.needsApproval !== 'function') {
     STATIC_FUNCTION_TOOL_APPROVAL_POLICIES.add(needsApproval);
   }
+  functionToolInputParsers.set(invoke, {
+    parser,
+    token: inputParserToken,
+    validationMode:
+      !isZodObject(options.parameters) &&
+      isStandardSchemaWithJSON(options.parameters)
+        ? 'standard'
+        : 'other',
+  });
 
   const isEnabled: ToolEnabledFunction<Context> =
     typeof options.isEnabled === 'function'

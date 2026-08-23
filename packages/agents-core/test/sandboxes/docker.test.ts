@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
   DockerSandboxClient,
   inContainerMountStrategy,
@@ -29,14 +29,6 @@ describe('DockerSandboxClient', () => {
   let rootDir: string;
   const cleanupContainerIds = new Set<string>();
 
-  beforeAll(() => {
-    if (!dockerAvailable) {
-      console.warn(
-        'Skipping Docker sandbox tests because Docker is unavailable.',
-      );
-    }
-  });
-
   afterEach(async () => {
     for (const containerId of cleanupContainerIds) {
       removeDockerContainer(containerId);
@@ -48,8 +40,8 @@ describe('DockerSandboxClient', () => {
     }
   });
 
-  itIfDocker(
-    'applies in-container command mounts inside Docker',
+  it(
+    'rejects custom command mount credential exposure before Docker side effects',
     async () => {
       rootDir = await mkdtemp(
         join(tmpdir(), 'agents-core-docker-sandbox-test-'),
@@ -58,52 +50,24 @@ describe('DockerSandboxClient', () => {
         workspaceBaseDir: rootDir,
         image: DOCKER_TEST_IMAGE,
       });
-      const session = await client.create(
-        new Manifest({
-          entries: {
-            mounted: {
-              type: 'mount',
-              source: 'memory://initial',
-              mountStrategy: inContainerMountStrategy({
-                pattern: {
-                  type: 'fuse',
-                  command:
-                    'printf initial > "$OPENAI_AGENTS_MOUNT_PATH/marker.txt"',
-                },
-              }),
+      await expect(
+        client.create(
+          new Manifest({
+            entries: {
+              mounted: {
+                type: 'mount',
+                source: 'memory://initial',
+                mountStrategy: inContainerMountStrategy({
+                  pattern: {
+                    type: 'fuse',
+                    command: 'custom-mount',
+                  },
+                }),
+              },
             },
-          },
-        }),
-      );
-      cleanupContainerIds.add(session.state.containerId);
-
-      const initialOutput = await session.execCommand({
-        cmd: 'cat mounted/marker.txt',
-      });
-      expect(initialOutput).toContain('initial');
-
-      await session.applyManifest(
-        new Manifest({
-          entries: {
-            applied: {
-              type: 'mount',
-              source: 'memory://applied',
-              mountStrategy: inContainerMountStrategy({
-                pattern: {
-                  type: 'fuse',
-                  command:
-                    'printf applied > "$OPENAI_AGENTS_MOUNT_PATH/marker.txt"',
-                },
-              }),
-            },
-          },
-        }),
-      );
-
-      const appliedOutput = await session.execCommand({
-        cmd: 'cat applied/marker.txt',
-      });
-      expect(appliedOutput).toContain('applied');
+          }).withInContainerMountCredentialExposureAcknowledged('mounted'),
+        ),
+      ).rejects.toThrow(/SDK-supported strategy/u);
     },
     DOCKER_TEST_TIMEOUT_MS,
   );

@@ -2,6 +2,7 @@ import type {
   JSONSchema7,
   LanguageModelV2 as LanguageModelV2Base,
   LanguageModelV2CallOptions,
+  LanguageModelV2FilePart,
   LanguageModelV2FunctionTool,
   LanguageModelV2Message,
   LanguageModelV2Prompt,
@@ -43,6 +44,7 @@ import {
 import {
   formatInlineData,
   getInlineMediaType,
+  snapshotRawUsage,
 } from '@openai/agents-core/utils/internal';
 import { isZodObject } from '@openai/agents/utils';
 import { extractUsage, toTracingUsage } from './usage';
@@ -79,6 +81,10 @@ type LanguageModelV2ProviderTool = {
 
 type LanguageModelV2ProviderToolCompat =
   LanguageModelV2ProviderDefinedTool | LanguageModelV2ProviderTool;
+
+type LanguageModelV2FunctionToolCompat = LanguageModelV2FunctionTool & {
+  strict: boolean;
+};
 
 /**
  * Provider tool definition returned by an AI SDK provider tool factory.
@@ -238,6 +244,11 @@ type ParsedInlineImageData = {
   mediaType: string;
 };
 
+const AI_SDK_FILE_INPUT_ERROR =
+  'AI SDK file inputs require a base64 data URL, valid non-empty raw base64 data with a PDF filename or providerData.mediaType, or a public HTTP(S) URL with a PDF filename or providerData.mediaType.';
+const AI_SDK_FILE_ID_ERROR =
+  'OpenAI file IDs are not supported by the AI SDK adapter. Use an OpenAI Responses model directly, or pass file data or a public HTTP(S) URL.';
+
 function parseBase64ImageDataUrl(
   imageSource: string,
 ): ParsedInlineImageData | undefined {
@@ -265,6 +276,167 @@ function parseBase64ImageDataUrl(
     data: imageSource.slice(commaIndex + 1),
     mediaType,
   };
+}
+
+function parseBase64FileDataUrl(
+  fileSource: string,
+): ParsedInlineImageData | undefined {
+  if (!/^data:/i.test(fileSource)) {
+    return undefined;
+  }
+
+  const commaIndex = fileSource.indexOf(',');
+  if (commaIndex === -1) {
+    return undefined;
+  }
+
+  const metadata = fileSource.slice('data:'.length, commaIndex);
+  const [maybeMediaType, ...parameters] = metadata.split(';');
+  const mediaType = maybeMediaType?.trim();
+  const isBase64 = parameters.some(
+    (parameter) => parameter.trim().toLowerCase() === 'base64',
+  );
+  if (!mediaType || !isBase64) {
+    return undefined;
+  }
+
+  return {
+    data: fileSource.slice(commaIndex + 1),
+    mediaType,
+  };
+}
+
+function isValidBase64Data(value: string): boolean {
+  const normalized = value.replace(/[\t\n\f\r ]/g, '');
+  if (
+    normalized.length === 0 ||
+    normalized.length % 4 === 1 ||
+    !/^[A-Za-z0-9+/]*={0,2}$/.test(normalized)
+  ) {
+    return false;
+  }
+
+  const paddingLength = normalized.endsWith('==')
+    ? 2
+    : normalized.endsWith('=')
+      ? 1
+      : 0;
+  if (paddingLength === 0) {
+    return true;
+  }
+
+  const dataLength = normalized.length - paddingLength;
+  return (
+    normalized.length % 4 === 0 &&
+    ((paddingLength === 1 && dataLength % 4 === 3) ||
+      (paddingLength === 2 && dataLength % 4 === 2))
+  );
+}
+
+function getProviderDataString(
+  providerData: Record<string, any> | undefined,
+  key: string,
+): string | undefined {
+  const value = providerData?.[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function parsePublicFileUrl(source: string): URL | undefined {
+  let url: URL;
+  try {
+    url = new URL(source);
+  } catch {
+    return undefined;
+  }
+
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new UserError(AI_SDK_FILE_INPUT_ERROR);
+  }
+  return url;
+}
+
+function getFileMediaType(
+  providerData: Record<string, any> | undefined,
+  filename: string | undefined,
+  url?: URL,
+): string {
+  const explicitMediaType = getProviderDataString(providerData, 'mediaType');
+  if (explicitMediaType) {
+    return explicitMediaType;
+  }
+
+  if (
+    [filename, url?.pathname].some((name) =>
+      name?.toLowerCase().endsWith('.pdf'),
+    )
+  ) {
+    return 'application/pdf';
+  }
+
+  throw new UserError(AI_SDK_FILE_INPUT_ERROR);
+}
+
+function toAiSdkFilePart(
+  model: LanguageModelCompatible,
+  input: protocol.InputFile,
+): LanguageModelV2FilePart {
+  const { file, filename, providerData } = input;
+  const providerOptions = toProviderOptions(providerData, model);
+
+  if (typeof file === 'string') {
+    const inlineFile = parseBase64FileDataUrl(file);
+    if (inlineFile) {
+      if (!isValidBase64Data(inlineFile.data)) {
+        throw new UserError(AI_SDK_FILE_INPUT_ERROR);
+      }
+      return {
+        type: 'file',
+        data: toAiSdkFileData(model, inlineFile.data),
+        mediaType: inlineFile.mediaType,
+        ...(filename ? { filename } : {}),
+        providerOptions,
+      };
+    }
+
+    if (file.startsWith('data:')) {
+      throw new UserError(AI_SDK_FILE_INPUT_ERROR);
+    }
+
+    const url = parsePublicFileUrl(file);
+    if (!url && !isValidBase64Data(file)) {
+      throw new UserError(AI_SDK_FILE_INPUT_ERROR);
+    }
+    const mediaType = getFileMediaType(providerOptions, filename, url);
+    return {
+      type: 'file',
+      data: toAiSdkFileData(model, url ?? file),
+      mediaType,
+      ...(filename ? { filename } : {}),
+      providerOptions,
+    };
+  }
+
+  if (isRecord(file)) {
+    const fileRecord: Record<string, unknown> = file;
+    if (typeof fileRecord.id === 'string') {
+      throw new UserError(AI_SDK_FILE_ID_ERROR);
+    }
+    if (typeof fileRecord.url === 'string') {
+      const url = parsePublicFileUrl(fileRecord.url);
+      if (!url) {
+        throw new UserError(AI_SDK_FILE_INPUT_ERROR);
+      }
+      return {
+        type: 'file',
+        data: toAiSdkFileData(model, url),
+        mediaType: getFileMediaType(providerOptions, filename, url),
+        ...(filename ? { filename } : {}),
+        providerOptions,
+      };
+    }
+  }
+
+  throw new UserError(AI_SDK_FILE_INPUT_ERROR);
 }
 
 /**
@@ -443,7 +615,7 @@ export function itemsToLanguageV2Messages(
                     };
                   }
                   if (c.type === 'input_file') {
-                    throw new UserError('File inputs are not supported.');
+                    return toAiSdkFilePart(model, c);
                   }
                   throw new UserError(`Unknown content type: ${c.type}`);
                 }),
@@ -732,6 +904,7 @@ export function itemsToLanguageV2Messages(
         };
         continue;
       }
+      flushCurrentAssistantMessage();
       messages.push({
         role: 'assistant',
         content: [
@@ -910,16 +1083,38 @@ function expectsObjectArguments(
   return false;
 }
 
-function buildRequestedToolsByName(
-  request: Pick<ModelRequest, 'tools' | 'handoffs'>,
-): Map<string, SerializedTool | SerializedHandoff> {
+function resolveRequestedTools(
+  request: Pick<ModelRequest, 'tools' | 'handoffs'> & {
+    _internal?: { toolNameCollisionPolicy?: 'warn' | 'error' };
+  },
+  logger: ReturnType<typeof getLogger>,
+): {
+  tools: SerializedTool[];
+  handoffs: SerializedHandoff[];
+  toolsByName: Map<string, SerializedTool | SerializedHandoff>;
+} {
   const toolsByName = new Map<string, SerializedTool | SerializedHandoff>();
+  const retainedToolIndices = new Set(request.tools.map((_, index) => index));
+  const retainedHandoffIndices = new Set(
+    request.handoffs.map((_, index) => index),
+  );
+  const routableEntriesByName = new Map<
+    string,
+    {
+      tool: SerializedTool | SerializedHandoff;
+      kind: 'tool' | 'handoff';
+      index: number;
+    }
+  >();
+  const collisionPolicy = request._internal?.toolNameCollisionPolicy ?? 'warn';
 
   const addRequestedTool = (
     name: string,
     tool: SerializedTool | SerializedHandoff,
+    entry: { kind: 'tool' | 'handoff'; index: number },
   ) => {
     const existing = toolsByName.get(name);
+    const existingRoutableEntry = routableEntriesByName.get(name);
     if (
       name === 'tool_search' &&
       existing &&
@@ -929,24 +1124,111 @@ function buildRequestedToolsByName(
         'AiSdkModel cannot disambiguate a hosted tool_search helper from a custom tool or handoff that is also named "tool_search". Rename the custom tool or use a different adapter.',
       );
     }
-
+    if (
+      existing &&
+      isFunctionToolOrHandoff(existing) !== isFunctionToolOrHandoff(tool)
+    ) {
+      const remediation =
+        'Assign unique tool names or toolNameOverride values, or use distinct namespaces.';
+      throw new UserError(
+        logger.dontLogToolData
+          ? `AiSdkModel cannot disambiguate tools with the same flattened name. ${remediation}`
+          : `AiSdkModel cannot disambiguate the flattened tool name '${name}'. ${remediation}`,
+      );
+    }
+    if (
+      existing &&
+      !isFunctionToolOrHandoff(existing) &&
+      !isFunctionToolOrHandoff(tool)
+    ) {
+      const remediation = 'Assign unique provider tool names.';
+      throw new UserError(
+        logger.dontLogToolData
+          ? `AiSdkModel cannot disambiguate provider tools with the same flattened name. ${remediation}`
+          : `AiSdkModel cannot disambiguate the flattened provider tool name '${name}'. ${remediation}`,
+      );
+    }
+    if (existingRoutableEntry && isFunctionToolOrHandoff(tool)) {
+      const remediation =
+        'Assign unique tool names or toolNameOverride values, or use distinct namespaces.';
+      const hasStructuredFunctionIdentity =
+        isStructuredFunctionTool(existingRoutableEntry.tool) ||
+        isStructuredFunctionTool(tool);
+      if (hasStructuredFunctionIdentity || collisionPolicy === 'error') {
+        throw new UserError(
+          logger.dontLogToolData
+            ? `AiSdkModel cannot disambiguate function tools and handoffs with the same flattened name. ${remediation}`
+            : `AiSdkModel cannot disambiguate the flattened tool name '${name}'. ${remediation}`,
+        );
+      }
+      logger.warn(
+        logger.dontLogToolData
+          ? `AI SDK tool name collision detected. ${remediation} Only the current dispatch winner will be exposed.`
+          : `AI SDK tool name collision detected for '${name}'. ${remediation} Only the current dispatch winner will be exposed.`,
+      );
+      if (existingRoutableEntry.kind === 'tool') {
+        retainedToolIndices.delete(existingRoutableEntry.index);
+      } else {
+        retainedHandoffIndices.delete(existingRoutableEntry.index);
+      }
+    }
     toolsByName.set(name, tool);
+    if (isFunctionToolOrHandoff(tool)) {
+      routableEntriesByName.set(name, { tool, ...entry });
+    }
   };
 
-  for (const tool of request.tools) {
+  for (const [index, tool] of request.tools.entries()) {
+    if (
+      tool.type === 'function' &&
+      typeof tool.namespace === 'string' &&
+      tool.namespace === tool.name
+    ) {
+      const remediation =
+        'Rename the namespace or tool, or use a Responses model for deferred top-level tools.';
+      throw new UserError(
+        logger.dontLogToolData
+          ? `AiSdkModel cannot route a function tool whose namespace matches its name because that wire shape is reserved for deferred top-level tools. ${remediation}`
+          : `AiSdkModel cannot route the function tool '${tool.name}' because its namespace matches its name and that wire shape is reserved for deferred top-level tools. ${remediation}`,
+      );
+    }
     addRequestedTool(
       tool.type === 'function'
         ? getSerializedFunctionToolName(tool)
         : tool.name,
       tool,
+      { kind: 'tool', index },
     );
   }
 
-  for (const handoff of request.handoffs) {
-    addRequestedTool(handoff.toolName, handoff);
+  for (const [index, handoff] of request.handoffs.entries()) {
+    addRequestedTool(handoff.toolName, handoff, { kind: 'handoff', index });
   }
 
-  return toolsByName;
+  return {
+    tools: request.tools.filter((_, index) => retainedToolIndices.has(index)),
+    handoffs: request.handoffs.filter((_, index) =>
+      retainedHandoffIndices.has(index),
+    ),
+    toolsByName,
+  };
+}
+
+function isFunctionToolOrHandoff(
+  tool: SerializedTool | SerializedHandoff,
+): boolean {
+  return 'toolName' in tool || tool.type === 'function';
+}
+
+function isStructuredFunctionTool(
+  tool: SerializedTool | SerializedHandoff,
+): tool is Extract<SerializedTool, { type: 'function' }> {
+  return (
+    !('toolName' in tool) &&
+    tool.type === 'function' &&
+    ((typeof tool.namespace === 'string' && tool.namespace.length > 0) ||
+      tool.deferLoading === true)
+  );
 }
 
 function isHostedToolSearchTool(
@@ -1122,11 +1404,19 @@ function createProtocolToolCallItem(args: {
   } else {
     toolCallArguments = JSON.stringify(input ?? {});
   }
+  const requestedFunctionTool =
+    requestedTool &&
+    !('toolName' in requestedTool) &&
+    requestedTool.type === 'function'
+      ? requestedTool
+      : undefined;
+  const namespace = requestedFunctionTool?.namespace;
 
   return {
     type: 'function_call',
     callId: toolCallId,
-    name: toolName,
+    name: namespace ? requestedFunctionTool.name : toolName,
+    ...(namespace ? { namespace } : {}),
     arguments: toolCallArguments,
     status: 'completed',
     providerData,
@@ -1330,6 +1620,64 @@ function isRecord(value: unknown): value is Record<string, any> {
   return typeof value === 'object' && value !== null;
 }
 
+function isPlainRecord(value: unknown): value is Record<string, any> {
+  if (!isRecord(value) || Array.isArray(value)) {
+    return false;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function getAiSdkProviderData(
+  model: LanguageModelCompatible,
+  modelSettings: ModelSettings,
+): Record<string, any> {
+  const providerData = modelSettings.providerData ?? {};
+  const promptCacheRetention = modelSettings.promptCacheRetention;
+
+  if (
+    model.provider !== 'openai.responses' ||
+    promptCacheRetention === undefined
+  ) {
+    return providerData;
+  }
+
+  if (getSpecVersion(model) === 'v2') {
+    throw new UserError(
+      'AI SDK prompt cache retention requires specificationVersion v3 or v4; v2 models do not support this option.',
+    );
+  }
+
+  const providerOptions = providerData.providerOptions;
+  if (providerOptions !== undefined && !isPlainRecord(providerOptions)) {
+    return providerData;
+  }
+
+  const openaiOptions = providerOptions?.openai;
+  if (openaiOptions !== undefined && !isPlainRecord(openaiOptions)) {
+    return providerData;
+  }
+
+  const providerPromptCacheRetention = openaiOptions?.promptCacheRetention;
+
+  return {
+    ...providerData,
+    providerOptions: {
+      ...providerOptions,
+      openai: {
+        ...openaiOptions,
+        promptCacheRetention:
+          providerPromptCacheRetention === undefined
+            ? promptCacheRetention === 'in-memory'
+              ? 'in_memory'
+              : promptCacheRetention
+            : providerPromptCacheRetention,
+      },
+    },
+  };
+}
+
 function getAiSdkToolName(tool: { name: string; namespace?: string }): string {
   return toolQualifiedName(tool.name, tool.namespace) ?? tool.name;
 }
@@ -1509,6 +1857,33 @@ function mergeProviderData(
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
+function mergeProviderMetadata(
+  base: Record<string, any> | undefined,
+  source: Record<string, any> | undefined,
+): Record<string, any> | undefined {
+  const merged = mergeProviderData(base, source);
+  if (!merged || !isRecord(base) || !isRecord(source)) {
+    return merged;
+  }
+
+  for (const provider of Object.keys(source)) {
+    if (isRecord(base[provider]) && isRecord(source[provider])) {
+      merged[provider] = {
+        ...base[provider],
+        ...source[provider],
+      };
+    }
+  }
+  return merged;
+}
+
+function shouldEmitReasoning(
+  text: string,
+  providerMetadata: Record<string, any> | undefined,
+): boolean {
+  return text.length > 0 || providerMetadata !== undefined;
+}
+
 function getHostedToolArgs(providerData: unknown): Record<string, any> {
   if (!isRecord(providerData)) {
     return {};
@@ -1532,7 +1907,7 @@ function getHostedToolArgs(providerData: unknown): Record<string, any> {
 export function toolToLanguageV2Tool(
   model: LanguageModelCompatible,
   tool: SerializedTool,
-): LanguageModelV2FunctionTool | LanguageModelV2ProviderToolCompat {
+): LanguageModelV2FunctionToolCompat | LanguageModelV2ProviderToolCompat {
   if (
     (tool.type === 'function' ||
       tool.type === 'shell' ||
@@ -1560,6 +1935,7 @@ export function toolToLanguageV2Tool(
       name: getSerializedFunctionToolName(tool),
       description: tool.description,
       inputSchema: tool.parameters as JSONSchema7,
+      strict: tool.strict,
       ...(Object.keys(providerOptions).length > 0 ? { providerOptions } : {}),
     };
   }
@@ -1761,6 +2137,51 @@ export class AiSdkModel implements Model {
     return transformed;
   }
 
+  async #transformOutputTextItems(
+    items: ModelResponse['output'],
+    request: ModelRequest,
+    stream: boolean,
+  ): Promise<void> {
+    let parts: protocol.OutputText[] = [];
+    const transformParts = async () => {
+      if (parts.length === 0) {
+        return;
+      }
+
+      const currentParts = parts;
+      parts = [];
+      const originalLengths = currentParts.map((part) => part.text.length);
+      const transformedText = await this.#transformOutputText(
+        currentParts.map((part) => part.text).join(''),
+        request,
+        stream,
+      );
+      let offset = 0;
+      for (const [index, part] of currentParts.entries()) {
+        const end =
+          index === currentParts.length - 1
+            ? transformedText.length
+            : Math.min(transformedText.length, offset + originalLengths[index]);
+        part.text = transformedText.slice(offset, end);
+        offset = end;
+      }
+    };
+
+    for (const item of items) {
+      if (item.type === 'message' && item.role === 'assistant') {
+        parts.push(
+          ...item.content.filter(
+            (content): content is protocol.OutputText =>
+              content.type === 'output_text',
+          ),
+        );
+      } else if (item.type !== 'reasoning') {
+        await transformParts();
+      }
+    }
+    await transformParts();
+  }
+
   async getResponse(request: ModelRequest) {
     return withGenerationSpan(async (span) => {
       try {
@@ -1794,11 +2215,15 @@ export class AiSdkModel implements Model {
           ];
         }
 
+        const resolvedRequestedTools = resolveRequestedTools(
+          request,
+          this.#logger,
+        );
         const tools = [
-          ...request.tools.map((tool) =>
+          ...resolvedRequestedTools.tools.map((tool) =>
             toolToLanguageV2Tool(this.#model, tool),
           ),
-          ...request.handoffs.map((handoff) =>
+          ...resolvedRequestedTools.handoffs.map((handoff) =>
             handoffToLanguageV2Tool(this.#model, handoff),
           ),
         ];
@@ -1811,7 +2236,7 @@ export class AiSdkModel implements Model {
           throw new UserError('Zod output type is not yet supported');
         }
 
-        const requestedToolsByName = buildRequestedToolsByName(request);
+        const requestedToolsByName = resolvedRequestedTools.toolsByName;
 
         const responseFormat: LanguageModelV2CallOptions['responseFormat'] =
           getResponseFormat(request.outputType);
@@ -1830,7 +2255,7 @@ export class AiSdkModel implements Model {
           responseFormat,
           abortSignal: request.signal,
 
-          ...(request.modelSettings.providerData ?? {}),
+          ...getAiSdkProviderData(this.#model, request.modelSettings),
         };
 
         if (this.#logger.dontLogModelData) {
@@ -1840,6 +2265,14 @@ export class AiSdkModel implements Model {
         }
 
         const result = await this.#model.doGenerate(aiSdkRequest);
+        const rawUsage =
+          request.modelSettings.preserveRawUsage === true
+            ? snapshotRawUsage((result as any).usage)
+            : undefined;
+        const preservedUsage =
+          rawUsage !== undefined
+            ? extractUsage((result as any).usage)
+            : undefined;
         const baseProviderData = buildBaseProviderData(
           this.#model,
           (result as any).response?.id,
@@ -1849,26 +2282,6 @@ export class AiSdkModel implements Model {
 
         const resultContent = (result as any).content ?? [];
 
-        // Emit reasoning before tool calls so Anthropic thinking signatures propagate into the next turn.
-        // Extract and add reasoning items FIRST (required by Anthropic: thinking blocks must precede tool_use blocks)
-        const reasoningParts = resultContent.filter(
-          (c: any) => c && c.type === 'reasoning',
-        );
-        for (const reasoningPart of reasoningParts) {
-          const reasoningText =
-            typeof reasoningPart.text === 'string' ? reasoningPart.text : '';
-          output.push({
-            type: 'reasoning',
-            content: [{ type: 'input_text', text: reasoningText }],
-            rawContent: [{ type: 'reasoning_text', text: reasoningText }],
-            // Preserve provider-specific metadata (including signature for Anthropic extended thinking)
-            providerData: mergeProviderData(
-              baseProviderData,
-              reasoningPart.providerMetadata,
-            ),
-          });
-        }
-
         const hasToolCalls = resultContent.some(
           (c: any) => c && c.type === 'tool-call',
         );
@@ -1876,11 +2289,63 @@ export class AiSdkModel implements Model {
           string,
           SerializedTool | SerializedHandoff
         >();
+        let pendingTextParts: string[] = [];
+        const flushPendingText = () => {
+          if (pendingTextParts.length === 0) {
+            return;
+          }
+          const textOutput: protocol.OutputText = {
+            type: 'output_text',
+            text: pendingTextParts.join(''),
+          };
+          output.push({
+            type: 'message',
+            content: [textOutput],
+            role: 'assistant',
+            status: 'completed',
+            providerData: mergeProviderData(
+              baseProviderData,
+              (result as any).providerMetadata,
+            ),
+          });
+          pendingTextParts = [];
+        };
         for (const part of resultContent) {
-          if (
-            !part ||
-            (part.type !== 'tool-call' && part.type !== 'tool-result')
-          ) {
+          if (!part) {
+            continue;
+          }
+
+          if (part.type === 'text' && typeof part.text === 'string') {
+            pendingTextParts.push(part.text);
+            continue;
+          }
+
+          if (part.type === 'reasoning') {
+            const reasoningText =
+              typeof part.text === 'string' ? part.text : '';
+            const reasoningProviderMetadata = mergeProviderData(
+              undefined,
+              part.providerMetadata,
+            );
+            if (
+              !shouldEmitReasoning(reasoningText, reasoningProviderMetadata)
+            ) {
+              continue;
+            }
+            flushPendingText();
+            output.push({
+              type: 'reasoning',
+              content: [{ type: 'input_text', text: reasoningText }],
+              rawContent: [{ type: 'reasoning_text', text: reasoningText }],
+              providerData: mergeProviderData(
+                baseProviderData,
+                reasoningProviderMetadata,
+              ),
+            });
+            continue;
+          }
+
+          if (part.type !== 'tool-call' && part.type !== 'tool-result') {
             continue;
           }
 
@@ -1909,20 +2374,20 @@ export class AiSdkModel implements Model {
               requestedToolsByCallId.set(part.toolCallId, requestedTool);
             }
 
-            output.push(
-              createProtocolToolCallItem({
-                requestedTool,
-                toolCallId: part.toolCallId,
-                toolName: part.toolName,
-                input: part.input,
-                providerExecuted: part.providerExecuted,
-                providerData: mergeProviderData(
-                  baseProviderData,
-                  part.providerMetadata ??
-                    (hasToolCalls ? result.providerMetadata : undefined),
-                ),
-              }),
-            );
+            const toolCallItem = createProtocolToolCallItem({
+              requestedTool,
+              toolCallId: part.toolCallId,
+              toolName: part.toolName,
+              input: part.input,
+              providerExecuted: part.providerExecuted,
+              providerData: mergeProviderData(
+                baseProviderData,
+                part.providerMetadata ??
+                  (hasToolCalls ? result.providerMetadata : undefined),
+              ),
+            });
+            flushPendingText();
+            output.push(toolCallItem);
             continue;
           }
 
@@ -1936,52 +2401,26 @@ export class AiSdkModel implements Model {
             ),
           });
           if (toolSearchOutput) {
+            flushPendingText();
             output.push(toolSearchOutput);
           }
         }
-
-        // Some of other platforms may return both tool calls and text.
-        // Putting a text message here will let the agent loop to complete,
-        // so adding this item only when the tool calls are empty.
-        // Note that the same support is not available for streaming mode.
-        if (!hasToolCalls) {
-          const textParts = resultContent.filter(
-            (c: any) => c && c.type === 'text' && typeof c.text === 'string',
-          );
-          if (textParts.length > 0) {
-            // A model response may contain multiple text parts. Concatenate them
-            // to mirror the streaming path (which accumulates every text-delta
-            // into a single output_text) instead of dropping all but the first.
-            const combinedText = textParts.map((c: any) => c.text).join('');
-            const transformedText = await this.#transformOutputText(
-              combinedText,
-              request,
-              false,
-            );
-            output.push({
-              type: 'message',
-              content: [{ type: 'output_text', text: transformedText }],
-              role: 'assistant',
-              status: 'completed',
-              providerData: mergeProviderData(
-                baseProviderData,
-                (result as any).providerMetadata,
-              ),
-            });
-          }
-        }
+        flushPendingText();
+        await this.#transformOutputTextItems(output, request, false);
+        const usage = preservedUsage ?? extractUsage((result as any).usage);
 
         if (span && request.tracing === true) {
           span.spanData.output = output;
         }
-
-        const usage = extractUsage((result as any).usage);
 
         const response = {
           responseId: (result as any).response?.id ?? 'FAKE_ID',
           usage: new Usage(usage),
           output,
           providerData: result,
+          ...(request.modelSettings.preserveRawUsage === true
+            ? { rawUsage }
+            : {}),
         } as const;
 
         if (span && request.tracing === true) {
@@ -2084,9 +2523,15 @@ export class AiSdkModel implements Model {
         ];
       }
 
+      const resolvedRequestedTools = resolveRequestedTools(
+        request,
+        this.#logger,
+      );
       const tools = [
-        ...request.tools.map((tool) => toolToLanguageV2Tool(this.#model, tool)),
-        ...request.handoffs.map((handoff) =>
+        ...resolvedRequestedTools.tools.map((tool) =>
+          toolToLanguageV2Tool(this.#model, tool),
+        ),
+        ...resolvedRequestedTools.handoffs.map((handoff) =>
           handoffToLanguageV2Tool(this.#model, handoff),
         ),
       ];
@@ -2111,9 +2556,9 @@ export class AiSdkModel implements Model {
         maxOutputTokens: request.modelSettings.maxTokens,
         responseFormat,
         abortSignal: request.signal,
-        ...(request.modelSettings.providerData ?? {}),
+        ...getAiSdkProviderData(this.#model, request.modelSettings),
       };
-      const requestedToolsByName = buildRequestedToolsByName(request);
+      const requestedToolsByName = resolvedRequestedTools.toolsByName;
 
       if (this.#logger.dontLogModelData) {
         this.#logger.debug('Request received (streamed)');
@@ -2133,30 +2578,108 @@ export class AiSdkModel implements Model {
       let usageCompletionTokens = 0;
       let usageInputTokensDetails: Record<string, number> | undefined;
       let usageOutputTokensDetails: Record<string, number> | undefined;
-      const toolItems: Array<
-        | protocol.FunctionCallItem
-        | protocol.ToolSearchCallItem
-        | protocol.ToolSearchOutputItem
-      > = [];
-      const toolCallItemIndexById = new Map<string, number>();
+      let rawUsage: Record<string, unknown> | undefined;
+      const recordUsage = (usage: ReturnType<typeof extractUsage>) => {
+        usagePromptTokens = usage.inputTokens;
+        usageCompletionTokens = usage.outputTokens;
+        usageInputTokensDetails = usage.inputTokensDetails;
+        usageOutputTokensDetails = usage.outputTokensDetails;
+      };
+      type StreamOutputEntry =
+        | { kind: 'reasoning'; reasoningId: string }
+        | {
+            kind: 'text';
+            output: protocol.OutputText;
+            itemId?: string;
+          }
+        | {
+            kind: 'tool';
+            item:
+              | protocol.FunctionCallItem
+              | protocol.ToolSearchCallItem
+              | protocol.ToolSearchOutputItem;
+          };
+      const orderedOutputEntries: StreamOutputEntry[] = [];
+      const toolCallEntryIndexById = new Map<string, number>();
       const requestedToolsByCallId = new Map<
         string,
         SerializedTool | SerializedHandoff
       >();
-      let textOutput: protocol.OutputText | undefined;
-      let textItemId: string | undefined;
+      let activeTextEntry:
+        Extract<StreamOutputEntry, { kind: 'text' }> | undefined;
 
-      // State for tracking reasoning blocks (for Anthropic extended thinking):
-      // Track reasoning deltas so we can preserve Anthropic signatures even when text is redacted.
-      const reasoningBlocks: Record<
+      const reasoningBlocks = new Map<
         string,
         {
           text: string;
           providerMetadata?: Record<string, any>;
         }
-      > = {};
+      >();
+      const getReasoningBlock = (
+        reasoningId: string,
+        providerMetadata: Record<string, any> | undefined,
+      ) => {
+        let reasoningBlock = reasoningBlocks.get(reasoningId);
+        if (!reasoningBlock) {
+          reasoningBlock = { text: '' };
+          reasoningBlocks.set(reasoningId, reasoningBlock);
+          orderedOutputEntries.push({ kind: 'reasoning', reasoningId });
+        }
+        reasoningBlock.providerMetadata = mergeProviderMetadata(
+          reasoningBlock.providerMetadata,
+          providerMetadata,
+        );
+        return reasoningBlock;
+      };
+      const closeActiveTextForReasoning = (reasoningBlock: {
+        text: string;
+        providerMetadata?: Record<string, any>;
+      }) => {
+        if (
+          shouldEmitReasoning(
+            reasoningBlock.text,
+            reasoningBlock.providerMetadata,
+          )
+        ) {
+          activeTextEntry = undefined;
+        }
+      };
+
+      const appendToolItem = (
+        item:
+          | protocol.FunctionCallItem
+          | protocol.ToolSearchCallItem
+          | protocol.ToolSearchOutputItem,
+        toolCallId?: string,
+      ) => {
+        const existingIndex = toolCallId
+          ? toolCallEntryIndexById.get(toolCallId)
+          : undefined;
+        if (existingIndex === undefined) {
+          activeTextEntry = undefined;
+          const entryIndex = orderedOutputEntries.length;
+          orderedOutputEntries.push({ kind: 'tool', item });
+          if (toolCallId) {
+            toolCallEntryIndexById.set(toolCallId, entryIndex);
+          }
+        } else {
+          orderedOutputEntries[existingIndex] = { kind: 'tool', item };
+        }
+      };
 
       for await (const part of stream) {
+        const preservedFinishUsage =
+          part.type === 'finish' &&
+          request.modelSettings.preserveRawUsage === true
+            ? snapshotRawUsage((part as any).usage)
+            : undefined;
+        if (part.type === 'finish') {
+          rawUsage = preservedFinishUsage;
+          if (preservedFinishUsage !== undefined) {
+            recordUsage(extractUsage(preservedFinishUsage));
+          }
+        }
+
         if (!started) {
           started = true;
           yield { type: 'response_started' };
@@ -2166,55 +2689,56 @@ export class AiSdkModel implements Model {
 
         switch (part.type) {
           case 'text-delta': {
-            if (!textOutput) {
-              textOutput = { type: 'output_text', text: '' };
-              // The adapter combines all AI SDK text blocks into one output
-              // message, so every normalized delta must use that message ID.
-              textItemId =
-                typeof (part as any).id === 'string'
-                  ? (part as any).id
-                  : undefined;
+            if (!activeTextEntry) {
+              activeTextEntry = {
+                kind: 'text',
+                output: { type: 'output_text', text: '' },
+                itemId:
+                  typeof (part as any).id === 'string'
+                    ? (part as any).id
+                    : undefined,
+              };
+              orderedOutputEntries.push(activeTextEntry);
             }
-            textOutput.text += (part as any).delta;
+            activeTextEntry.output.text += (part as any).delta;
             yield {
               type: 'output_text_delta',
               delta: (part as any).delta,
-              ...(textItemId ? { itemId: textItemId } : {}),
+              ...(activeTextEntry.itemId
+                ? { itemId: activeTextEntry.itemId }
+                : {}),
             };
             break;
           }
           case 'reasoning-start': {
             // Start tracking a new reasoning block
             const reasoningId = (part as any).id ?? 'default';
-            reasoningBlocks[reasoningId] = {
-              text: '',
-              providerMetadata: (part as any).providerMetadata,
-            };
+            const reasoningBlock = getReasoningBlock(
+              reasoningId,
+              (part as any).providerMetadata,
+            );
+            closeActiveTextForReasoning(reasoningBlock);
             break;
           }
           case 'reasoning-delta': {
             // Accumulate reasoning text
             const reasoningId = (part as any).id ?? 'default';
-            if (!reasoningBlocks[reasoningId]) {
-              reasoningBlocks[reasoningId] = {
-                text: '',
-                providerMetadata: (part as any).providerMetadata,
-              };
-            }
-            reasoningBlocks[reasoningId].text += (part as any).delta ?? '';
+            const reasoningBlock = getReasoningBlock(
+              reasoningId,
+              (part as any).providerMetadata,
+            );
+            reasoningBlock.text += (part as any).delta ?? '';
+            closeActiveTextForReasoning(reasoningBlock);
             break;
           }
           case 'reasoning-end': {
             // Capture final provider metadata (may contain signature)
             const reasoningId = (part as any).id ?? 'default';
-            if (
-              reasoningBlocks[reasoningId] &&
-              (part as any).providerMetadata
-            ) {
-              reasoningBlocks[reasoningId].providerMetadata = (
-                part as any
-              ).providerMetadata;
-            }
+            const reasoningBlock = getReasoningBlock(
+              reasoningId,
+              (part as any).providerMetadata,
+            );
+            closeActiveTextForReasoning(reasoningBlock);
             break;
           }
           case 'tool-call': {
@@ -2238,13 +2762,7 @@ export class AiSdkModel implements Model {
                   (part as any).providerMetadata,
                 ),
               });
-              const existingIndex = toolCallItemIndexById.get(toolCallId);
-              if (existingIndex === undefined) {
-                toolCallItemIndexById.set(toolCallId, toolItems.length);
-                toolItems.push(toolCallItem);
-              } else {
-                toolItems[existingIndex] = toolCallItem;
-              }
+              appendToolItem(toolCallItem, toolCallId);
             }
             break;
           }
@@ -2268,7 +2786,7 @@ export class AiSdkModel implements Model {
               ),
             });
             if (toolSearchOutput) {
-              toolItems.push(toolSearchOutput);
+              appendToolItem(toolSearchOutput);
             }
             break;
           }
@@ -2279,11 +2797,9 @@ export class AiSdkModel implements Model {
             break;
           }
           case 'finish': {
-            const usage = extractUsage((part as any).usage);
-            usagePromptTokens = usage.inputTokens;
-            usageCompletionTokens = usage.outputTokens;
-            usageInputTokensDetails = usage.inputTokensDetails;
-            usageOutputTokensDetails = usage.outputTokensDetails;
+            if (preservedFinishUsage === undefined) {
+              recordUsage(extractUsage((part as any).usage));
+            }
             break;
           }
           case 'error': {
@@ -2296,15 +2812,23 @@ export class AiSdkModel implements Model {
 
       const outputs: protocol.OutputModelItem[] = [];
 
-      // Add reasoning items FIRST (required by Anthropic: thinking blocks must precede tool_use blocks)
-      // Emit reasoning item even when text is empty to preserve signature in providerData for redacted thinking streams
-      for (const [reasoningId, reasoningBlock] of Object.entries(
-        reasoningBlocks,
-      )) {
-        if (reasoningBlock.text || reasoningBlock.providerMetadata) {
+      for (const entry of orderedOutputEntries) {
+        if (entry.kind === 'reasoning') {
+          const reasoningBlock = reasoningBlocks.get(entry.reasoningId);
+          if (!reasoningBlock) {
+            continue;
+          }
+          if (
+            !shouldEmitReasoning(
+              reasoningBlock.text,
+              reasoningBlock.providerMetadata,
+            )
+          ) {
+            continue;
+          }
           outputs.push({
             type: 'reasoning',
-            id: reasoningId !== 'default' ? reasoningId : undefined,
+            id: entry.reasoningId !== 'default' ? entry.reasoningId : undefined,
             content: [{ type: 'input_text', text: reasoningBlock.text }],
             rawContent: [{ type: 'reasoning_text', text: reasoningBlock.text }],
             // Preserve provider-specific metadata (including signature for Anthropic extended thinking)
@@ -2314,37 +2838,34 @@ export class AiSdkModel implements Model {
               responseId ? { responseId } : undefined,
             ),
           });
+          continue;
         }
-      }
 
-      if (textOutput) {
-        const transformedText = await this.#transformOutputText(
-          textOutput.text,
-          request,
-          true,
-        );
+        if (entry.kind === 'text') {
+          outputs.push({
+            type: 'message',
+            ...(entry.itemId ? { id: entry.itemId } : {}),
+            role: 'assistant',
+            content: [entry.output],
+            status: 'completed',
+            providerData: mergeProviderData(
+              baseProviderData,
+              responseId ? { responseId } : undefined,
+            ),
+          });
+          continue;
+        }
+
         outputs.push({
-          type: 'message',
-          ...(textItemId ? { id: textItemId } : {}),
-          role: 'assistant',
-          content: [{ ...textOutput, text: transformedText }],
-          status: 'completed',
+          ...entry.item,
           providerData: mergeProviderData(
             baseProviderData,
+            entry.item.providerData,
             responseId ? { responseId } : undefined,
           ),
         });
       }
-      for (const toolItem of toolItems) {
-        outputs.push({
-          ...toolItem,
-          providerData: mergeProviderData(
-            baseProviderData,
-            toolItem.providerData,
-            responseId ? { responseId } : undefined,
-          ),
-        });
-      }
+      await this.#transformOutputTextItems(outputs, request, true);
 
       const finalEvent: protocol.StreamEventResponseCompleted = {
         type: 'response_done',
@@ -2365,6 +2886,9 @@ export class AiSdkModel implements Model {
                 }
               : {}),
           },
+          ...(request.modelSettings.preserveRawUsage === true && rawUsage
+            ? { rawUsage }
+            : {}),
           output: outputs,
         },
       };
@@ -2401,7 +2925,9 @@ export class AiSdkModel implements Model {
       if (span) {
         span.setError({
           message:
-            error instanceof Error ? error.message : 'Error streaming response',
+            request.tracing === true && error instanceof Error
+              ? error.message
+              : 'Unknown error',
           data: {
             error:
               request.tracing === true

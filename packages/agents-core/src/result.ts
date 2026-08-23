@@ -16,7 +16,7 @@ import {
 } from '@openai/agents-core/_shims';
 import { ReadableStream } from './shims/interface';
 import { RunStreamEvent } from './events';
-import { getTurnInput } from './runner/items';
+import { getRunOutput, getTurnInput } from './runner/items';
 import { RunState } from './runState';
 import { RunContext } from './runContext';
 import type { AgentToolInvocation } from './agentToolInvocation';
@@ -28,6 +28,7 @@ import type {
   ToolOutputGuardrailResult,
 } from './toolGuardrail';
 import { combineAbortSignalsWithOptions } from './utils/abortSignals';
+import { processFinalOutputWithRedaction } from './utils/finalOutputError';
 
 type AbortHandlerRef<T extends object> = {
   current?: T;
@@ -158,7 +159,7 @@ class RunResultBase<
    * For the output including the agents, use the `newItems` property.
    */
   get output(): AgentOutputItem[] {
-    return getTurnInput([], this.newItems, this.state._reasoningItemIdPolicy);
+    return getRunOutput(this.newItems, this.state._reasoningItemIdPolicy);
   }
 
   /**
@@ -255,22 +256,27 @@ class RunResultBase<
    * Any interruptions that occurred during the agent run for example for tool approvals.
    */
   get interruptions(): RunToolApprovalItem[] {
-    if (this.state._currentStep?.type === 'next_step_interruption') {
-      return this.state._currentStep.data.interruptions;
-    }
-
-    return [];
+    return this.state.getInterruptions();
   }
 
   /**
    * The final output of the agent. If the output type was set to anything other than `text`,
-   * this will be parsed either as JSON or using the Zod schema you provided.
+   * this will be parsed either as JSON or using the validation schema you provided.
    */
   get finalOutput(): ResolvedAgentOutput<TAgent['outputType']> | undefined {
     if (this.state._currentStep?.type === 'next_step_final_output') {
-      return this.state._currentAgent.processFinalOutput(
-        this.state._currentStep.output,
-      ) as ResolvedAgentOutput<TAgent['outputType']>;
+      const output = this.state._currentStep.output;
+      if (this.state._currentAgent.outputType === 'text') {
+        return this.state._currentAgent.processFinalOutput(
+          output,
+        ) as ResolvedAgentOutput<TAgent['outputType']>;
+      }
+      return processFinalOutputWithRedaction(
+        () =>
+          this.state._currentAgent.processFinalOutput(
+            output,
+          ) as ResolvedAgentOutput<TAgent['outputType']>,
+      );
     }
 
     logger.warn('Accessed finalOutput before agent run is completed.');
@@ -300,6 +306,27 @@ export class StreamedRunResult<
   extends RunResultBase<TContext, TAgent>
   implements AsyncIterable<RunStreamEvent>
 {
+  #finalOutputHidden = false;
+
+  override get finalOutput():
+    ResolvedAgentOutput<TAgent['outputType']> | undefined {
+    if (this.#finalOutputHidden) {
+      logger.warn('Accessed finalOutput before agent run is completed.');
+      return undefined;
+    }
+    return super.finalOutput;
+  }
+
+  /** @internal */
+  _hideFinalOutput(): void {
+    this.#finalOutputHidden = true;
+  }
+
+  /** @internal */
+  _revealFinalOutput(): void {
+    this.#finalOutputHidden = false;
+  }
+
   /**
    * The current agent that is running
    */
@@ -308,9 +335,24 @@ export class StreamedRunResult<
   }
 
   /**
-   * The current turn number
+   * The number of model turns admitted so far.
+   *
+   * Written by the streaming runner at the point a turn is *admitted* -- after
+   * the `maxTurns` limit check and any blocking input guardrails have passed,
+   * immediately before the model request starts. It therefore counts turns that
+   * actually reached the model, not turns that were merely begun:
+   *
+   * - a handled max-turn boundary (e.g. `maxTurns: 0`) leaves this at `0`,
+   *   because the limit check throws before any turn is admitted;
+   * - a blocking input guardrail that trips on the first turn leaves this at
+   *   `0`, because no model request was made;
+   * - a resumed run starts from the turn count carried in the resumed state.
+   *
+   * `RunState._currentTurn` is incremented at the *start* of a turn, before
+   * either check. The runner rolls that increment back if the model request
+   * never starts, so resumed state carries only admitted turns.
    */
-  public currentTurn: number = 0;
+  public currentTurn = 0;
 
   /**
    * The maximum number of turns that can be run
@@ -318,11 +360,20 @@ export class StreamedRunResult<
   public maxTurns: number | null | undefined;
 
   #error: unknown = null;
+  #hasError = false;
   #combinedSignal?: AbortSignal;
   #abortSignalSnapshot?: AbortSignal;
   #abortController: AbortController;
   #readableController: ReadableStreamController<RunStreamEvent> | undefined;
   #readableStream: _ReadableStream<RunStreamEvent>;
+  #queuedStreamEvents: RunStreamEvent[] = [];
+  #queuedStreamEventIndex = 0;
+  #streamReadPending = false;
+  #streamTerminal:
+    | { type: 'done' }
+    | { type: 'error'; error: unknown; preserveQueuedItems: boolean }
+    | undefined;
+  #preserveQueuedItemsOnError = false;
   #completedPromise: Promise<void>;
   #completedPromiseResolve: (() => void) | undefined;
   #completedPromiseReject: ((err: unknown) => void) | undefined;
@@ -339,6 +390,13 @@ export class StreamedRunResult<
     } = {} as any,
   ) {
     super(result.state);
+    this.#finalOutputHidden =
+      result.state?._currentStep?.type === 'next_step_final_output';
+
+    // Seed from the resumed state so a run continued from a serialized state does
+    // not restart its public turn count at 0. A fresh run carries `_currentTurn = 0`
+    // here, so this is a no-op for the common case.
+    this.currentTurn = result.state?._currentTurn ?? 0;
 
     this.#abortController = new AbortController();
     const { signal: combinedSignal, cleanup: cleanupCombinedSignal } =
@@ -358,16 +416,26 @@ export class StreamedRunResult<
     this.#combinedSignalCleanup = cleanupCombinedSignal;
     this.#abortSignalSnapshot = combinedSignal;
 
-    this.#readableStream = new _ReadableStream<RunStreamEvent>({
-      start: (controller) => {
-        this.#readableController = controller;
+    this.#readableStream = new _ReadableStream<RunStreamEvent>(
+      {
+        start: (controller) => {
+          this.#readableController = controller;
+        },
+        pull: () => {
+          this.#streamReadPending = true;
+          this.#drainStreamQueue();
+        },
+        cancel: () => {
+          if (!this.#abortController.signal.aborted) {
+            this.#abortController.abort();
+          }
+          this.#cancelStream();
+        },
       },
-      cancel: () => {
-        if (!this.#abortController.signal.aborted) {
-          this.#abortController.abort();
-        }
+      {
+        highWaterMark: 0,
       },
-    });
+    );
 
     this.#completedPromise = new Promise((resolve, reject) => {
       this.#completedPromiseResolve = resolve;
@@ -398,9 +466,18 @@ export class StreamedRunResult<
    * Adds an item to the stream of output items
    */
   _addItem(item: RunStreamEvent) {
-    if (!this.cancelled) {
-      this.#readableController?.enqueue(item);
+    if (!this.cancelled && !this.#streamTerminal) {
+      this.#queuedStreamEvents.push(item);
+      this.#drainStreamQueue();
     }
+  }
+
+  /**
+   * @internal
+   * Keeps already queued events available if later cleanup fails.
+   */
+  _preserveQueuedItemsOnError() {
+    this.#preserveQueuedItemsOnError = true;
   }
 
   /**
@@ -408,9 +485,11 @@ export class StreamedRunResult<
    * Indicates that the stream has been completed
    */
   _done() {
-    if (!this.cancelled && this.#readableController) {
-      this.#readableController.close();
-      this.#readableController = undefined;
+    if (!this.cancelled) {
+      if (!this.#streamTerminal) {
+        this.#streamTerminal = { type: 'done' };
+      }
+      this.#drainStreamQueue();
     }
     this.#completedPromiseResolve?.();
     this.#detachAbortHandler();
@@ -420,16 +499,45 @@ export class StreamedRunResult<
    * @internal
    * Handles an error in the stream loop.
    */
-  _raiseError(err: unknown) {
-    if (!this.cancelled && this.#readableController) {
-      this.#readableController.error(err);
-      this.#readableController = undefined;
+  _raiseError(
+    err: unknown,
+    options?: {
+      preserveQueuedItems?: boolean;
+    },
+  ) {
+    if (!this.cancelled) {
+      const existingPreservedError =
+        this.#streamTerminal?.type === 'error' &&
+        this.#streamTerminal.preserveQueuedItems
+          ? this.#streamTerminal
+          : undefined;
+      const preserveQueuedItems =
+        options?.preserveQueuedItems === true ||
+        Boolean(existingPreservedError) ||
+        this.#preserveQueuedItemsOnError;
+      this.#streamTerminal = {
+        type: 'error',
+        error: existingPreservedError ? existingPreservedError.error : err,
+        preserveQueuedItems,
+      };
+      if (!preserveQueuedItems) {
+        this.#clearStreamQueue();
+        if (this.#readableController) {
+          this.#readableController.error(err);
+          this.#readableController = undefined;
+        }
+      } else {
+        this.#drainStreamQueue();
+      }
     }
-    this.#error = err;
-    this.#completedPromiseReject?.(err);
-    this.#completedPromise.catch((e) => {
-      logModelAndToolActionDebug(logger, 'Resulted in an error:', e);
-    });
+    if (!this.#hasError) {
+      this.#hasError = true;
+      this.#error = err;
+      this.#completedPromiseReject?.(err);
+      this.#completedPromise.catch((e) => {
+        logModelAndToolActionDebug(logger, 'Resulted in an error:', e);
+      });
+    }
     this.#detachAbortHandler();
   }
 
@@ -530,12 +638,20 @@ export class StreamedRunResult<
   }
 
   #handleAbort() {
+    this.#cancelStream();
+  }
+
+  #cancelStream() {
     if (this.#cancelled) {
       this.#detachAbortHandler();
       return;
     }
 
     this.#cancelled = true;
+    this.#clearStreamQueue();
+    this.#preserveQueuedItemsOnError = false;
+    this.#streamTerminal = { type: 'done' };
+    this.#streamReadPending = false;
 
     const controller = this.#readableController;
     this.#readableController = undefined;
@@ -553,6 +669,53 @@ export class StreamedRunResult<
     }
 
     this.#detachAbortHandler();
+  }
+
+  #drainStreamQueue() {
+    const controller = this.#readableController;
+    if (!controller || !this.#streamReadPending) {
+      return;
+    }
+    if (this.#queuedStreamEventIndex < this.#queuedStreamEvents.length) {
+      const event = this.#queuedStreamEvents[this.#queuedStreamEventIndex];
+      this.#queuedStreamEventIndex += 1;
+      this.#compactStreamQueue();
+      this.#streamReadPending = false;
+      controller.enqueue(event);
+      return;
+    }
+    if (this.#streamTerminal?.type === 'done') {
+      this.#streamReadPending = false;
+      controller.close();
+      this.#readableController = undefined;
+      return;
+    }
+    if (this.#streamTerminal?.type === 'error') {
+      this.#streamReadPending = false;
+      controller.error(this.#streamTerminal.error);
+      this.#readableController = undefined;
+    }
+  }
+
+  #clearStreamQueue() {
+    this.#queuedStreamEvents = [];
+    this.#queuedStreamEventIndex = 0;
+  }
+
+  #compactStreamQueue() {
+    if (this.#queuedStreamEventIndex === this.#queuedStreamEvents.length) {
+      this.#clearStreamQueue();
+      return;
+    }
+    if (
+      this.#queuedStreamEventIndex >= 1024 &&
+      this.#queuedStreamEventIndex * 2 >= this.#queuedStreamEvents.length
+    ) {
+      this.#queuedStreamEvents = this.#queuedStreamEvents.slice(
+        this.#queuedStreamEventIndex,
+      );
+      this.#queuedStreamEventIndex = 0;
+    }
   }
 
   #detachAbortHandler() {

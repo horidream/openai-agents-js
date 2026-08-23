@@ -16,6 +16,22 @@ import { OpenAIConversationsSession } from '../src';
 const createSession = (options: OpenAIConversationsSessionOptions) =>
   new OpenAIConversationsSession(options);
 
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+};
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve: Deferred<T>['resolve'];
+  let reject: Deferred<T>['reject'];
+  const promise = new Promise<T>((innerResolve, innerReject) => {
+    resolve = innerResolve;
+    reject = innerReject;
+  });
+  return { promise, resolve: resolve!, reject: reject! };
+}
+
 describe('OpenAIConversationsSession', () => {
   beforeEach(() => {
     convertToOutputItemMock.mockReset();
@@ -641,6 +657,298 @@ describe('OpenAIConversationsSession', () => {
     });
   });
 
+  it('preserves IDs required by program items when adding items', async () => {
+    const createMock = vi.fn();
+    const inputItems = [
+      {
+        id: 'program-item',
+        type: 'program',
+        callId: 'program-call',
+        code: 'return tools.lookup({ sku: "A-1" });',
+        fingerprint: 'program-fingerprint',
+      },
+      {
+        id: 'program-output-item',
+        type: 'program_output',
+        callId: 'program-call',
+        output: '{"available":42}',
+        status: 'completed',
+      },
+      {
+        id: 'message-item',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+      },
+    ];
+    getInputItemsMock.mockReturnValue([
+      {
+        id: 'program-item',
+        type: 'program',
+        call_id: 'program-call',
+        code: 'return tools.lookup({ sku: "A-1" });',
+        fingerprint: 'program-fingerprint',
+        providerData: { server: 'metadata' },
+      },
+      {
+        id: 'program-output-item',
+        type: 'program_output',
+        call_id: 'program-call',
+        result: '{"available":42}',
+        status: 'completed',
+        provider_data: { server: 'metadata' },
+      },
+      {
+        id: 'message-item',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+      },
+    ] as any);
+
+    const session = createSession({
+      client: {
+        conversations: {
+          items: {
+            list: vi.fn(),
+            create: createMock,
+            delete: vi.fn(),
+          },
+          create: vi.fn(),
+          delete: vi.fn(),
+        },
+      } as any,
+      conversationId: 'conv-123',
+    });
+
+    await session.addItems(inputItems as any);
+
+    expect(createMock).toHaveBeenCalledWith('conv-123', {
+      items: [
+        {
+          id: 'program-item',
+          type: 'program',
+          call_id: 'program-call',
+          code: 'return tools.lookup({ sku: "A-1" });',
+          fingerprint: 'program-fingerprint',
+        },
+        {
+          id: 'program-output-item',
+          type: 'program_output',
+          call_id: 'program-call',
+          result: '{"available":42}',
+          status: 'completed',
+        },
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [],
+        },
+      ],
+    });
+  });
+
+  it.each([
+    {
+      name: 'a missing program ID',
+      inputItem: {
+        type: 'program',
+        callId: 'program-call',
+        code: 'return 42;',
+        fingerprint: 'program-fingerprint',
+      },
+      convertedItem: {
+        id: undefined,
+        type: 'program',
+        call_id: 'program-call',
+        code: 'return 42;',
+        fingerprint: 'program-fingerprint',
+      },
+    },
+    {
+      name: 'a non-string program ID',
+      inputItem: {
+        id: 42,
+        type: 'program',
+        callId: 'program-call',
+        code: 'return 42;',
+        fingerprint: 'program-fingerprint',
+      },
+      convertedItem: {
+        id: 42,
+        type: 'program',
+        call_id: 'program-call',
+        code: 'return 42;',
+        fingerprint: 'program-fingerprint',
+      },
+    },
+    {
+      name: 'a non-string program output ID',
+      inputItem: {
+        id: 42,
+        type: 'program_output',
+        callId: 'program-call',
+        output: '42',
+        status: 'completed',
+      },
+      convertedItem: {
+        id: 42,
+        type: 'program_output',
+        call_id: 'program-call',
+        result: '42',
+        status: 'completed',
+      },
+    },
+  ])(
+    'does not synthesize or coerce $name',
+    async ({ inputItem, convertedItem }) => {
+      const createMock = vi
+        .fn()
+        .mockRejectedValue(new Error('Conversation item ID is invalid'));
+      getInputItemsMock.mockReturnValue([convertedItem] as any);
+
+      const session = createSession({
+        client: {
+          conversations: {
+            items: {
+              list: vi.fn(),
+              create: createMock,
+              delete: vi.fn(),
+            },
+            create: vi.fn(),
+            delete: vi.fn(),
+          },
+        } as any,
+        conversationId: 'conv-123',
+      });
+
+      await expect(session.addItems([inputItem] as any)).rejects.toThrow(
+        'Conversation item ID is invalid',
+      );
+      expect(createMock).toHaveBeenCalledWith('conv-123', {
+        items: [convertedItem],
+      });
+    },
+  );
+
+  it('preserves the conversation ID when replacing history with compaction', async () => {
+    const createItems = vi.fn();
+    const deleteConversation = vi.fn();
+    const compaction = {
+      type: 'compaction',
+      id: 'cmp-preserve-conversation-id',
+      encrypted_content: 'ciphertext',
+    };
+    const retained = {
+      type: 'message',
+      role: 'assistant',
+      status: 'completed',
+      content: [{ type: 'output_text', text: 'retained' }],
+    };
+    const program = {
+      id: 'program-item',
+      type: 'program',
+      call_id: 'program-call',
+      code: 'return 42;',
+      fingerprint: 'program-fingerprint',
+    };
+    const programOutput = {
+      id: 'program-output-item',
+      type: 'program_output',
+      call_id: 'program-call',
+      result: '42',
+      status: 'completed',
+    };
+    getInputItemsMock.mockReturnValue([
+      compaction,
+      program,
+      programOutput,
+      retained,
+    ] as any);
+    const session = createSession({
+      client: {
+        conversations: {
+          items: {
+            list: vi.fn(),
+            create: createItems,
+            delete: vi.fn(),
+          },
+          create: vi.fn(),
+          delete: deleteConversation,
+        },
+      } as any,
+      conversationId: 'conv-preserved',
+    });
+
+    await session.replaceHistoryWithCompaction([
+      compaction,
+      program,
+      programOutput,
+      retained,
+    ] as any);
+
+    expect(createItems).toHaveBeenCalledWith('conv-preserved', {
+      items: [
+        {
+          type: 'compaction',
+          encrypted_content: 'ciphertext',
+        },
+        program,
+        programOutput,
+        retained,
+      ],
+    });
+    expect(deleteConversation).not.toHaveBeenCalled();
+    await expect(session.getSessionId()).resolves.toBe('conv-preserved');
+  });
+
+  it('normalizes backend-assigned metadata for persistence comparison', () => {
+    getInputItemsMock.mockImplementation((items) => items);
+    const session = createSession({
+      client: {} as any,
+      conversationId: 'conv-persistence-comparison',
+    });
+    const expected = {
+      type: 'function_call',
+      id: 'response-function-call-id',
+      callId: 'call-persistence-comparison',
+      name: 'lookup',
+      arguments: '{}',
+      providerData: { model: 'gpt-5', source: 'response' },
+    };
+    const stored = {
+      ...expected,
+      id: 'backend-assigned-conversation-item-id',
+      providerData: { source: 'conversation' },
+    };
+
+    expect(
+      session.prepareHistoryItemsForPersistenceComparison([expected] as any),
+    ).toEqual(
+      session.prepareHistoryItemsForPersistenceComparison([stored] as any),
+    );
+    expect(
+      session.prepareHistoryItemsForPersistenceComparison([expected] as any),
+    ).toEqual([
+      {
+        type: 'function_call',
+        callId: 'call-persistence-comparison',
+        name: 'lookup',
+        arguments: '{}',
+      },
+    ]);
+    const program = {
+      id: 'program-persistence-id',
+      type: 'program',
+      call_id: 'program-call',
+      code: 'return 42;',
+      fingerprint: 'program-fingerprint',
+    };
+    expect(
+      session.prepareHistoryItemsForPersistenceComparison([program] as any),
+    ).toEqual([program]);
+  });
+
   it('preserves reasoning identity and encrypted content when adding items', async () => {
     const createMock = vi.fn();
     const inputItems = [
@@ -966,6 +1274,7 @@ describe('OpenAIConversationsSession', () => {
   });
 
   it('clearSession is a no-op before a conversation is created', async () => {
+    const createConversation = vi.fn();
     const deleteConversation = vi.fn();
 
     const session = createSession({
@@ -976,7 +1285,7 @@ describe('OpenAIConversationsSession', () => {
             create: vi.fn(),
             delete: vi.fn(),
           },
-          create: vi.fn(),
+          create: createConversation,
           delete: deleteConversation,
         },
       } as any,
@@ -984,7 +1293,253 @@ describe('OpenAIConversationsSession', () => {
 
     await session.clearSession();
 
+    expect(createConversation).not.toHaveBeenCalled();
     expect(deleteConversation).not.toHaveBeenCalled();
+    expect(session.sessionId).toBeUndefined();
+  });
+
+  it('shares one lazy conversation across concurrent getSessionId calls', async () => {
+    let resolveCreate!: (value: { id: string }) => void;
+    const createConversation = vi.fn(
+      () =>
+        new Promise<{ id: string }>((resolve) => {
+          resolveCreate = resolve;
+        }),
+    );
+
+    const session = createSession({
+      client: {
+        conversations: {
+          items: {
+            list: vi.fn(),
+            create: vi.fn(),
+            delete: vi.fn(),
+          },
+          create: createConversation,
+          delete: vi.fn(),
+        },
+      } as any,
+    });
+
+    const firstId = session.getSessionId();
+    const secondId = session.getSessionId();
+
+    await vi.waitFor(() => expect(createConversation).toHaveBeenCalledTimes(1));
+    resolveCreate({ id: 'conv-shared' });
+
+    await expect(Promise.all([firstId, secondId])).resolves.toEqual([
+      'conv-shared',
+      'conv-shared',
+    ]);
+    expect(createConversation).toHaveBeenCalledTimes(1);
+    expect(session.sessionId).toBe('conv-shared');
+  });
+
+  it('retries lazy creation after a create failure', async () => {
+    const createConversation = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('Create failed'))
+      .mockResolvedValueOnce({ id: 'conv-retry' });
+
+    const session = createSession({
+      client: {
+        conversations: {
+          items: {
+            list: vi.fn(),
+            create: vi.fn(),
+            delete: vi.fn(),
+          },
+          create: createConversation,
+          delete: vi.fn(),
+        },
+      } as any,
+    });
+
+    await expect(session.getSessionId()).rejects.toThrow('Create failed');
+    expect(session.sessionId).toBeUndefined();
+
+    await expect(session.getSessionId()).resolves.toBe('conv-retry');
+    expect(createConversation).toHaveBeenCalledTimes(2);
+    expect(session.sessionId).toBe('conv-retry');
+  });
+
+  it('retains and retries the same conversation ID after delete failure', async () => {
+    const createConversation = vi.fn();
+    const deleteConversation = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('Delete failed'))
+      .mockResolvedValueOnce({ deleted: true });
+
+    const session = createSession({
+      client: {
+        conversations: {
+          items: {
+            list: vi.fn(),
+            create: vi.fn(),
+            delete: vi.fn(),
+          },
+          create: createConversation,
+          delete: deleteConversation,
+        },
+      } as any,
+      conversationId: 'conv-existing',
+    });
+
+    await expect(session.clearSession()).rejects.toThrow('Delete failed');
+    expect(session.sessionId).toBe('conv-existing');
+
+    await expect(session.clearSession()).resolves.toBeUndefined();
+    expect(deleteConversation).toHaveBeenCalledTimes(2);
+    expect(deleteConversation).toHaveBeenNthCalledWith(1, 'conv-existing');
+    expect(deleteConversation).toHaveBeenNthCalledWith(2, 'conv-existing');
+    expect(createConversation).not.toHaveBeenCalled();
+    expect(session.sessionId).toBeUndefined();
+  });
+
+  it('creates a new conversation after a concurrent clear completes', async () => {
+    let resolveDelete!: () => void;
+    const deleteConversation = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveDelete = resolve;
+        }),
+    );
+    const createConversation = vi.fn().mockResolvedValue({ id: 'conv-new' });
+
+    const session = createSession({
+      client: {
+        conversations: {
+          items: {
+            list: vi.fn(),
+            create: vi.fn(),
+            delete: vi.fn(),
+          },
+          create: createConversation,
+          delete: deleteConversation,
+        },
+      } as any,
+      conversationId: 'conv-old',
+    });
+
+    const clear = session.clearSession();
+    await vi.waitFor(() =>
+      expect(deleteConversation).toHaveBeenCalledWith('conv-old'),
+    );
+
+    const getId = session.getSessionId();
+    expect(createConversation).not.toHaveBeenCalled();
+
+    resolveDelete();
+    await expect(clear).resolves.toBeUndefined();
+    await expect(getId).resolves.toBe('conv-new');
+    expect(createConversation).toHaveBeenCalledTimes(1);
+    expect(session.sessionId).toBe('conv-new');
+  });
+
+  it.each(['getItems', 'addItems', 'popItem'] as const)(
+    'waits for an in-flight lazy %s operation before clearing',
+    async (operationName) => {
+      const createConversation = createDeferred<{ id: string }>();
+      const itemOperation = createDeferred<void>();
+      const itemOperationStarted = createDeferred<void>();
+      const deleteConversation = vi.fn();
+      const list = vi.fn(() => ({
+        [Symbol.asyncIterator]() {
+          return {
+            async next() {
+              itemOperationStarted.resolve(undefined);
+              await itemOperation.promise;
+              return { done: true, value: undefined };
+            },
+          };
+        },
+      }));
+      const createItems = vi.fn(async () => {
+        itemOperationStarted.resolve(undefined);
+        await itemOperation.promise;
+      });
+
+      getInputItemsMock.mockReturnValue([
+        { type: 'message', role: 'user', content: 'hello' },
+      ] as any);
+
+      const session = createSession({
+        client: {
+          conversations: {
+            items: {
+              list,
+              create: createItems,
+              delete: vi.fn(),
+            },
+            create: vi.fn(() => createConversation.promise),
+            delete: deleteConversation,
+          },
+        } as any,
+      });
+
+      const operation =
+        operationName === 'getItems'
+          ? session.getItems()
+          : operationName === 'addItems'
+            ? session.addItems([
+                { type: 'message', role: 'user', content: 'hello' },
+              ] as any)
+            : session.popItem();
+      const clear = session.clearSession();
+
+      createConversation.resolve({ id: 'conv-lazy' });
+      await itemOperationStarted.promise;
+      expect(deleteConversation).not.toHaveBeenCalled();
+
+      itemOperation.resolve(undefined);
+      await operation;
+      await clear;
+
+      expect(deleteConversation).toHaveBeenCalledOnce();
+      expect(deleteConversation).toHaveBeenCalledWith('conv-lazy');
+      expect(session.sessionId).toBeUndefined();
+    },
+  );
+
+  it('releases a queued clear when an active item operation fails', async () => {
+    const itemOperation = createDeferred<void>();
+    const createItems = vi.fn(() => itemOperation.promise);
+    const deleteConversation = vi.fn();
+
+    getInputItemsMock.mockReturnValue([
+      { type: 'message', role: 'user', content: 'hello' },
+    ] as any);
+
+    const session = createSession({
+      client: {
+        conversations: {
+          items: {
+            list: vi.fn(),
+            create: createItems,
+            delete: vi.fn(),
+          },
+          create: vi.fn(),
+          delete: deleteConversation,
+        },
+      } as any,
+      conversationId: 'conv-existing',
+    });
+
+    const addItems = session.addItems([
+      { type: 'message', role: 'user', content: 'hello' },
+    ] as any);
+    const addItemsResult = expect(addItems).rejects.toThrow('Item failed');
+    await vi.waitFor(() => expect(createItems).toHaveBeenCalledOnce());
+
+    const clear = session.clearSession();
+    expect(deleteConversation).not.toHaveBeenCalled();
+
+    itemOperation.reject(new Error('Item failed'));
+    await addItemsResult;
+    await clear;
+
+    expect(deleteConversation).toHaveBeenCalledWith('conv-existing');
+    expect(session.sessionId).toBeUndefined();
   });
 
   it('treats input_* output arrays as raw items instead of response output arrays', async () => {

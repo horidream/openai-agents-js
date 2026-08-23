@@ -7,6 +7,7 @@ import {
   resetCurrentSpan,
   protocol,
   UserError,
+  ModelBehaviorError,
 } from '@openai/agents-core';
 import type {
   ModelRetryAdvice,
@@ -78,9 +79,13 @@ import {
   normalizeHostedMcpRequireApproval,
 } from '@openai/agents-core/utils';
 import {
+  reportModelFailureUsage,
+  assertValidCompactionItems,
   formatInlineData,
   getInlineMediaType,
+  snapshotRawUsage,
 } from '@openai/agents-core/utils/internal';
+import { FAKE_ID } from './openaiItemIds';
 
 type ModelTracingParent = Parameters<typeof createResponseSpan>[1];
 
@@ -282,15 +287,29 @@ type SerializedShellContainerSkill = NonNullable<
 type SerializedShellContainerNetworkPolicy =
   SerializedShellContainerAutoEnvironment['networkPolicy'];
 
+const replaySafeWebSocketErrors = new WeakSet<object>();
+const transientNeverSentWebSocketErrors = new WeakSet<object>();
+
+function markReplaySafeWebSocketError(error: unknown): void {
+  if (typeof error === 'object' && error !== null) {
+    replaySafeWebSocketErrors.add(error);
+  }
+}
+
+function markTransientNeverSentWebSocketError(error: unknown): void {
+  if (typeof error === 'object' && error !== null) {
+    transientNeverSentWebSocketErrors.add(error);
+  }
+}
+
 function isNeverSentWebSocketError(error: unknown): boolean {
-  if (isWebSocketNotOpenError(error)) {
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    transientNeverSentWebSocketErrors.has(error)
+  ) {
     return true;
   }
-
-  const errorCause =
-    error instanceof Error
-      ? (error as Error & { cause?: unknown }).cause
-      : undefined;
 
   if (
     error instanceof ResponsesWebSocketInternalError &&
@@ -299,14 +318,34 @@ function isNeverSentWebSocketError(error: unknown): boolean {
     return true;
   }
 
-  if (
+  const errorCause =
+    error instanceof Error
+      ? (error as Error & { cause?: unknown }).cause
+      : undefined;
+
+  return (
     errorCause instanceof ResponsesWebSocketInternalError &&
     errorCause.code === 'connection_closed_before_opening'
-  ) {
-    return true;
-  }
+  );
+}
 
-  return false;
+function isReplaySafeWebSocketError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    replaySafeWebSocketErrors.has(error)
+  );
+}
+
+function isTransientConnectionSetupError(error: unknown): boolean {
+  return (
+    (error instanceof ResponsesWebSocketInternalError &&
+      error.code === 'connection_closed_before_opening') ||
+    (error instanceof Error &&
+      error.message.startsWith(
+        'Responses websocket connection timed out before opening after ',
+      ))
+  );
 }
 
 function isAmbiguousWebSocketReplayError(error: unknown): boolean {
@@ -328,6 +367,26 @@ function isAmbiguousWebSocketReplayError(error: unknown): boolean {
     (errorCause.code === 'connection_closed_before_terminal_response_event' ||
       errorCause.code === 'pong_timeout')
   );
+}
+
+function markUnsafeWebSocketReplayError(
+  error: unknown,
+  responseStarted: boolean,
+): void {
+  if (!(error instanceof Error)) {
+    return;
+  }
+
+  const replayError = error as Error & {
+    unsafeToReplay?: boolean;
+    responseStarted?: boolean;
+  };
+  if (replayError.unsafeToReplay !== true) {
+    replayError.unsafeToReplay = true;
+  }
+  if (responseStarted && replayError.responseStarted !== true) {
+    replayError.responseStarted = true;
+  }
 }
 
 function hasSerializedComputerDisplayMetadata(
@@ -2045,7 +2104,7 @@ function getMessageItem(
         'phase',
       ]),
     };
-    return assistantMessage;
+    return stripSdkGeneratedPlaceholderItemId(assistantMessage);
   }
 
   throw new UserError(`Unsupported item ${JSON.stringify(item)}`);
@@ -2121,6 +2180,33 @@ function getPrompt(prompt: ModelRequest['prompt']):
   };
 }
 
+function stripSdkGeneratedPlaceholderItemId<
+  T extends OpenAI.Responses.ResponseInputItem,
+>(item: T): T {
+  const itemWithOptionalId = item as OpenAI.Responses.ResponseInputItem & {
+    id?: unknown;
+  };
+  if (itemWithOptionalId.id !== FAKE_ID) {
+    return item;
+  }
+
+  const { id: _id, ...itemWithoutId } = itemWithOptionalId;
+  return itemWithoutId as T;
+}
+
+function stripOutputOnlyCreatedBy<T extends OpenAI.Responses.ResponseInputItem>(
+  item: T,
+): T {
+  if (!Object.prototype.hasOwnProperty.call(item, 'created_by')) {
+    return item;
+  }
+
+  const { created_by: _createdBy, ...withoutCreatedBy } = item as T & {
+    created_by?: string;
+  };
+  return withoutCreatedBy as T;
+}
+
 function getInputItems(
   input: ModelRequest['input'],
 ): OpenAI.Responses.ResponseInputItem[] {
@@ -2133,7 +2219,7 @@ function getInputItems(
     ];
   }
 
-  return input.map((item): OpenAI.Responses.ResponseInputItem => {
+  const inputItems = input.map((item): OpenAI.Responses.ResponseInputItem => {
     if (isMessageItem(item)) {
       return getMessageItem(item);
     }
@@ -2254,7 +2340,7 @@ function getInputItems(
         ]),
       };
 
-      return entry;
+      return stripSdkGeneratedPlaceholderItemId(entry);
     }
 
     if (item.type === 'function_call_result') {
@@ -2459,7 +2545,7 @@ function getInputItems(
         id: item.id ?? undefined,
         call_id: item.callId,
         status: item.status ?? 'in_progress',
-        operation: item.operation,
+        operation: serializeApplyPatchOperationForResponses(item.operation),
         ...(item.caller ? { caller: toOpenAIToolCaller(item.caller) } : {}),
       };
 
@@ -2651,14 +2737,13 @@ function getInputItems(
     if (item.type === 'compaction') {
       const encryptedContent =
         (item as any).encrypted_content ?? (item as any).encryptedContent;
-      if (typeof encryptedContent !== 'string') {
-        throw new UserError('Compaction item missing encrypted_content');
-      }
-      return {
+      const compactionItem = {
         type: 'compaction',
         id: item.id ?? undefined,
         encrypted_content: encryptedContent,
-      } as OpenAI.Responses.ResponseInputItem;
+      } as protocol.CompactionItem;
+      assertValidCompactionItems([compactionItem]);
+      return compactionItem as OpenAI.Responses.ResponseInputItem;
     }
 
     if (item.type === 'unknown') {
@@ -2671,6 +2756,7 @@ function getInputItems(
     const exhaustive = item satisfies never;
     throw new UserError(`Unsupported item ${JSON.stringify(exhaustive)}`);
   });
+  return inputItems.map(stripOutputOnlyCreatedBy);
 }
 
 // As of May 29, the output is always screenshot putput
@@ -2985,13 +3071,16 @@ function convertToOutputItem(
             path: operation.path,
           };
           break;
-        case 'update_file':
+        case 'update_file': {
+          const moveTo = getApplyPatchMoveDestination(operation);
           normalizedOperation = {
             type: 'update_file',
             path: operation.path,
             diff: operation.diff,
+            ...(moveTo !== undefined ? { moveTo } : {}),
           };
           break;
+        }
         default:
           throw new UserError('Unknown apply_patch operation type');
       }
@@ -3103,16 +3192,14 @@ function convertToOutputItem(
         created_by?: string;
         id?: string;
       };
-      if (typeof encrypted_content !== 'string') {
-        throw new UserError('Compaction item missing encrypted_content');
-      }
-      const output: protocol.CompactionItem = {
+      const output = {
         type: 'compaction',
         id: item.id ?? undefined,
         encrypted_content,
         created_by,
         providerData,
-      };
+      } as unknown as protocol.CompactionItem;
+      assertValidCompactionItems([output]);
       return output;
     }
 
@@ -3124,6 +3211,33 @@ function convertToOutputItem(
   });
 }
 
+function getApplyPatchMoveDestination(operation: unknown): string | undefined {
+  const moveTo = (operation as { move_to?: unknown }).move_to;
+  if (moveTo === undefined || moveTo === null) {
+    return undefined;
+  }
+  if (typeof moveTo !== 'string' || moveTo.length === 0) {
+    throw new UserError(
+      'apply_patch_call update_file move_to must be a non-empty string',
+    );
+  }
+  return moveTo;
+}
+
+function serializeApplyPatchOperationForResponses(
+  operation: protocol.ApplyPatchOperation,
+): OpenAI.Responses.ResponseInputItem.ApplyPatchCall['operation'] {
+  if (operation.type !== 'update_file' || operation.moveTo === undefined) {
+    return operation;
+  }
+
+  const { moveTo, ...rest } = operation;
+  return {
+    ...rest,
+    move_to: moveTo,
+  } as OpenAI.Responses.ResponseInputItem.ApplyPatchCall['operation'];
+}
+
 export { getToolChoice, convertTool, getInputItems, convertToOutputItem };
 
 const TERMINAL_RESPONSES_STREAM_EVENT_TYPES = new Set([
@@ -3131,6 +3245,7 @@ const TERMINAL_RESPONSES_STREAM_EVENT_TYPES = new Set([
   'response.failed',
   'response.incomplete',
   'response.error',
+  'error',
 ]);
 
 function isTerminalResponsesStreamEventType(
@@ -3140,6 +3255,51 @@ function isTerminalResponsesStreamEventType(
     typeof eventType === 'string' &&
     TERMINAL_RESPONSES_STREAM_EVENT_TYPES.has(eventType)
   );
+}
+
+type UnsuccessfulResponseError = ModelBehaviorError & {
+  readonly unsafeToReplay: true;
+  readonly responseStarted: true;
+};
+
+function getUnsuccessfulResponseTerminalType(
+  response: OpenAI.Responses.Response | undefined,
+  eventType?: string,
+): string | undefined {
+  if (
+    eventType === 'response.failed' ||
+    eventType === 'response.incomplete' ||
+    eventType === 'response.error' ||
+    eventType === 'error' ||
+    (eventType === 'response.completed' && !response)
+  ) {
+    return eventType;
+  }
+
+  const status = (response as { status?: unknown } | undefined)?.status;
+  return status === 'failed' || status === 'incomplete'
+    ? `response.${status}`
+    : undefined;
+}
+
+function createUnsuccessfulResponseError(
+  terminalType: string,
+  request: ModelRequest,
+  usage?: Usage,
+): UnsuccessfulResponseError {
+  const error = new ModelBehaviorError(
+    terminalType === 'response.completed'
+      ? 'OpenAI Responses terminal event "response.completed" is missing its required response payload.'
+      : `OpenAI Responses request ended with unsuccessful terminal state "${terminalType}".`,
+  ) as UnsuccessfulResponseError;
+  Object.defineProperties(error, {
+    unsafeToReplay: { value: true },
+    responseStarted: { value: true },
+  });
+  if (usage) {
+    reportModelFailureUsage(request, error, usage);
+  }
+  return error;
 }
 
 type ResponseStreamWithRequestID =
@@ -3235,6 +3395,16 @@ export class OpenAIResponsesModel implements Model {
     response: OpenAI.Responses.Response,
   ): OpenAI.Responses.Response {
     return response;
+  }
+
+  /**
+   * @internal
+   */
+  protected _getUnsuccessfulResponseTerminalType(
+    response: OpenAI.Responses.Response | undefined,
+    eventType?: string,
+  ): string | undefined {
+    return getUnsuccessfulResponseTerminalType(response, eventType);
   }
 
   /**
@@ -3428,11 +3598,6 @@ export class OpenAIResponsesModel implements Model {
     }
     const responseFormat = getResponseFormat(request.outputType, mergedText);
 
-    let parallelToolCalls: boolean | undefined = undefined;
-    if (typeof request.modelSettings.parallelToolCalls === 'boolean') {
-      parallelToolCalls = request.modelSettings.parallelToolCalls;
-    }
-
     const shouldSendTools =
       tools.length > 0 ||
       request.toolsExplicitlyProvided === true ||
@@ -3466,7 +3631,6 @@ export class OpenAIResponsesModel implements Model {
       ...(!shouldOmitToolChoice
         ? { tool_choice: compatibleToolChoice as ToolChoiceOptions }
         : {}),
-      parallel_tool_calls: parallelToolCalls,
       stream,
       text: responseFormat,
       store: request.modelSettings.store,
@@ -3485,6 +3649,24 @@ export class OpenAIResponsesModel implements Model {
         ...requestData,
         ...transportOverrides.extraBody,
       };
+    }
+
+    const hasExplicitTools =
+      Array.isArray(requestData.tools) && requestData.tools.length > 0;
+    const promptMaySupplyTools =
+      Boolean(request.prompt) &&
+      requestData.tools === undefined &&
+      request.toolsExplicitlyProvided !== true;
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        requestData,
+        'parallel_tool_calls',
+      ) &&
+      typeof request.modelSettings.parallelToolCalls === 'boolean' &&
+      (hasExplicitTools || promptMaySupplyTools)
+    ) {
+      (requestData as Record<string, unknown>).parallel_tool_calls =
+        request.modelSettings.parallelToolCalls;
     }
 
     requestData = {
@@ -3536,17 +3718,35 @@ export class OpenAIResponsesModel implements Model {
    * @returns A promise that resolves to the response from the model.
    */
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    const response = await withResponseSpan(
+    const { response, rawUsage, preservedUsage } = await withResponseSpan(
       async (span) => {
         const response = await this._fetchResponse(request, false);
+        const rawUsage =
+          request.modelSettings.preserveRawUsage === true
+            ? snapshotRawUsage(response.usage)
+            : undefined;
+        const preservedUsage =
+          rawUsage !== undefined ? this._getResponseUsage(response) : undefined;
+        const terminalType =
+          this._getUnsuccessfulResponseTerminalType(response);
 
         if (request.tracing) {
           span.spanData.response_id = response.id;
-          span.spanData._input = request.input;
-          span.spanData._response = response;
+          if (request.tracing === true || !terminalType) {
+            span.spanData._input = request.input;
+            span.spanData._response = response;
+          }
         }
 
-        return response;
+        if (terminalType) {
+          throw createUnsuccessfulResponseError(
+            terminalType,
+            request,
+            preservedUsage ?? this._getResponseUsage(response),
+          );
+        }
+
+        return { response, rawUsage, preservedUsage };
       },
       undefined,
       getModelTracingParent(request),
@@ -3554,13 +3754,14 @@ export class OpenAIResponsesModel implements Model {
 
     const responseForSDKOutput = this._getResponseForSDKOutput(response);
     const output: ModelResponse = {
-      usage: this._getResponseUsage(response),
+      usage: preservedUsage ?? this._getResponseUsage(response),
       output: this._convertResponseOutputItems(
         responseForSDKOutput.output as Array<Record<string, any>>,
       ),
       responseId: response.id,
       requestId: getOpenAIResponseRequestId(response),
       providerData: response,
+      ...(rawUsage !== undefined ? { rawUsage } : {}),
     };
 
     return output;
@@ -3577,6 +3778,7 @@ export class OpenAIResponsesModel implements Model {
     const span = request.tracing
       ? createResponseSpan(undefined, getModelTracingParent(request))
       : undefined;
+    let terminalError: UnsuccessfulResponseError | undefined;
     try {
       if (span) {
         span.start();
@@ -3619,30 +3821,64 @@ export class OpenAIResponsesModel implements Model {
         } else if (isTerminalResponsesStreamEventType(eventType)) {
           const terminalEvent =
             event as OpenAI.Responses.ResponseStreamEvent & {
-              response: OpenAI.Responses.Response;
+              response?: OpenAI.Responses.Response;
             };
-          finalResponse = terminalEvent.response;
-          const { response, ...remainingEvent } = terminalEvent;
-          const {
-            output: _output,
-            usage: _usage,
-            id,
-            ...remainingResponse
-          } = response;
-          const responseForSDKOutput = this._getResponseForSDKOutput(response);
-          yield {
-            type: 'response_done',
-            response: {
-              id: id,
-              requestId: getOpenAIResponseRequestId(response),
-              output: this._convertResponseOutputItems(
-                responseForSDKOutput.output as Array<Record<string, any>>,
-              ),
-              usage: this._getStreamedResponseUsage(response),
-              providerData: remainingResponse,
-            },
-            providerData: remainingEvent,
-          };
+          const terminalResponse = terminalEvent.response;
+          const unsuccessfulTerminalType =
+            this._getUnsuccessfulResponseTerminalType(
+              terminalResponse,
+              eventType,
+            );
+          if (unsuccessfulTerminalType) {
+            terminalError = createUnsuccessfulResponseError(
+              unsuccessfulTerminalType,
+              request,
+              terminalResponse
+                ? this._getResponseUsage(terminalResponse)
+                : undefined,
+            );
+            if (terminalResponse) {
+              finalResponse = terminalResponse;
+            }
+            if (span && terminalResponse) {
+              span.spanData.response_id = terminalResponse.id;
+              if (request.tracing === true) {
+                span.spanData._response = terminalResponse;
+              }
+            }
+            if (span?.error === null) {
+              span.setError({
+                message: terminalError.message,
+              });
+            }
+          } else if (terminalResponse) {
+            finalResponse = terminalResponse;
+            const { response: _response, ...remainingEvent } = terminalEvent;
+            const {
+              output: _output,
+              usage: _usage,
+              id,
+              ...remainingResponse
+            } = terminalResponse;
+            const responseForSDKOutput =
+              this._getResponseForSDKOutput(terminalResponse);
+            yield {
+              type: 'response_done',
+              response: {
+                id: id,
+                requestId: getOpenAIResponseRequestId(terminalResponse),
+                output: this._convertResponseOutputItems(
+                  responseForSDKOutput.output as Array<Record<string, any>>,
+                ),
+                usage: this._getStreamedResponseUsage(terminalResponse),
+                ...(request.modelSettings.preserveRawUsage === true
+                  ? { rawUsage: snapshotRawUsage(terminalResponse.usage) }
+                  : {}),
+                providerData: remainingResponse,
+              },
+              providerData: remainingEvent,
+            };
+          }
         } else if (eventType === 'response.output_text.delta') {
           const { delta, ...remainingEvent } = event as unknown as {
             delta: string;
@@ -3678,26 +3914,32 @@ export class OpenAIResponsesModel implements Model {
             },
           };
         }
+        if (terminalError) {
+          throw terminalError;
+        }
       }
 
       if (request.tracing && span && finalResponse) {
         span.spanData.response_id = finalResponse.id;
-        span.spanData._response = finalResponse;
+        if (request.tracing === true || !terminalError) {
+          span.spanData._response = finalResponse;
+        }
       }
     } catch (error) {
-      if (span) {
+      const errorToThrow = terminalError ?? error;
+      if (span?.error === null) {
         span.setError({
           message: 'Error streaming response',
           data: {
             error: request.tracing
-              ? String(error)
-              : error instanceof Error
-                ? error.name
+              ? String(errorToThrow)
+              : errorToThrow instanceof Error
+                ? errorToThrow.name
                 : undefined,
           },
         });
       }
-      throw error;
+      throw errorToThrow;
     } finally {
       if (span) {
         span.end();
@@ -3759,12 +4001,22 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
       };
     }
 
-    if (isAmbiguousWebSocketReplayError(args.error)) {
+    if (isReplaySafeWebSocketError(args.error)) {
       return {
         suggested: false,
-        replaySafety: 'unsafe',
+        replaySafety: 'safe',
         reason: args.error instanceof Error ? args.error.message : undefined,
       };
+    }
+
+    if (isAmbiguousWebSocketReplayError(args.error)) {
+      return (
+        super.getRetryAdvice(args) ?? {
+          suggested: false,
+          replaySafety: 'unsafe',
+          reason: args.error instanceof Error ? args.error.message : undefined,
+        }
+      );
     }
 
     return super.getRetryAdvice(args);
@@ -3796,37 +4048,46 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
       return this.#iterWebSocketResponseEvents(builtRequest);
     }
 
-    let finalResponse: OpenAI.Responses.Response | undefined;
-    let receivedAnyEvent = false;
+    let receivedResponseEvent = false;
     try {
+      let finalResponse: OpenAI.Responses.Response | undefined;
       for await (const event of this.#iterWebSocketResponseEvents(
         builtRequest,
       )) {
-        receivedAnyEvent = true;
+        receivedResponseEvent = true;
         const eventType = (event as { type?: string }).type;
         if (isTerminalResponsesStreamEventType(eventType)) {
-          finalResponse = (event as { response: OpenAI.Responses.Response })
-            .response;
+          const terminalResponse = (
+            event as { response?: OpenAI.Responses.Response }
+          ).response;
+          const unsuccessfulTerminalType =
+            this._getUnsuccessfulResponseTerminalType(
+              terminalResponse,
+              eventType,
+            );
+          if (unsuccessfulTerminalType && !terminalResponse) {
+            throw createUnsuccessfulResponseError(
+              unsuccessfulTerminalType,
+              request,
+            );
+          }
+          finalResponse = terminalResponse;
         }
       }
+
+      if (!finalResponse) {
+        throw new Error(
+          'Responses websocket stream ended without a terminal response event.',
+        );
+      }
+
+      return finalResponse;
     } catch (error) {
-      if (receivedAnyEvent && error instanceof Error) {
-        (
-          error as Error & {
-            unsafeToReplay?: boolean;
-          }
-        ).unsafeToReplay = true;
+      if (receivedResponseEvent) {
+        markUnsafeWebSocketReplayError(error, true);
       }
       throw error;
     }
-
-    if (!finalResponse) {
-      throw new Error(
-        'Responses websocket stream ended without a terminal response event.',
-      );
-    }
-
-    return finalResponse;
   }
 
   async close(): Promise<void> {
@@ -3838,14 +4099,15 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
   ): AsyncIterable<OpenAI.Responses.ResponseStreamEvent> {
     const requestTimeoutDeadline =
       this.#createWebSocketRequestTimeoutDeadline();
-    const releaseLock = await this.#acquireWebSocketRequestLock(
-      builtRequest.signal,
-      requestTimeoutDeadline,
-    );
-
-    let receivedAnyEvent = false;
+    let releaseLock: (() => void) | undefined;
+    let replayMayBeUnsafe = false;
+    let receivedServerFrame = false;
     let sawTerminalResponseEvent = false;
     try {
+      releaseLock = await this.#acquireWebSocketRequestLock(
+        builtRequest.signal,
+        requestTimeoutDeadline,
+      );
       throwIfAborted(builtRequest.signal);
       const { frame, wsURL, headers } = await this.#prepareWebSocketRequest(
         builtRequest,
@@ -3871,24 +4133,34 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
       const serializedFrame = JSON.stringify(frame);
       const sendSerializedFrame = async () => {
         try {
-          await activeConnection.send(serializedFrame);
-        } catch (error) {
-          if (!isWebSocketNotOpenError(error)) {
-            throw error;
-          }
+          try {
+            await activeConnection.send(serializedFrame);
+          } catch (error) {
+            if (!isWebSocketNotOpenError(error)) {
+              throw error;
+            }
 
-          setActiveConnection(
-            await this.#reconnectWebSocketConnection(
-              wsURL,
-              headers,
-              builtRequest.signal,
-              requestTimeoutDeadline,
-            ),
-          );
-          await activeConnection.send(serializedFrame);
+            setActiveConnection(
+              await this.#reconnectWebSocketConnection(
+                wsURL,
+                headers,
+                builtRequest.signal,
+                requestTimeoutDeadline,
+              ),
+            );
+            await activeConnection.send(serializedFrame);
+          }
+        } catch (error) {
+          if (isWebSocketNotOpenError(error)) {
+            markTransientNeverSentWebSocketError(error);
+          }
+          throw error;
         }
       };
       await sendSerializedFrame();
+      // Once response.create leaves the client, a timeout or disconnect can
+      // race with server acceptance even before the first response frame.
+      replayMayBeUnsafe = true;
 
       while (true) {
         const rawFrame = await this.#nextWebSocketFrame(
@@ -3897,12 +4169,12 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
           requestTimeoutDeadline,
         );
         if (rawFrame === null) {
-          if (!receivedAnyEvent && reusedConnectionForCurrentAttempt) {
+          if (!receivedServerFrame && reusedConnectionForCurrentAttempt) {
             // The request frame was already sent on a reused socket. If the
             // socket closes before the first response event arrives, the server
             // may still be processing the request, so replaying `response.create`
             // can duplicate model work and tool side effects.
-            receivedAnyEvent = true;
+            replayMayBeUnsafe = true;
             throw new Error(
               'Responses websocket connection closed after sending a request on a reused connection before any response events were received. The request may have been accepted, so the SDK will not automatically retry this websocket request.',
             );
@@ -3912,6 +4184,8 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
           );
         }
 
+        replayMayBeUnsafe = true;
+        receivedServerFrame = true;
         const payloadText = await webSocketFrameToText(rawFrame);
         const payload = JSON.parse(payloadText);
         const eventType =
@@ -3919,19 +4193,11 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
             ? payload.type
             : undefined;
 
-        if (eventType === 'error') {
-          receivedAnyEvent = true;
-          throw new Error(
-            `Responses websocket error: ${JSON.stringify(payload)}`,
-          );
-        }
-
         const event = payload as OpenAI.Responses.ResponseStreamEvent;
         const isTerminalResponseEvent =
           isTerminalResponsesStreamEventType(eventType);
         // Successful websocket responses do not currently expose a transport
         // request ID analogous to the HTTP x-request-id header.
-        receivedAnyEvent = true;
         if (isTerminalResponseEvent) {
           sawTerminalResponseEvent = true;
         }
@@ -3942,8 +4208,14 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
         }
       }
     } catch (error) {
+      if (!replayMayBeUnsafe) {
+        markReplaySafeWebSocketError(error);
+      }
+      if (replayMayBeUnsafe) {
+        markUnsafeWebSocketReplayError(error, receivedServerFrame);
+      }
       if (
-        !receivedAnyEvent &&
+        !replayMayBeUnsafe &&
         !(error instanceof OpenAI.APIUserAbortError) &&
         shouldWrapNoEventWebSocketError(error)
       ) {
@@ -3953,16 +4225,21 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
         if (error instanceof Error) {
           (wrappedError as Error & { cause?: unknown }).cause = error;
         }
+        markReplaySafeWebSocketError(wrappedError);
+        if (isNeverSentWebSocketError(error)) {
+          markTransientNeverSentWebSocketError(wrappedError);
+        }
         throw wrappedError;
       }
       throw error;
     } finally {
       const shouldDropConnection =
         !sawTerminalResponseEvent || !this.#reuseConnection;
-      const dropConnectionPromise = shouldDropConnection
-        ? this.#dropWebSocketConnection()
-        : undefined;
-      releaseLock();
+      const dropConnectionPromise =
+        releaseLock && shouldDropConnection
+          ? this.#dropWebSocketConnection()
+          : undefined;
+      releaseLock?.();
       await dropConnectionPromise;
     }
   }
@@ -4140,14 +4417,21 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
       (configuredTimeoutMs) =>
         `Responses websocket connection timed out before opening after ${configuredTimeoutMs}ms.`,
     );
-    this.#wsConnection = await ResponsesWebSocketConnection.connect(
-      wsURL,
-      headers,
-      signal,
-      connectTimeout.timeoutMs,
-      connectTimeout.errorMessage,
-      this.#websocketOptions,
-    );
+    try {
+      this.#wsConnection = await ResponsesWebSocketConnection.connect(
+        wsURL,
+        headers,
+        signal,
+        connectTimeout.timeoutMs,
+        connectTimeout.errorMessage,
+        this.#websocketOptions,
+      );
+    } catch (error) {
+      if (isTransientConnectionSetupError(error)) {
+        markTransientNeverSentWebSocketError(error);
+      }
+      throw error;
+    }
     this.#wsConnectionIdentity = identity;
     return { connection: this.#wsConnection, reused: false };
   }
@@ -4243,6 +4527,9 @@ export class OpenAIResponsesWSModel extends OpenAIResponsesModel {
       return releaseLock;
     } catch (error) {
       releaseLock();
+      if (!(error instanceof OpenAI.APIUserAbortError)) {
+        markTransientNeverSentWebSocketError(error);
+      }
       throw error;
     }
   }

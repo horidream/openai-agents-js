@@ -147,6 +147,14 @@ function normalizeRealtimeMessageContent(
   });
 }
 
+function cloneRealtimeEvent<T>(event: T): T {
+  if (typeof globalThis.structuredClone === 'function') {
+    return globalThis.structuredClone(event);
+  }
+
+  return JSON.parse(JSON.stringify(event)) as T;
+}
+
 export abstract class OpenAIRealtimeBase
   extends EventEmitterDelegate<OpenAIRealtimeEventTypes>
   implements RealtimeTransportLayer
@@ -226,7 +234,7 @@ export abstract class OpenAIRealtimeBase
     }
     const { data: parsed, raw, isGeneric } = result;
 
-    this.emit('*', structuredClone(raw));
+    this.emit('*', cloneRealtimeEvent(raw));
     if (isGeneric) {
       return;
     }
@@ -332,6 +340,13 @@ export abstract class OpenAIRealtimeBase
           itemId: parsed.item_id,
           responseId: parsed.response_id,
         });
+      } else if (parsed.type === 'response.output_text.delta') {
+        this.emit('output_text_delta', {
+          type: 'output_text_delta',
+          delta: parsed.delta,
+          itemId: parsed.item_id,
+          responseId: parsed.response_id,
+        });
       }
       // no support for partial transcripts yet.
       return;
@@ -380,7 +395,11 @@ export abstract class OpenAIRealtimeBase
             parsed.item.role,
             parsed.item.content,
           ),
-          status: parsed.item.status,
+          status:
+            parsed.item.status ??
+            (parsed.type === 'conversation.item.added'
+              ? 'in_progress'
+              : 'completed'),
         });
         this.emit('item_update', item);
         return;

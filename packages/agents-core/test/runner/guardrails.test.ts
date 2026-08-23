@@ -22,11 +22,11 @@ import {
 } from '../../src/errors';
 import { Usage } from '../../src/usage';
 import { RunMessageOutputItem } from '../../src/items';
-import { FakeModelProvider } from '../stubs';
+import { ScriptedModelProvider } from '../stubs';
 
 beforeAll(() => {
   setTracingDisabled(true);
-  setDefaultModelProvider(new FakeModelProvider());
+  setDefaultModelProvider(new ScriptedModelProvider());
 });
 
 type AnyAgent = Agent<unknown, AgentOutputType<unknown>>;
@@ -132,10 +132,69 @@ describe('runInputGuardrails', () => {
     expect(state._currentTurn).toBe(0);
   });
 
-  it('wraps execution failures and rolls back the current turn', async () => {
+  it('reads a successful input guardrail verdict once', async () => {
+    const agent = makeAgent({ name: 'SingleReadInput' });
+    const state = makeState(agent);
+    let reads = 0;
+    const output = {
+      outputInfo: { reason: 'blocked' },
+      get tripwireTriggered() {
+        reads += 1;
+        if (reads >= 2) {
+          throw new Error('input verdict was read twice');
+        }
+        return true;
+      },
+    };
+    const guardrail = defineInputGuardrail({
+      name: 'single-read-input',
+      execute: async () => output,
+    });
+
+    await expect(
+      withTrace('guardrails-input-single-read', () =>
+        runInputGuardrails(state, [guardrail]),
+      ),
+    ).rejects.toBeInstanceOf(InputGuardrailTripwireTriggered);
+    expect(reads).toBe(1);
+    expect(state._inputGuardrailResults[0]?.output).toBe(output);
+  });
+
+  it('does not publish an input result when its first verdict read fails', async () => {
+    const agent = makeAgent({ name: 'UnreadableInput' });
+    const state = makeState(agent);
+    let reads = 0;
+    const guardrail = defineInputGuardrail({
+      name: 'unreadable-input',
+      execute: async () => ({
+        outputInfo: { reason: 'unknown' },
+        get tripwireTriggered(): boolean {
+          reads += 1;
+          throw new Error('input verdict is unreadable');
+        },
+      }),
+    });
+
+    await expect(
+      withTrace('guardrails-input-unreadable', () =>
+        runInputGuardrails(state, [guardrail]),
+      ),
+    ).rejects.toBeInstanceOf(GuardrailExecutionError);
+    expect(reads).toBe(1);
+    expect(state._inputGuardrailResults).toEqual([]);
+  });
+
+  it('wraps execution failures without mutating runner-owned turn state', async () => {
     const agent = makeAgent({ name: 'Error' });
     const state = makeState(agent);
     state._currentTurn = 2;
+    const successfulGuardrail = defineInputGuardrail({
+      name: 'success',
+      execute: async () => ({
+        tripwireTriggered: false,
+        outputInfo: { ok: true },
+      }),
+    });
     const guardrail = defineInputGuardrail({
       name: 'error',
       execute: async () => {
@@ -145,11 +204,13 @@ describe('runInputGuardrails', () => {
 
     await expect(
       withTrace('guardrails-error', () =>
-        runInputGuardrails(state, [guardrail]),
+        runInputGuardrails(state, [successfulGuardrail, guardrail]),
       ),
     ).rejects.toBeInstanceOf(GuardrailExecutionError);
-    expect(state._inputGuardrailResults).toHaveLength(0);
-    expect(state._currentTurn).toBe(1);
+    expect(state._inputGuardrailResults.map((r) => r.guardrail.name)).toEqual([
+      'success',
+    ]);
+    expect(state._currentTurn).toBe(2);
   });
 
   it('awaits sibling input guardrails before surfacing execution failures', async () => {
@@ -157,6 +218,7 @@ describe('runInputGuardrails', () => {
     const state = makeState(agent);
     let releaseSlowGuardrail!: () => void;
     let markSlowStarted!: () => void;
+    let markFastFinished!: () => void;
     let markErrorThrown!: () => void;
     let slowGuardrailFinished = false;
     const slowGuardrailCanFinish = new Promise<void>((resolve) => {
@@ -164,6 +226,9 @@ describe('runInputGuardrails', () => {
     });
     const slowGuardrailStarted = new Promise<void>((resolve) => {
       markSlowStarted = resolve;
+    });
+    const fastGuardrailFinished = new Promise<void>((resolve) => {
+      markFastFinished = resolve;
     });
     const errorThrown = new Promise<void>((resolve) => {
       markErrorThrown = resolve;
@@ -183,14 +248,25 @@ describe('runInputGuardrails', () => {
     const errorGuardrail = defineInputGuardrail({
       name: 'error',
       execute: async () => {
-        await slowGuardrailStarted;
+        await fastGuardrailFinished;
         markErrorThrown();
         throw new Error('boom');
       },
     });
+    const fastGuardrail = defineInputGuardrail({
+      name: 'fast',
+      execute: async () => {
+        await slowGuardrailStarted;
+        markFastFinished();
+        return {
+          tripwireTriggered: false,
+          outputInfo: { fast: true },
+        };
+      },
+    });
 
     const runPromise = withTrace('guardrails-input-error-await-sibling', () =>
-      runInputGuardrails(state, [slowGuardrail, errorGuardrail]),
+      runInputGuardrails(state, [slowGuardrail, fastGuardrail, errorGuardrail]),
     );
     let settled = false;
     void runPromise.then(
@@ -210,6 +286,10 @@ describe('runInputGuardrails', () => {
     await expect(runPromise).rejects.toBeInstanceOf(GuardrailExecutionError);
     expect(settledBeforeSiblingFinished).toBe(false);
     expect(slowGuardrailFinished).toBe(true);
+    expect(state._inputGuardrailResults.map((r) => r.guardrail.name)).toEqual([
+      'slow',
+      'fast',
+    ]);
   });
 });
 
@@ -276,6 +356,76 @@ describe('runOutputGuardrails', () => {
     expect(state._outputGuardrailResults).toHaveLength(1);
   });
 
+  it('observes a successful output guardrail verdict once', async () => {
+    const agent = makeAgent({ name: 'SingleReadOutput' });
+    const state = makeState(agent);
+    let reads = 0;
+    const output = {
+      outputInfo: { reason: 'blocked' },
+      get tripwireTriggered() {
+        reads += 1;
+        if (reads >= 2) {
+          throw new Error('output verdict was read twice');
+        }
+        return true;
+      },
+    };
+    const guardrail = defineOutputGuardrail({
+      name: 'single-read-output',
+      execute: async () => output,
+    });
+    const observed: Array<{ result: object; tripwireTriggered: boolean }> = [];
+
+    await expect(
+      withTrace('guardrails-output-single-read', () =>
+        runOutputGuardrails(
+          state,
+          [guardrail as any],
+          'blocked',
+          (result, tripwireTriggered) => {
+            observed.push({ result, tripwireTriggered });
+          },
+        ),
+      ),
+    ).rejects.toBeInstanceOf(OutputGuardrailTripwireTriggered);
+    expect(reads).toBe(1);
+    expect(observed).toEqual([
+      {
+        result: state._outputGuardrailResults[0],
+        tripwireTriggered: true,
+      },
+    ]);
+    expect(state._outputGuardrailResults[0]?.output).toBe(output);
+  });
+
+  it('does not publish or observe an output result when its first verdict read fails', async () => {
+    const agent = makeAgent({ name: 'UnreadableOutput' });
+    const state = makeState(agent);
+    let reads = 0;
+    let observationCount = 0;
+    const guardrail = defineOutputGuardrail({
+      name: 'unreadable-output',
+      execute: async () => ({
+        outputInfo: { reason: 'unknown' },
+        get tripwireTriggered(): boolean {
+          reads += 1;
+          throw new Error('output verdict is unreadable');
+        },
+      }),
+    });
+
+    await expect(
+      withTrace('guardrails-output-unreadable', () =>
+        runOutputGuardrails(state, [guardrail as any], 'unknown', () => {
+          observationCount += 1;
+        }),
+      ),
+    ).rejects.toBeInstanceOf(GuardrailExecutionError);
+    expect(reads).toBe(1);
+    expect(observationCount).toBe(0);
+    expect(state._outputGuardrailResults).toEqual([]);
+  });
+
   it('awaits sibling output guardrails before surfacing a tripwire', async () => {
     const agent = makeAgent({ name: 'TripOutputAwait' });
     const state = makeState(agent);
@@ -328,9 +478,16 @@ describe('runOutputGuardrails', () => {
     ]);
   });
 
-  it('wraps errors from guardrails without recording results', async () => {
+  it('wraps errors from guardrails and records completed results', async () => {
     const agent = makeAgent({ name: 'OutError' });
     const state = makeState(agent);
+    const successfulGuardrail = defineOutputGuardrail({
+      name: 'success',
+      execute: async () => ({
+        tripwireTriggered: false,
+        outputInfo: { ok: true },
+      }),
+    });
     const runnerGuardrail = defineOutputGuardrail({
       name: 'error',
       execute: async () => {
@@ -340,10 +497,16 @@ describe('runOutputGuardrails', () => {
 
     await expect(
       withTrace('guardrails-output-error', () =>
-        runOutputGuardrails(state, [runnerGuardrail as any], 'ok'),
+        runOutputGuardrails(
+          state,
+          [successfulGuardrail as any, runnerGuardrail as any],
+          'ok',
+        ),
       ),
     ).rejects.toBeInstanceOf(GuardrailExecutionError);
-    expect(state._outputGuardrailResults).toHaveLength(0);
+    expect(state._outputGuardrailResults.map((r) => r.guardrail.name)).toEqual([
+      'success',
+    ]);
   });
 
   it('awaits sibling output guardrails before surfacing execution failures', async () => {
@@ -351,6 +514,7 @@ describe('runOutputGuardrails', () => {
     const state = makeState(agent);
     let releaseSlowGuardrail!: () => void;
     let markSlowStarted!: () => void;
+    let markFastFinished!: () => void;
     let markErrorThrown!: () => void;
     let slowGuardrailFinished = false;
     const slowGuardrailCanFinish = new Promise<void>((resolve) => {
@@ -358,6 +522,9 @@ describe('runOutputGuardrails', () => {
     });
     const slowGuardrailStarted = new Promise<void>((resolve) => {
       markSlowStarted = resolve;
+    });
+    const fastGuardrailFinished = new Promise<void>((resolve) => {
+      markFastFinished = resolve;
     });
     const errorThrown = new Promise<void>((resolve) => {
       markErrorThrown = resolve;
@@ -369,24 +536,36 @@ describe('runOutputGuardrails', () => {
         await slowGuardrailCanFinish;
         slowGuardrailFinished = true;
         return {
-          tripwireTriggered: false,
+          tripwireTriggered: true,
           outputInfo: { slow: true },
         };
       },
     });
+    const primaryError = new Error('boom');
     const errorGuardrail = defineOutputGuardrail({
       name: 'error',
       execute: async () => {
-        await slowGuardrailStarted;
+        await fastGuardrailFinished;
         markErrorThrown();
-        throw new Error('boom');
+        throw primaryError;
+      },
+    });
+    const fastGuardrail = defineOutputGuardrail({
+      name: 'fast',
+      execute: async () => {
+        await slowGuardrailStarted;
+        markFastFinished();
+        return {
+          tripwireTriggered: false,
+          outputInfo: { fast: true },
+        };
       },
     });
 
     const runPromise = withTrace('guardrails-output-error-await-sibling', () =>
       runOutputGuardrails(
         state,
-        [slowGuardrail as any, errorGuardrail as any],
+        [slowGuardrail as any, fastGuardrail as any, errorGuardrail as any],
         'ok',
       ),
     );
@@ -405,8 +584,20 @@ describe('runOutputGuardrails', () => {
     const settledBeforeSiblingFinished = settled;
     releaseSlowGuardrail();
 
-    await expect(runPromise).rejects.toBeInstanceOf(GuardrailExecutionError);
+    let caughtError: unknown;
+    try {
+      await runPromise;
+    } catch (error) {
+      caughtError = error;
+    }
+
+    expect(caughtError).toBeInstanceOf(GuardrailExecutionError);
+    expect((caughtError as GuardrailExecutionError).error).toBe(primaryError);
     expect(settledBeforeSiblingFinished).toBe(false);
     expect(slowGuardrailFinished).toBe(true);
+    expect(state._outputGuardrailResults.map((r) => r.guardrail.name)).toEqual([
+      'slow',
+      'fast',
+    ]);
   });
 });

@@ -1,5 +1,122 @@
 # @openai/agents-realtime
 
+## 0.17.0
+
+### Patch Changes
+
+- Updated dependencies [33fe55c]
+  - @openai/agents-core@0.17.0
+
+## 0.16.1
+
+### Patch Changes
+
+- Updated dependencies [2896600]
+- Updated dependencies [acedac3]
+- Updated dependencies [b93163b]
+- Updated dependencies [8ece061]
+- Updated dependencies [937fb98]
+- Updated dependencies [861ba39]
+- Updated dependencies [f4bd821]
+- Updated dependencies [51fb859]
+- Updated dependencies [e3aaeea]
+  - @openai/agents-core@0.16.1
+
+## 0.16.0
+
+### Minor Changes
+
+- b727790: feat: add scripted model, sandbox session, and Realtime testing utilities
+
+### Patch Changes
+
+- 2918ec0: fix: reject unsupported assistant audio history replay before remote history mutation
+- d85dd2c: fix: fall back to 24kHz PCM for non-finite realtime audio rates
+- aa6dd2d: feat: support Standard Schema tool inputs and structured agent outputs
+- Updated dependencies [bedb045]
+- Updated dependencies [442cedb]
+- Updated dependencies [ede1fb9]
+- Updated dependencies [f639953]
+- Updated dependencies [e2cbca8]
+- Updated dependencies [c5eda7e]
+- Updated dependencies [d4ef614]
+- Updated dependencies [77343dd]
+- Updated dependencies [b727790]
+- Updated dependencies [200c20e]
+- Updated dependencies [85a5ddb]
+- Updated dependencies [d385c10]
+- Updated dependencies [aa6dd2d]
+- Updated dependencies [d7fd0cf]
+- Updated dependencies [26bc638]
+  - @openai/agents-core@0.16.0
+
+## 0.15.0
+
+### Patch Changes
+
+- d1c585d: feat: support React Native package conditions for portable core and Realtime shims
+- 1f617f9: fix: bind tool approvals and completed replays to canonical invocations
+- 49fe593: feat: support GA Realtime transcription options in session configuration
+- 1a3d6e6: fix(agents-realtime): accept `{ type: "duration", seconds }` usage on `conversation.item.input_audio_transcription.completed` so `whisper-1` (duration-billed) transcripts no longer fall through to the generic-event path and skip the typed emit and retrieve fallback
+- 21ec503: fix(realtime): keep a caller-supplied WebRTC media stream alive on close
+
+  `OpenAIRealtimeWebRTC.close()` no longer stops the tracks of a `mediaStream` passed in through the transport options. That stream now stays owned by the application, so it remains usable for a level meter, a recorder, or a later reconnect, and the application is responsible for calling `stop()` on its tracks when it is done with it. A microphone the transport opens itself, when `mediaStream` is omitted, is still stopped by `close()` as before.
+
+  `close()` leaves the mute state alone. A caller-supplied track keeps whatever `enabled` value it had, and `muted` keeps reporting what it reported before the close, matching the default microphone path.
+
+- d48b2b0: fix: scope persistent hosted MCP approvals by server and tool identity
+- Updated dependencies [00def07]
+- Updated dependencies [d1c585d]
+- Updated dependencies [ba85cda]
+- Updated dependencies [daefc63]
+- Updated dependencies [2ce5c25]
+- Updated dependencies [398a592]
+- Updated dependencies [75af3ee]
+- Updated dependencies [1f617f9]
+- Updated dependencies [442cfe3]
+- Updated dependencies [d308e1d]
+- Updated dependencies [09d5065]
+- Updated dependencies [41f5011]
+- Updated dependencies [81e0066]
+- Updated dependencies [c122399]
+- Updated dependencies [5b5a7cb]
+- Updated dependencies [9b97dd2]
+- Updated dependencies [8249c45]
+- Updated dependencies [e006790]
+- Updated dependencies [512f340]
+- Updated dependencies [066a03c]
+- Updated dependencies [b7cb351]
+- Updated dependencies [d48b2b0]
+- Updated dependencies [96201ba]
+- Updated dependencies [c7a91e6]
+  - @openai/agents-core@0.15.0
+
+## 0.14.3
+
+### Patch Changes
+
+- 00bfb9d: fix: clean up failed Realtime connection attempts
+- a94f376: fix: accept status-less and incomplete Realtime conversation message items (#1571)
+- 73cce94: fix: apply realtime output guardrails to text deltas
+- Updated dependencies [31bc820]
+- Updated dependencies [90781d8]
+- Updated dependencies [08169df]
+- Updated dependencies [1154aa0]
+- Updated dependencies [15ac711]
+- Updated dependencies [59fa3fc]
+- Updated dependencies [2d5d040]
+- Updated dependencies [427331f]
+- Updated dependencies [4bb80e4]
+- Updated dependencies [78f8581]
+- Updated dependencies [b4a90f9]
+- Updated dependencies [9416c96]
+- Updated dependencies [f431475]
+- Updated dependencies [9cbba54]
+- Updated dependencies [0f9b12e]
+- Updated dependencies [92a0809]
+- Updated dependencies [1eaa425]
+  - @openai/agents-core@0.14.3
+
 ## 0.14.2
 
 ### Patch Changes

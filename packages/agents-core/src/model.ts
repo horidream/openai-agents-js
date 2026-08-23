@@ -128,6 +128,14 @@ export type RetryDecision =
        * Optional explanation for logging or debugging.
        */
       reason?: string;
+
+      /**
+       * Explicit application approval to repeat provider-side work that may
+       * already have happened. This is required when replay safety is unknown
+       * or unsafe, including timed-out requests. Streamed requests remain
+       * non-retryable after any output event is emitted.
+       */
+      approveUnsafeReplay?: boolean;
     };
 
 export type ModelRetryNormalizedError = {
@@ -181,6 +189,11 @@ export type ModelRetryAdvice = {
   replaySafety?: 'unsafe' | 'safe';
 
   /**
+   * Whether the provider had begun emitting the response when the failure occurred.
+   */
+  responseStarted?: boolean;
+
+  /**
    * Provider-supplied normalized facts that should override generic extraction when present.
    */
   normalized?: Partial<ModelRetryNormalizedError>;
@@ -216,6 +229,38 @@ export type RetryPolicyContext = {
    * Generic normalized facts extracted from the error and provider advice.
    */
   normalized: ModelRetryNormalizedError;
+
+  /**
+   * The previous response identifier carried by the failed request, when present.
+   */
+  readonly previousResponseId?: string;
+
+  /**
+   * The conversation identifier carried by the failed request, when present.
+   */
+  readonly conversationId?: string;
+
+  /**
+   * Stable provider replay classification captured before the policy runs.
+   * The runner always supplies this field; it is optional for compatibility
+   * with code that constructs policy contexts directly.
+   */
+  readonly replaySafety?: 'safe' | 'unsafe' | 'unknown';
+
+  /**
+   * Stable response-start evidence captured before the policy runs.
+   * The runner preserves `undefined` when the provider supplies no evidence.
+   * The field is optional for compatibility with code that constructs policy
+   * contexts directly.
+   */
+  readonly responseStarted?: boolean;
+
+  /**
+   * Whether the failed request carried a previous response or conversation identifier.
+   * The runner always supplies this field; it is optional for compatibility
+   * with code that constructs policy contexts directly.
+   */
+  readonly statefulRequest?: boolean;
 };
 
 export type RetryPolicy = (
@@ -272,6 +317,14 @@ export type ModelRetrySettings = {
  * for the specific model and provider you are using.
  */
 export type ModelSettings = {
+  /**
+   * Cooperative timeout in milliseconds for each model call.
+   * The timeout aborts only the current model call; a run-level abort signal
+   * still cancels the entire run. Must be greater than 0 and less than or
+   * equal to 2147483647 when provided.
+   */
+  timeoutMs?: number;
+
   /**
    * The temperature to use when calling the model.
    */
@@ -357,6 +410,12 @@ export type ModelSettings = {
    * Runtime-only retry configuration for the model request.
    */
   retry?: ModelRetrySettings;
+
+  /**
+   * Whether to preserve a JSON-compatible snapshot of provider usage before
+   * the Agents SDK normalizes it. Defaults to false if not provided.
+   */
+  preserveRawUsage?: boolean;
 };
 
 export type ModelTracing = boolean | 'enabled_without_data';
@@ -563,6 +622,7 @@ export type ModelRequest = {
     runnerManagedRetry?: boolean;
     reasoningEffortImplicit?: boolean;
     tracingParent?: Span<any> | Trace;
+    toolNameCollisionPolicy?: 'warn' | 'error';
   };
 };
 
@@ -614,6 +674,12 @@ export type ModelResponse = {
    * Raw response data from the underlying model provider.
    */
   providerData?: Record<string, any>;
+
+  /**
+   * A detached JSON-compatible snapshot of provider usage captured before
+   * the Agents SDK normalizes missing values. Only populated when requested.
+   */
+  rawUsage?: Record<string, unknown>;
 };
 
 /**

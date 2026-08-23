@@ -367,6 +367,11 @@ export class OpenAIHostedMultiAgentModel extends OpenAIResponsesModel {
     return this.#normalizedResponses.get(response) ?? response;
   }
 
+  /** @internal */
+  protected override _getUnsuccessfulResponseTerminalType(): undefined {
+    return undefined;
+  }
+
   protected override _getResponseUsage(
     response: OpenAI.Responses.Response,
   ): Usage {
@@ -728,11 +733,14 @@ export class OpenAIHostedMultiAgentModel extends OpenAIResponsesModel {
     } catch (error) {
       threwError = true;
       if (requestMayHaveReachedServer && error instanceof Error) {
-        (
-          error as Error & {
-            unsafeToReplay?: boolean;
-          }
-        ).unsafeToReplay = true;
+        const replayError = error as Error & {
+          unsafeToReplay?: boolean;
+          responseStarted?: boolean;
+        };
+        replayError.unsafeToReplay = true;
+        if (receivedServerMessage) {
+          replayError.responseStarted = true;
+        }
       }
       if (hadActiveResponse && sentFrameWasReturnedUnsent) {
         const transportOverridesKey = this.#webSocketTransportOverridesKey;

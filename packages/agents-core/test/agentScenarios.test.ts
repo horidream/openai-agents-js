@@ -39,181 +39,50 @@ import {
   defineToolOutputGuardrail,
   shellTool,
   applyPatchTool,
+  attachClientToolSearchExecutor,
 } from '../src';
 import { getDefaultModelProvider } from '../src/providers';
 import { user } from '../src/helpers/message';
 import * as protocol from '../src/types/protocol';
 import logger from '../src/logger';
+import { getFunctionToolStateKey } from '../src/toolIdentity';
+import {
+  ScriptedModel,
+  modelError,
+  type ScriptedModelInput,
+} from '../src/testing';
 
 /**
- * Fake model for scenario-style tests. It queues per-turn outputs (or errors),
- * records the request args, and can emit streaming events including text deltas
- * and a final response_done event.
+ * Compatibility wrapper for the scenario tests' existing queue helpers.
  */
-class RecordingModel implements Model {
-  #turnOutputs: Array<ModelResponse | ModelResponse['output'] | Error> = [];
-  #hardcodedUsage: Usage | undefined;
-  public lastTurnArgs: Partial<ModelRequest> | undefined;
-  public firstTurnArgs: Partial<ModelRequest> | undefined;
-  public calls: Partial<ModelRequest>[] = [];
-  #responseCounter = 0;
-
+class RecordingModel extends ScriptedModel {
   constructor(initial?: ModelResponse | ModelResponse['output'] | Error) {
-    if (initial) {
-      this.#turnOutputs.push(initial);
-    }
+    super(typeof initial === 'undefined' ? [] : [toScriptedInput(initial)]);
   }
 
-  setHardcodedUsage(usage: Usage) {
-    this.#hardcodedUsage = usage;
+  get lastTurnArgs(): Readonly<ModelRequest> | undefined {
+    return this.lastCall?.request;
+  }
+
+  get firstTurnArgs(): Readonly<ModelRequest> | undefined {
+    return this.firstCall?.request;
   }
 
   setNextOutput(output: ModelResponse | ModelResponse['output'] | Error) {
-    this.#turnOutputs.push(output);
+    this.enqueue(toScriptedInput(output));
   }
 
   addMultipleTurnOutputs(
     outputs: Array<ModelResponse | ModelResponse['output'] | Error>,
   ) {
-    this.#turnOutputs.push(...outputs);
-  }
-
-  #getNextOutput(): ModelResponse | ModelResponse['output'] | Error {
-    if (this.#turnOutputs.length === 0) {
-      throw new Error('No queued output');
-    }
-    return this.#turnOutputs.shift() as
-      ModelResponse | ModelResponse['output'] | Error;
-  }
-
-  #recordArgs(request: ModelRequest) {
-    const recordedArgs: Partial<ModelRequest> = {
-      systemInstructions: request.systemInstructions,
-      input: request.input,
-      modelSettings: request.modelSettings,
-      tools: request.tools,
-      outputType: request.outputType,
-      handoffs: request.handoffs,
-      previousResponseId: request.previousResponseId,
-      conversationId: request.conversationId,
-      prompt: request.prompt,
-      overridePromptModel: request.overridePromptModel,
-    };
-    this.lastTurnArgs = recordedArgs;
-    this.calls.push(recordedArgs);
-    if (!this.firstTurnArgs) {
-      this.firstTurnArgs = this.lastTurnArgs;
-    }
-  }
-
-  async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    this.#recordArgs(request);
-    const output = this.#getNextOutput();
-    if (output instanceof Error) {
-      throw output;
-    }
-    const { normalizedOutput, usage, responseId } = normalizeTurnOutput(
-      output,
-      this.#hardcodedUsage,
-    );
-    const finalResponseId = responseId ?? `resp-${++this.#responseCounter}`;
-    if (responseId) {
-      this.#responseCounter += 1;
-    }
-    return { output: normalizedOutput, usage, responseId: finalResponseId };
-  }
-
-  async *getStreamedResponse(
-    request: ModelRequest,
-  ): AsyncIterable<protocol.StreamEvent> {
-    this.#recordArgs(request);
-    const output = this.#getNextOutput();
-    if (output instanceof Error) {
-      throw output;
-    }
-    const { normalizedOutput, usage, responseId } = normalizeTurnOutput(
-      output,
-      this.#hardcodedUsage,
-    );
-    const finalResponseId =
-      responseId ?? `resp-stream-${++this.#responseCounter}`;
-    if (responseId) {
-      this.#responseCounter += 1;
-    }
-
-    const signal = request.signal;
-
-    const throwIfAborted = () => {
-      if (signal?.aborted) {
-        const err = new Error('Aborted');
-        err.name = 'AbortError';
-        throw err;
-      }
-    };
-
-    throwIfAborted();
-
-    yield* streamFromOutput(normalizedOutput, throwIfAborted);
-
-    throwIfAborted();
-
-    yield {
-      type: 'response_done',
-      response: {
-        id: finalResponseId,
-        usage: {
-          requests: usage.requests,
-          inputTokens: usage.inputTokens,
-          outputTokens: usage.outputTokens,
-          totalTokens: usage.totalTokens,
-          inputTokensDetails: usage.inputTokensDetails,
-          outputTokensDetails: usage.outputTokensDetails,
-        },
-        output: normalizedOutput,
-      },
-    } as protocol.StreamEvent;
+    this.enqueue(...outputs.map(toScriptedInput));
   }
 }
 
-function normalizeTurnOutput(
-  turn: ModelResponse | ModelResponse['output'],
-  hardcodedUsage: Usage | undefined,
-): {
-  normalizedOutput: ModelResponse['output'];
-  usage: Usage;
-  responseId?: string;
-} {
-  const responseLike = turn as Partial<ModelResponse>;
-  const normalizedOutput = (responseLike.output ??
-    turn) as ModelResponse['output'];
-  const usage =
-    hardcodedUsage !== undefined
-      ? new Usage(hardcodedUsage)
-      : responseLike.usage
-        ? new Usage(responseLike.usage)
-        : new Usage();
-  return { normalizedOutput, usage, responseId: responseLike.responseId };
-}
-
-async function* streamFromOutput(
-  output: ModelResponse['output'],
-  throwIfAborted: () => void,
-): AsyncIterable<protocol.StreamEvent> {
-  for (const item of output) {
-    throwIfAborted();
-    if (item.type !== 'message') {
-      continue;
-    }
-    const content = Array.isArray(item.content) ? item.content : [];
-    for (const part of content) {
-      if (part.type === 'output_text') {
-        yield {
-          type: 'output_text_delta',
-          delta: part.text,
-        } as protocol.StreamEvent;
-      }
-    }
-  }
+function toScriptedInput(
+  output: ModelResponse | ModelResponse['output'] | Error,
+): ScriptedModelInput {
+  return output instanceof Error ? modelError(output) : output;
 }
 
 /**
@@ -261,6 +130,27 @@ function hostedToolCall(
       name,
       id: `htc_${name}`,
       arguments: args,
+    },
+  };
+}
+
+function hostedMcpApprovalRequest(
+  requestId: string,
+  serverLabel: string,
+  toolName: string,
+  rawRequestId = requestId,
+): protocol.HostedToolCallItem {
+  return {
+    id: rawRequestId,
+    type: 'hosted_tool_call',
+    name: 'mcp_approval_request',
+    status: 'completed',
+    providerData: {
+      type: 'mcp_approval_request',
+      id: requestId,
+      server_label: serverLabel,
+      name: toolName,
+      arguments: '{}',
     },
   };
 }
@@ -573,6 +463,139 @@ describe('Agent scenarios (examples and docs patterns)', () => {
 
     warnSpy.mockRestore();
   });
+
+  it.each([
+    ['current schema after restoration', 'after restoration', false],
+    ['legacy schema before serialization', 'before serialization', true],
+    ['legacy schema after restoration', 'after restoration', true],
+  ] as const)(
+    'rebinds nested deferred bare approvals in %s',
+    async (_description, approvalTiming, downgrade) => {
+      let executions = 0;
+      const deferredApprovalTool = tool({
+        name: 'secure_lookup',
+        description: 'Requires approval after deferred loading.',
+        parameters: z.object({}).strict(),
+        deferLoading: true,
+        needsApproval: true,
+        execute: async () => {
+          executions += 1;
+          return 'approved lookup';
+        },
+      });
+      const clientToolSearch = attachClientToolSearchExecutor(
+        {
+          type: 'hosted_tool',
+          name: 'tool_search',
+          providerData: { type: 'tool_search', execution: 'client' },
+        },
+        async () => deferredApprovalTool,
+      );
+      const nestedModel = new RecordingModel();
+      nestedModel.addMultipleTurnOutputs([
+        [
+          {
+            type: 'tool_search_call',
+            id: 'nested-search-call',
+            status: 'completed',
+            arguments: {},
+            providerData: {
+              call_id: 'nested-search-provider-call',
+              execution: 'client',
+            },
+          } as protocol.ToolSearchCallItem,
+          functionToolCall('secure_lookup', '{}', 'nested-deferred-call'),
+        ],
+        [textMessage('Nested done')],
+      ]);
+      const nestedAgent = new Agent({
+        name: 'LegacyNestedDeferredAgent',
+        model: nestedModel,
+        tools: [clientToolSearch],
+      });
+      const nestedTool = nestedAgent.asTool({
+        toolName: 'legacy_nested_agent',
+        toolDescription: 'Runs the nested deferred approval agent.',
+      });
+      const outerModel = new RecordingModel();
+      outerModel.addMultipleTurnOutputs([
+        [
+          functionToolCall(
+            nestedTool.name,
+            JSON.stringify({ input: 'look up the record' }),
+            'outer-nested-call',
+          ),
+        ],
+        [textMessage('Outer done')],
+      ]);
+      const outerAgent = new Agent({
+        name: 'LegacyNestedDeferredOuterAgent',
+        model: outerModel,
+        tools: [nestedTool],
+      });
+      const runner = new Runner();
+
+      const first = await runner.run(outerAgent, 'start');
+      expect(first.interruptions).toHaveLength(1);
+      expect(first.interruptions[0]?.agent).toBe(nestedAgent);
+
+      if (approvalTiming === 'before serialization') {
+        first.state.approve(first.interruptions[0]!);
+      }
+      const publicApprovals = first.state._context.toJSON().approvals;
+      const serialized = first.state.toJSON() as any;
+      const downgradeToLegacy = (value: any) => {
+        value.$schemaVersion = '1.15';
+        delete value.context.functionApprovals;
+        delete value.context.legacyFunctionApprovals;
+        delete value.pendingAgentToolRunAliases;
+        for (const interruption of value.currentStep?.data?.interruptions ??
+          []) {
+          delete interruption.functionToolStateKey;
+        }
+      };
+      if (downgrade) {
+        for (const [key, pendingState] of Object.entries(
+          serialized.pendingAgentToolRuns,
+        )) {
+          const nestedState = JSON.parse(pendingState as string);
+          downgradeToLegacy(nestedState);
+          serialized.pendingAgentToolRuns[key] = JSON.stringify(nestedState);
+        }
+        downgradeToLegacy(serialized);
+        serialized.context.approvals = {
+          ...serialized.context.approvals,
+          ...publicApprovals,
+        };
+      }
+
+      const restored = await RunState.fromString(
+        outerAgent,
+        JSON.stringify(serialized),
+      );
+      const approval = restored.getInterruptions()[0];
+      expect(approval?.functionToolStateKey).toBe(
+        getFunctionToolStateKey(deferredApprovalTool),
+      );
+      if (approvalTiming === 'after restoration') {
+        restored.approve(approval!);
+      } else {
+        expect(
+          restored._context.isToolApproved({
+            toolName: getFunctionToolStateKey(deferredApprovalTool)!,
+            callId: 'nested-deferred-call',
+            functionTool: false,
+            agent: nestedAgent,
+          }),
+        ).toBe(true);
+      }
+
+      const resumed = await runner.run(outerAgent, restored);
+      expect(resumed.interruptions).toHaveLength(0);
+      expect(resumed.finalOutput).toBe('Outer done');
+      expect(executions).toBe(1);
+    },
+  );
 
   it('handles multi-step approvals in deeply nested agent tools', async () => {
     const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
@@ -1218,7 +1241,7 @@ describe('Agent scenarios (examples and docs patterns)', () => {
     const second = await run(agent, 'Follow up', { session });
     expect(second.finalOutput).toBe('Second reply');
 
-    const secondInput = model.calls[1]?.input;
+    const secondInput = model.calls[1]?.request.input;
     expect(Array.isArray(secondInput)).toBe(true);
     if (Array.isArray(secondInput)) {
       const assistantMessages = secondInput.filter(
@@ -1277,15 +1300,15 @@ describe('Agent scenarios (examples and docs patterns)', () => {
       previousResponseId: 'seed-resp',
     });
     expect(first.finalOutput).toBe('First turn');
-    expect(model.calls[0]?.previousResponseId).toBe('seed-resp');
+    expect(model.calls[0]?.request.previousResponseId).toBe('seed-resp');
 
     const followUp = await run(agent, 'Follow up', {
       previousResponseId: first.rawResponses[0]?.responseId,
     });
     expect(followUp.finalOutput).toBe('Second turn');
-    expect(model.calls[1]?.previousResponseId).toBe('resp-100');
+    expect(model.calls[1]?.request.previousResponseId).toBe('resp-100');
 
-    const secondInput = model.calls[1]?.input;
+    const secondInput = model.calls[1]?.request.input;
     expect(Array.isArray(secondInput)).toBe(true);
     if (Array.isArray(secondInput)) {
       expect(secondInput.length).toBe(1);
@@ -1422,7 +1445,7 @@ describe('Agent scenarios (examples and docs patterns)', () => {
     expect(translationModel.calls.length).toBe(3);
     expect(
       translationModel.calls.every(
-        (call) => extractUserText(call.input) === 'Hello',
+        (call) => extractUserText(call.request.input) === 'Hello',
       ),
     ).toBe(true);
     expect(pickerResult.finalOutput).toBe('Pick: Dos');
@@ -2119,7 +2142,7 @@ describe('Agent scenarios (examples and docs patterns)', () => {
     expect(executed).toHaveLength(1);
     expect(executed[0].commands).toEqual(['echo hi']);
 
-    const secondInput = model.calls[1]?.input;
+    const secondInput = model.calls[1]?.request.input;
     expect(Array.isArray(secondInput)).toBe(true);
     if (Array.isArray(secondInput)) {
       const shellOutputs = secondInput.filter(
@@ -2171,7 +2194,7 @@ describe('Agent scenarios (examples and docs patterns)', () => {
     expect(result.finalOutput).toBe('patched');
     expect(operations).toHaveLength(1);
 
-    const secondInput = model.calls[1]?.input;
+    const secondInput = model.calls[1]?.request.input;
     expect(Array.isArray(secondInput)).toBe(true);
     if (Array.isArray(secondInput)) {
       const patchOutputs = secondInput.filter(
@@ -2826,6 +2849,247 @@ describe('Agent scenarios (examples and docs patterns)', () => {
     warnSpy.mockRestore();
   });
 
+  it.each([
+    { name: 'run', stream: false },
+    { name: 'stream', stream: true },
+  ])(
+    'does not reuse a persistent hosted MCP approval across servers with $name',
+    async ({ stream }) => {
+      const model = new RecordingModel();
+      model.addMultipleTurnOutputs([
+        [hostedMcpApprovalRequest('request-a', 'server-a', 'lookup_account')],
+        [
+          hostedMcpApprovalRequest(
+            'request-b',
+            'server-b',
+            'lookup_account',
+            'conflicting-raw-request-b',
+          ),
+        ],
+      ]);
+      const agent = new Agent({
+        name: 'scoped-mcp-approval',
+        model,
+        tools: [
+          hostedMcpTool({
+            serverLabel: 'server-a',
+            serverUrl: 'https://server-a.example/mcp',
+            requireApproval: 'always',
+          }),
+          hostedMcpTool({
+            serverLabel: 'server-b',
+            serverUrl: 'https://server-b.example/mcp',
+            requireApproval: 'always',
+          }),
+        ],
+      });
+
+      const runWithMode = async (
+        input: string | RunState<unknown, Agent<unknown, 'text'>>,
+      ) => {
+        if (stream) {
+          const result = await run(agent, input, { stream: true });
+          await result.completed;
+          return result;
+        }
+        return run(agent, input);
+      };
+
+      const first = await runWithMode('Lookup the account');
+      expect(first.interruptions).toHaveLength(1);
+      expect(
+        (first.interruptions[0].rawItem.providerData as any).server_label,
+      ).toBe('server-a');
+      first.state.approve(first.interruptions[0], { alwaysApprove: true });
+
+      const restored = await RunState.fromString(agent, first.state.toString());
+      const resumed = await runWithMode(restored);
+
+      expect(resumed.interruptions).toHaveLength(1);
+      expect(
+        (resumed.interruptions[0].rawItem.providerData as any).server_label,
+      ).toBe('server-b');
+    },
+  );
+
+  it.each([
+    { name: 'run with sticky approval', stream: false, sticky: 'approve' },
+    { name: 'stream with sticky approval', stream: true, sticky: 'approve' },
+    { name: 'run with sticky rejection', stream: false, sticky: 'reject' },
+    { name: 'stream with sticky rejection', stream: true, sticky: 'reject' },
+  ] as const)(
+    'honors exact call decisions after a serialized $name resume',
+    async ({ stream, sticky }) => {
+      const executions: string[] = [];
+      const approvalTool = tool({
+        name: 'exact_decision_tool',
+        description: 'Executes only approved calls.',
+        parameters: z.object({ value: z.string() }),
+        needsApproval: true,
+        execute: async ({ value }) => {
+          executions.push(value);
+          return value;
+        },
+      });
+      const model = new RecordingModel();
+      model.addMultipleTurnOutputs([
+        [
+          functionToolCall(
+            approvalTool.name,
+            JSON.stringify({ value: 'sticky' }),
+            'sticky-call',
+          ),
+          functionToolCall(
+            approvalTool.name,
+            JSON.stringify({ value: 'exception' }),
+            'exception-call',
+          ),
+        ],
+        [textMessage('done')],
+      ]);
+      const agent = new Agent({
+        name: 'ExactDecisionResumeAgent',
+        model,
+        tools: [approvalTool],
+      });
+      const runWithMode = async (
+        input: string | RunState<unknown, Agent<unknown, 'text'>>,
+      ) => {
+        if (stream) {
+          const result = await run(agent, input, { stream: true });
+          await result.completed;
+          return result;
+        }
+        return run(agent, input);
+      };
+
+      const first = await runWithMode('start');
+      expect(first.interruptions).toHaveLength(2);
+      if (sticky === 'approve') {
+        first.state.approve(first.interruptions[0], { alwaysApprove: true });
+        first.state.reject(first.interruptions[1], {
+          message: 'Denied exactly.',
+        });
+      } else {
+        first.state.reject(first.interruptions[0], {
+          alwaysReject: true,
+          message: 'Denied by default.',
+        });
+        first.state.approve(first.interruptions[1]);
+      }
+
+      const restored = await RunState.fromString(agent, first.state.toString());
+      const resumed = await runWithMode(restored);
+
+      expect(resumed.interruptions).toHaveLength(0);
+      expect(resumed.finalOutput).toBe('done');
+      expect(executions).toEqual([
+        sticky === 'approve' ? 'sticky' : 'exception',
+      ]);
+    },
+  );
+
+  it('restores a pending schema 1.17 sticky MCP approval as exact-call approval', async () => {
+    const model = new RecordingModel();
+    model.addMultipleTurnOutputs([
+      [hostedMcpApprovalRequest('request-a', 'server-a', 'lookup_account')],
+      [hostedMcpApprovalRequest('request-b', 'server-b', 'lookup_account')],
+    ]);
+    const agent = new Agent({
+      name: 'legacy-scoped-mcp-approval',
+      model,
+      tools: [
+        hostedMcpTool({
+          serverLabel: 'server-a',
+          serverUrl: 'https://server-a.example/mcp',
+          requireApproval: 'always',
+        }),
+        hostedMcpTool({
+          serverLabel: 'server-b',
+          serverUrl: 'https://server-b.example/mcp',
+          requireApproval: 'always',
+        }),
+      ],
+    });
+
+    const first = await run(agent, 'Lookup the account');
+    expect(first.interruptions).toHaveLength(1);
+    first.state.approve(first.interruptions[0], { alwaysApprove: true });
+
+    const serialized = first.state.toJSON() as any;
+    serialized.$schemaVersion = '1.17';
+    serialized.context.approvals = {
+      lookup_account: { approved: true, rejected: [] },
+    };
+    delete serialized.context.hostedMcpApprovals;
+
+    const restored = await RunState.fromString(
+      agent,
+      JSON.stringify(serialized),
+    );
+    const resumed = await run(agent, restored);
+
+    expect(resumed.interruptions).toHaveLength(1);
+    expect(
+      (resumed.interruptions[0].rawItem.providerData as any).server_label,
+    ).toBe('server-b');
+  });
+
+  it('keeps hosted MCP approvals server-scoped in nested agent resumes', async () => {
+    const nestedModel = new RecordingModel();
+    nestedModel.addMultipleTurnOutputs([
+      [hostedMcpApprovalRequest('nested-a', 'server-a', 'lookup_account')],
+      [hostedMcpApprovalRequest('nested-b', 'server-b', 'lookup_account')],
+    ]);
+    const nestedAgent = new Agent({
+      name: 'NestedMcpApprovalAgent',
+      model: nestedModel,
+      tools: [
+        hostedMcpTool({
+          serverLabel: 'server-a',
+          serverUrl: 'https://server-a.example/mcp',
+          requireApproval: 'always',
+        }),
+        hostedMcpTool({
+          serverLabel: 'server-b',
+          serverUrl: 'https://server-b.example/mcp',
+          requireApproval: 'always',
+        }),
+      ],
+    });
+    const nestedTool = nestedAgent.asTool({
+      toolName: 'nested_mcp_agent',
+      toolDescription: 'Run the nested MCP agent.',
+    });
+    const outerModel = new RecordingModel([
+      functionToolCall(
+        'nested_mcp_agent',
+        JSON.stringify({ input: 'lookup' }),
+        'outer-mcp-call',
+      ),
+    ]);
+    const outerAgent = new Agent({
+      name: 'OuterMcpApprovalAgent',
+      model: outerModel,
+      tools: [nestedTool],
+    });
+
+    const first = await run(outerAgent, 'Start');
+    expect(first.interruptions).toHaveLength(1);
+    first.state.approve(first.interruptions[0], { alwaysApprove: true });
+
+    const restored = await RunState.fromString(
+      outerAgent,
+      first.state.toString(),
+    );
+    const resumed = await run(outerAgent, restored);
+
+    expect(resumed.interruptions).toHaveLength(1);
+    expect(
+      (resumed.interruptions[0].rawItem.providerData as any).server_label,
+    ).toBe('server-b');
+  });
+
   it('orchestrator calls multiple translation tools then summarizes', async () => {
     const spanishModel = new RecordingModel([textMessage('ES hola')]);
     const spanishAgent = new Agent({ name: 'spanish', model: spanishModel });
@@ -2839,12 +3103,14 @@ describe('Agent scenarios (examples and docs patterns)', () => {
         functionToolCall(
           'translate_to_spanish',
           JSON.stringify({ input: 'Hi' }),
+          'translate-spanish',
         ),
       ],
       [
         functionToolCall(
           'translate_to_french',
           JSON.stringify({ input: 'Hi' }),
+          'translate-french',
         ),
       ],
       [textMessage('Summary complete')],

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
 import {
   OpenAIResponsesModel,
   OpenAIResponsesWSModel,
@@ -10,13 +10,44 @@ import {
   Agent,
   retryPolicies,
   Runner,
+  type AgentInputItem,
+  type ModelRequest,
+  type Session,
   setDefaultModelProvider,
+  setTraceProcessors,
   setTracingDisabled,
   withTrace,
   type ResponseStreamEvent,
   Span,
+  ModelBehaviorError,
 } from '@openai/agents-core';
 import type { ResponseStreamEvent as OpenAIResponseStreamEvent } from 'openai/resources/responses/responses';
+import { FAKE_ID } from '../src/openaiItemIds';
+
+class TestableOpenAIResponsesModel extends OpenAIResponsesModel {
+  buildRequest(request: any, stream: boolean) {
+    return this._buildResponsesCreateRequest(request, stream);
+  }
+}
+
+const serializedFunctionTool = {
+  type: 'function',
+  name: 'lookup',
+  description: 'Look up a record.',
+  parameters: { type: 'object', properties: {}, additionalProperties: false },
+  strict: true,
+} as const;
+
+const serializedHandoff = {
+  toolName: 'transfer_to_specialist',
+  toolDescription: 'Transfer to a specialist.',
+  inputJsonSchema: {
+    type: 'object',
+    properties: {},
+    additionalProperties: false,
+  },
+  strictJsonSchema: true,
+} as const;
 
 describe('OpenAIResponsesModel', () => {
   beforeAll(() => {
@@ -27,6 +58,375 @@ describe('OpenAIResponsesModel', () => {
       },
     });
   });
+  afterEach(() => {
+    setTracingDisabled(true);
+    setTraceProcessors([]);
+  });
+
+  it.each([
+    {
+      label: 'a local function tool',
+      tools: [serializedFunctionTool],
+      handoffs: [],
+      prompt: undefined,
+      toolsExplicitlyProvided: undefined,
+      providerData: undefined,
+      expectedToolsLength: 1,
+      expectsParallelToolCalls: true,
+    },
+    {
+      label: 'a converted handoff tool',
+      tools: [],
+      handoffs: [serializedHandoff],
+      prompt: undefined,
+      toolsExplicitlyProvided: undefined,
+      providerData: undefined,
+      expectedToolsLength: 1,
+      expectsParallelToolCalls: true,
+    },
+    {
+      label: 'no tools',
+      tools: [],
+      handoffs: [],
+      prompt: undefined,
+      toolsExplicitlyProvided: undefined,
+      providerData: undefined,
+      expectedToolsLength: 0,
+      expectsParallelToolCalls: false,
+    },
+    {
+      label: 'explicitly empty tools',
+      tools: [],
+      handoffs: [],
+      prompt: undefined,
+      toolsExplicitlyProvided: true,
+      providerData: undefined,
+      expectedToolsLength: 0,
+      expectsParallelToolCalls: false,
+    },
+    {
+      label: 'a stored prompt with implicit tools',
+      tools: [],
+      handoffs: [],
+      prompt: { promptId: 'pmpt_123' },
+      toolsExplicitlyProvided: false,
+      providerData: undefined,
+      expectedToolsLength: undefined,
+      expectsParallelToolCalls: true,
+    },
+    {
+      label: 'a stored prompt with explicitly empty tools',
+      tools: [],
+      handoffs: [],
+      prompt: { promptId: 'pmpt_123' },
+      toolsExplicitlyProvided: true,
+      providerData: undefined,
+      expectedToolsLength: 0,
+      expectsParallelToolCalls: false,
+    },
+    {
+      label: 'a stored prompt with undefined provider tools',
+      tools: [],
+      handoffs: [],
+      prompt: { promptId: 'pmpt_123' },
+      toolsExplicitlyProvided: false,
+      providerData: { tools: undefined },
+      expectedToolsLength: undefined,
+      expectsParallelToolCalls: true,
+    },
+    {
+      label: 'extra-body tools',
+      tools: [],
+      handoffs: [],
+      prompt: undefined,
+      toolsExplicitlyProvided: undefined,
+      providerData: {
+        extraBody: {
+          tools: [
+            {
+              type: 'function',
+              name: 'raw_lookup',
+              description: 'Look up a raw record.',
+              parameters: {
+                type: 'object',
+                properties: {},
+                additionalProperties: false,
+              },
+              strict: true,
+            },
+          ],
+        },
+      },
+      expectedToolsLength: 1,
+      expectsParallelToolCalls: true,
+    },
+    {
+      label: 'top-level provider tools',
+      tools: [],
+      handoffs: [],
+      prompt: undefined,
+      toolsExplicitlyProvided: undefined,
+      providerData: {
+        tools: [
+          {
+            type: 'function',
+            name: 'raw_lookup',
+            description: 'Look up a raw record.',
+            parameters: {
+              type: 'object',
+              properties: {},
+              additionalProperties: false,
+            },
+            strict: true,
+          },
+        ],
+      },
+      expectedToolsLength: 1,
+      expectsParallelToolCalls: true,
+    },
+  ])(
+    'aligns parallel_tool_calls with effective tools for $label',
+    ({
+      tools,
+      handoffs,
+      prompt,
+      toolsExplicitlyProvided,
+      providerData,
+      expectedToolsLength,
+      expectsParallelToolCalls,
+    }) => {
+      const model = new TestableOpenAIResponsesModel(
+        { responses: { create: vi.fn() } } as unknown as OpenAI,
+        'gpt-test',
+      );
+
+      for (const stream of [false, true]) {
+        for (const parallelToolCalls of [true, false] as const) {
+          const { requestData } = model.buildRequest(
+            {
+              input: 'hello',
+              modelSettings: { parallelToolCalls, providerData },
+              tools,
+              handoffs,
+              prompt,
+              toolsExplicitlyProvided,
+              outputType: 'text',
+              tracing: false,
+            },
+            stream,
+          );
+
+          if (expectedToolsLength === undefined) {
+            expect(requestData.tools).toBeUndefined();
+          } else {
+            expect(requestData.tools).toHaveLength(expectedToolsLength);
+          }
+          if (expectsParallelToolCalls) {
+            expect(requestData.parallel_tool_calls).toBe(parallelToolCalls);
+          } else {
+            expect(requestData).not.toHaveProperty('parallel_tool_calls');
+          }
+        }
+      }
+    },
+  );
+
+  it('preserves explicit providerData parallel_tool_calls precedence without converted tools', () => {
+    const model = new TestableOpenAIResponsesModel(
+      { responses: { create: vi.fn() } } as unknown as OpenAI,
+      'gpt-test',
+    );
+    const providerData = { parallel_tool_calls: true };
+
+    const { requestData } = model.buildRequest(
+      {
+        input: 'hello',
+        modelSettings: { parallelToolCalls: false, providerData },
+        tools: [],
+        handoffs: [],
+        outputType: 'text',
+        tracing: false,
+      },
+      false,
+    );
+
+    expect(requestData.parallel_tool_calls).toBe(true);
+    expect(providerData).toEqual({ parallel_tool_calls: true });
+  });
+
+  it.each([
+    { label: 'without providerData', stream: false, providerData: undefined },
+    {
+      label: 'with providerData',
+      stream: false,
+      providerData: { customMarker: 'keep' },
+    },
+    { label: 'without providerData', stream: true, providerData: undefined },
+    {
+      label: 'with providerData',
+      stream: true,
+      providerData: { customMarker: 'keep' },
+    },
+  ])(
+    'strips Chat Completions placeholder item IDs $label when stream=$stream',
+    ({ stream, providerData }) => {
+      const model = new TestableOpenAIResponsesModel(
+        { responses: { create: vi.fn() } } as unknown as OpenAI,
+        'gpt-test',
+      );
+      const providerMetadata = providerData ? { providerData } : {};
+      const history = [
+        {
+          id: FAKE_ID,
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'hello' }],
+          status: 'completed',
+          ...providerMetadata,
+        },
+        {
+          id: FAKE_ID,
+          type: 'function_call',
+          callId: 'call_1',
+          name: 'lookup',
+          arguments: '{}',
+          status: 'completed',
+          ...providerMetadata,
+        },
+      ];
+      const originalHistory = structuredClone(history);
+
+      const request = model.buildRequest(
+        {
+          input: history,
+          modelSettings: {},
+          tools: [],
+          handoffs: [],
+          outputType: 'text',
+          tracing: false,
+        },
+        stream,
+      );
+      const input = request.requestData.input as Array<Record<string, unknown>>;
+
+      expect(input[0]).not.toHaveProperty('id');
+      expect(input[1]).not.toHaveProperty('id');
+      expect(input[1]).toMatchObject({
+        type: 'function_call',
+        call_id: 'call_1',
+      });
+      if (providerData) {
+        expect(input[0]).toHaveProperty('custom_marker', 'keep');
+        expect(input[1]).toHaveProperty('custom_marker', 'keep');
+      }
+      expect(history).toEqual(originalHistory);
+    },
+  );
+
+  it('preserves provider item IDs and tool correlation IDs in Responses input', () => {
+    const model = new TestableOpenAIResponsesModel(
+      { responses: { create: vi.fn() } } as unknown as OpenAI,
+      'gpt-test',
+    );
+
+    const request = model.buildRequest(
+      {
+        input: [
+          {
+            id: 'msg_real',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'hello' }],
+            status: 'completed',
+          },
+          {
+            id: 'fc_real',
+            type: 'function_call',
+            callId: 'call_real',
+            name: 'lookup',
+            arguments: '{}',
+            status: 'completed',
+          },
+          {
+            id: 'fco_real',
+            type: 'function_call_result',
+            callId: 'call_real',
+            output: 'result',
+            status: 'completed',
+          },
+          {
+            id: FAKE_ID,
+            type: 'reasoning',
+            content: [],
+          },
+          {
+            id: FAKE_ID,
+            type: 'program',
+            callId: 'program_call_real',
+            code: 'return 1;',
+            fingerprint: 'fingerprint_real',
+          },
+          {
+            id: FAKE_ID,
+            type: 'program_output',
+            callId: 'program_call_real',
+            output: '1',
+            status: 'completed',
+          },
+          {
+            id: FAKE_ID,
+            type: 'computer_call',
+            callId: 'computer_call_real',
+            action: { type: 'wait' },
+            status: 'completed',
+          },
+          {
+            id: FAKE_ID,
+            type: 'unknown',
+            providerData: {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: 'provider message' }],
+              status: 'completed',
+            },
+          },
+          {
+            id: `${FAKE_ID}-but-not-the-placeholder`,
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'near match' }],
+            status: 'completed',
+          },
+        ],
+        modelSettings: {},
+        tools: [],
+        handoffs: [],
+        outputType: 'text',
+        tracing: false,
+      },
+      false,
+    );
+    const input = request.requestData.input as Array<Record<string, unknown>>;
+
+    expect(input.map((item) => item.id)).toEqual([
+      'msg_real',
+      'fc_real',
+      'fco_real',
+      FAKE_ID,
+      FAKE_ID,
+      FAKE_ID,
+      FAKE_ID,
+      FAKE_ID,
+      `${FAKE_ID}-but-not-the-placeholder`,
+    ]);
+    expect(input[1]).toHaveProperty('call_id', 'call_real');
+    expect(input[2]).toHaveProperty('call_id', 'call_real');
+    expect(input[4]).toHaveProperty('call_id', 'program_call_real');
+    expect(input[5]).toHaveProperty('call_id', 'program_call_real');
+    expect(input[6]).toHaveProperty('call_id', 'computer_call_real');
+    expect(input[7]).toHaveProperty('type', 'message');
+  });
+
   it('getResponse returns correct ModelResponse and calls client with right parameters', async () => {
     await withTrace('test', async () => {
       const fakeResponse = {
@@ -89,7 +489,343 @@ describe('OpenAIResponsesModel', () => {
         },
       ]);
       expect(result.responseId).toBe('res1');
+      expect(result.rawUsage).toBeUndefined();
     });
+  });
+
+  it.each(['failed', 'incomplete'] as const)(
+    'getResponse rejects an unsuccessful %s response before output processing',
+    async (status) => {
+      const sensitiveDetail = 'sensitive-provider-detail';
+      const fakeResponse = {
+        id: 'resp_unsuccessful',
+        status,
+        usage: {
+          input_tokens: 3,
+          output_tokens: 4,
+          total_tokens: 7,
+        },
+        output: [{ type: 'unsupported_output', secret: sensitiveDetail }],
+        error: { message: sensitiveDetail },
+        incomplete_details: { reason: sensitiveDetail },
+      };
+      const createMock = vi.fn().mockResolvedValue(fakeResponse);
+      const model = new OpenAIResponsesModel(
+        { responses: { create: createMock } } as unknown as OpenAI,
+        'gpt-test',
+      );
+      const request = {
+        systemInstructions: undefined,
+        input: 'hello',
+        modelSettings: {},
+        tools: [],
+        outputType: 'text',
+        handoffs: [],
+        tracing: false,
+        signal: undefined,
+      } as any;
+
+      const error = await withTrace('test', () =>
+        model.getResponse(request),
+      ).catch((caught: unknown) => caught as any);
+
+      expect(error).toBeInstanceOf(ModelBehaviorError);
+      expect(error.message).toBe(
+        `OpenAI Responses request ended with unsuccessful terminal state "response.${status}".`,
+      );
+      expect(error.message).not.toContain(sensitiveDetail);
+      expect(error.data).toBeUndefined();
+      expect(Object.keys(error)).not.toContain('unsafeToReplay');
+      expect(Object.keys(error)).not.toContain('responseStarted');
+      expect(
+        model.getRetryAdvice({ error, request, stream: false, attempt: 1 }),
+      ).toMatchObject({
+        suggested: false,
+        replaySafety: 'unsafe',
+        responseStarted: true,
+      });
+    },
+  );
+
+  it('preserves incomplete response usage in Runner accounting', async () => {
+    setTracingDisabled(false);
+    let taskSpan: Span<any> | undefined;
+    let turnSpan: Span<any> | undefined;
+    setTraceProcessors([
+      {
+        async onTraceStart() {},
+        async onTraceEnd() {},
+        async onSpanStart() {},
+        async onSpanEnd(span: Span<any>) {
+          if (span.spanData.type === 'task') {
+            taskSpan = span;
+          }
+          if (span.spanData.type === 'turn') {
+            turnSpan = span;
+          }
+        },
+        async shutdown() {},
+        async forceFlush() {},
+      },
+    ]);
+    const model = new OpenAIResponsesModel(
+      {
+        responses: {
+          create: vi.fn().mockResolvedValue({
+            id: 'resp_incomplete_usage',
+            status: 'incomplete',
+            usage: {
+              input_tokens: 3,
+              output_tokens: 4,
+              total_tokens: 7,
+              input_tokens_details: { cached_tokens: 1 },
+              output_tokens_details: { reasoning_tokens: 2 },
+            },
+            output: [],
+            incomplete_details: { reason: 'max_output_tokens' },
+          }),
+        },
+      } as unknown as OpenAI,
+      'gpt-test',
+    );
+    const agent = new Agent({ name: 'IncompleteUsageAgent', model });
+
+    const error = await new Runner()
+      .run(agent, 'hello')
+      .catch((caught: unknown) => caught as any);
+
+    expect(error).toBeInstanceOf(ModelBehaviorError);
+    expect(taskSpan?.spanData.usage).toMatchObject({
+      requests: 1,
+      input_tokens: 3,
+      output_tokens: 4,
+      total_tokens: 7,
+    });
+    expect(turnSpan?.spanData.usage).toMatchObject({
+      input_tokens: 3,
+      output_tokens: 4,
+      cached_input_tokens: 1,
+    });
+  });
+
+  it('getResponse accepts an explicitly completed response', async () => {
+    const model = new OpenAIResponsesModel(
+      {
+        responses: {
+          create: vi.fn().mockResolvedValue({
+            id: 'resp_completed',
+            status: 'completed',
+            usage: {},
+            output: [],
+          }),
+        },
+      } as unknown as OpenAI,
+      'gpt-test',
+    );
+
+    const result = await withTrace('test', () =>
+      model.getResponse({
+        systemInstructions: undefined,
+        input: 'hello',
+        modelSettings: {},
+        tools: [],
+        outputType: 'text',
+        handoffs: [],
+        tracing: false,
+        signal: undefined,
+      } as any),
+    );
+
+    expect(result.responseId).toBe('resp_completed');
+    expect(result.output).toEqual([]);
+  });
+
+  it('redacts an unsuccessful non-streaming response from no-data tracing', async () => {
+    setTracingDisabled(false);
+    let responseSpan: Span<any> | undefined;
+    setTraceProcessors([
+      {
+        async onTraceStart() {},
+        async onTraceEnd() {},
+        async onSpanStart() {},
+        async onSpanEnd(span: Span<any>) {
+          if (span.spanData.type === 'response') {
+            responseSpan = span;
+          }
+        },
+        async shutdown() {},
+        async forceFlush() {},
+      },
+    ]);
+    const sensitiveDetail = 'sensitive-no-data-response';
+    const model = new OpenAIResponsesModel(
+      {
+        responses: {
+          create: vi.fn().mockResolvedValue({
+            id: 'resp_no_data_incomplete',
+            status: 'incomplete',
+            usage: {},
+            output: [],
+            incomplete_details: { reason: sensitiveDetail },
+          }),
+        },
+      } as unknown as OpenAI,
+      'gpt-test',
+    );
+
+    await expect(
+      withTrace('test', () =>
+        model.getResponse({
+          systemInstructions: undefined,
+          input: sensitiveDetail,
+          modelSettings: {},
+          tools: [],
+          outputType: 'text',
+          handoffs: [],
+          tracing: 'enabled_without_data',
+          signal: undefined,
+        } as any),
+      ),
+    ).rejects.toThrow(ModelBehaviorError);
+
+    expect(responseSpan?.spanData.response_id).toBe('resp_no_data_incomplete');
+    expect(responseSpan?.spanData._input).toBeUndefined();
+    expect(responseSpan?.spanData._response).toBeUndefined();
+    expect(JSON.stringify(responseSpan?.error)).not.toContain(sensitiveDetail);
+  });
+
+  it('does not persist an unsuccessful non-streaming response as a successful turn', async () => {
+    const fakeResponse = {
+      id: 'resp_incomplete_tool',
+      status: 'incomplete',
+      usage: {},
+      output: [
+        {
+          type: 'function_call',
+          id: 'fc_incomplete',
+          call_id: 'call_incomplete',
+          name: 'lookup',
+          arguments: '{}',
+        },
+      ],
+    };
+    const model = new OpenAIResponsesModel(
+      {
+        responses: { create: vi.fn().mockResolvedValue(fakeResponse) },
+      } as unknown as OpenAI,
+      'gpt-test',
+    );
+    const addItems = vi.fn(async (_items: AgentInputItem[]) => {});
+    const session: Session = {
+      getSessionId: vi.fn().mockResolvedValue('terminal-failure-session'),
+      getItems: vi.fn().mockResolvedValue([]),
+      addItems,
+      popItem: vi.fn().mockResolvedValue(undefined),
+      clearSession: vi.fn().mockResolvedValue(undefined),
+    };
+    const agent = new Agent({ name: 'TerminalFailureAgent', model });
+
+    await expect(
+      new Runner().run(agent, 'persist-me', { session }),
+    ).rejects.toThrow(ModelBehaviorError);
+    expect(addItems).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['omitted', {}, {}],
+    ['explicit zero', { cached_tokens: 0 }, { cached_tokens: 0 }],
+  ])(
+    'getResponse preserves %s cached token field presence when enabled',
+    async (_label, inputTokensDetails, expectedInputTokensDetails) => {
+      await withTrace('test', async () => {
+        const fakeResponse = {
+          id: 'res-raw-usage',
+          usage: {
+            input_tokens: 3,
+            output_tokens: 2,
+            total_tokens: 5,
+            input_tokens_details: inputTokensDetails,
+            output_tokens_details: { reasoning_tokens: 0 },
+            provider_metric: null,
+          },
+          output: [],
+        };
+        const createMock = vi.fn().mockResolvedValue(fakeResponse);
+        const model = new OpenAIResponsesModel(
+          { responses: { create: createMock } } as unknown as OpenAI,
+          'gpt-test',
+        );
+
+        const result = await model.getResponse({
+          input: 'hello',
+          modelSettings: { preserveRawUsage: true },
+          tools: [],
+          outputType: 'text',
+          handoffs: [],
+          tracing: false,
+        } as any);
+
+        expect(result.rawUsage).toEqual({
+          input_tokens: 3,
+          output_tokens: 2,
+          total_tokens: 5,
+          input_tokens_details: expectedInputTokensDetails,
+          output_tokens_details: { reasoning_tokens: 0 },
+          provider_metric: null,
+        });
+      });
+    },
+  );
+
+  it('captures raw and normalized usage before tracing processors can mutate it', async () => {
+    const fakeResponse = {
+      id: 'res-traced-raw-usage',
+      usage: {
+        input_tokens: 3,
+        output_tokens: 2,
+        total_tokens: 5,
+      },
+      output: [],
+    };
+    const createMock = vi.fn().mockResolvedValue(fakeResponse);
+    setTracingDisabled(false);
+    setTraceProcessors([
+      {
+        async onTraceStart() {},
+        async onTraceEnd() {},
+        async onSpanStart() {},
+        async onSpanEnd(span: Span<any>) {
+          const response = span.spanData._response as any;
+          if (response?.usage) {
+            response.usage.input_tokens = 99;
+          }
+        },
+        async shutdown() {},
+        async forceFlush() {},
+      },
+    ]);
+    const model = new OpenAIResponsesModel(
+      { responses: { create: createMock } } as unknown as OpenAI,
+      'gpt-test',
+    );
+
+    const result = await withTrace('test', () =>
+      model.getResponse({
+        input: 'hello',
+        modelSettings: { preserveRawUsage: true },
+        tools: [],
+        outputType: 'text',
+        handoffs: [],
+        tracing: true,
+      } as any),
+    );
+
+    expect(result.rawUsage).toEqual({
+      input_tokens: 3,
+      output_tokens: 2,
+      total_tokens: 5,
+    });
+    expect(result.usage.inputTokens).toBe(3);
   });
 
   it('getResponse exposes the OpenAI request ID on ModelResponse', async () => {
@@ -1098,6 +1834,7 @@ describe('OpenAIResponsesModel', () => {
       ),
       {
         unsafeToReplay: true,
+        responseStarted: true,
       },
     );
 
@@ -1120,6 +1857,7 @@ describe('OpenAIResponsesModel', () => {
       replaySafety: 'unsafe',
       reason:
         'Responses websocket connection closed before a terminal response event.',
+      responseStarted: true,
     });
   });
 
@@ -4489,6 +5227,681 @@ describe('OpenAIResponsesModel', () => {
     ).toHaveLength(1);
   });
 
+  it.each([
+    ['response.incomplete', 'incomplete'],
+    ['response.failed', 'failed'],
+    ['error', undefined],
+  ] as const)(
+    'rejects terminal stream event %s after preserving the raw event and cleanup',
+    async (terminalEventType, status) => {
+      let cleanedUp = false;
+      const sensitiveDetail = 'sensitive-stream-detail';
+      const terminalEvent =
+        terminalEventType === 'error'
+          ? ({
+              type: 'error',
+              code: 'server_error',
+              message: sensitiveDetail,
+              param: null,
+              sequence_number: 0,
+            } satisfies OpenAIResponseStreamEvent)
+          : {
+              type: terminalEventType,
+              response: {
+                id: 'resp_stream_unsuccessful',
+                status,
+                output: [],
+                usage: {},
+                error: { message: sensitiveDetail },
+                incomplete_details: { reason: sensitiveDetail },
+              },
+              sequence_number: 0,
+            };
+      async function* fakeStream() {
+        try {
+          yield terminalEvent;
+        } finally {
+          cleanedUp = true;
+        }
+      }
+      const model = new OpenAIResponsesModel(
+        {
+          responses: { create: vi.fn().mockResolvedValue(fakeStream()) },
+        } as unknown as OpenAI,
+        'model-stream',
+      );
+      const request = {
+        systemInstructions: undefined,
+        input: 'data',
+        modelSettings: {},
+        tools: [],
+        outputType: 'text',
+        handoffs: [],
+        tracing: false,
+        signal: undefined,
+      } as any;
+      const received: ResponseStreamEvent[] = [];
+
+      const error = await (async () => {
+        try {
+          for await (const event of model.getStreamedResponse(request)) {
+            received.push(event);
+          }
+        } catch (caught) {
+          return caught;
+        }
+      })();
+
+      expect(error).toBeInstanceOf(ModelBehaviorError);
+      expect((error as Error).message).toBe(
+        `OpenAI Responses request ended with unsuccessful terminal state "${terminalEventType}".`,
+      );
+      expect((error as Error).message).not.toContain(sensitiveDetail);
+      expect(cleanedUp).toBe(true);
+      expect(
+        received.filter((event) => event.type === 'response_done'),
+      ).toEqual([]);
+      expect(
+        received.filter(
+          (event) =>
+            event.type === 'model' && event.event.type === terminalEventType,
+        ),
+      ).toHaveLength(1);
+      expect(
+        model.getRetryAdvice({ error, request, stream: true, attempt: 1 }),
+      ).toMatchObject({
+        suggested: false,
+        replaySafety: 'unsafe',
+        responseStarted: true,
+      });
+    },
+  );
+
+  it.each([undefined, null])(
+    'rejects a completed stream event with response=%s',
+    async (response) => {
+      setTracingDisabled(false);
+      let responseSpan: Span<any> | undefined;
+      setTraceProcessors([
+        {
+          async onTraceStart() {},
+          async onTraceEnd() {},
+          async onSpanStart(span: Span<any>) {
+            if (span.spanData.type === 'response') {
+              responseSpan = span;
+            }
+          },
+          async onSpanEnd() {},
+          async shutdown() {},
+          async forceFlush() {},
+        },
+      ]);
+      const terminalEvent = {
+        type: 'response.completed',
+        ...(response === undefined ? {} : { response }),
+        sequence_number: 0,
+      };
+      let cleanedUp = false;
+      let readPastTerminal = false;
+      async function* fakeStream() {
+        try {
+          yield terminalEvent;
+          readPastTerminal = true;
+        } finally {
+          cleanedUp = true;
+        }
+      }
+      const model = new OpenAIResponsesModel(
+        {
+          responses: { create: vi.fn().mockResolvedValue(fakeStream()) },
+        } as unknown as OpenAI,
+        'model-stream',
+      );
+      const request = {
+        systemInstructions: undefined,
+        input: 'sensitive malformed response input',
+        modelSettings: {},
+        tools: [],
+        outputType: 'text',
+        handoffs: [],
+        tracing: 'enabled_without_data',
+      } as ModelRequest;
+      const message =
+        'OpenAI Responses terminal event "response.completed" is missing its required response payload.';
+      const error = await withTrace('test', async () => {
+        const iterator = model
+          .getStreamedResponse(request)
+          [Symbol.asyncIterator]();
+        expect((await iterator.next()).value).toMatchObject({
+          type: 'model',
+          event: terminalEvent,
+        });
+        expect(responseSpan?.error).toEqual({ message });
+        return iterator.next().catch((caught: unknown) => caught);
+      });
+      expect(error).toBeInstanceOf(ModelBehaviorError);
+      expect((error as Error).message).toBe(message);
+      expect(JSON.stringify(responseSpan?.spanData)).not.toContain(
+        request.input,
+      );
+      expect(cleanedUp).toBe(true);
+      expect(readPastTerminal).toBe(false);
+      expect(
+        model.getRetryAdvice({ error, request, stream: true, attempt: 1 }),
+      ).toMatchObject({
+        suggested: false,
+        replaySafety: 'unsafe',
+        responseStarted: true,
+      });
+    },
+  );
+
+  it('closes the stream after the first unsuccessful terminal', async () => {
+    setTracingDisabled(false);
+    let responseSpan: Span<any> | undefined;
+    setTraceProcessors([
+      {
+        async onTraceStart() {},
+        async onTraceEnd() {},
+        async onSpanStart() {},
+        async onSpanEnd(span: Span<any>) {
+          if (span.spanData.type === 'response') {
+            responseSpan = span;
+          }
+        },
+        async shutdown() {},
+        async forceFlush() {},
+      },
+    ]);
+    let cleanedUp = false;
+    const unsuccessfulEvent = {
+      type: 'response.incomplete',
+      response: {
+        id: 'resp_first_incomplete',
+        status: 'incomplete',
+        output: [],
+        usage: {
+          input_tokens: 3,
+          output_tokens: 4,
+          total_tokens: 7,
+          input_tokens_details: { cached_tokens: 1 },
+          output_tokens_details: { reasoning_tokens: 2 },
+        },
+        incomplete_details: { reason: 'max_output_tokens' },
+      },
+      sequence_number: 0,
+    } as const;
+    const laterCompletedEvent: OpenAIResponseStreamEvent = {
+      type: 'response.completed',
+      response: {
+        id: 'resp_later_completed',
+        status: 'completed',
+        output: [],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 20,
+          total_tokens: 30,
+        },
+      } as any,
+      sequence_number: 1,
+    };
+    async function* fakeStream() {
+      try {
+        yield unsuccessfulEvent;
+        yield laterCompletedEvent;
+      } finally {
+        cleanedUp = true;
+      }
+    }
+    const model = new OpenAIResponsesModel(
+      {
+        responses: {
+          create: vi.fn().mockImplementation(async () => fakeStream()),
+        },
+      } as unknown as OpenAI,
+      'model-stream',
+    );
+    const request = {
+      systemInstructions: undefined,
+      input: 'data',
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: 'enabled_without_data',
+      signal: undefined,
+    } as any;
+    const received: ResponseStreamEvent[] = [];
+
+    const error = await withTrace('test', async () => {
+      return await (async () => {
+        try {
+          for await (const event of model.getStreamedResponse(request)) {
+            received.push(event);
+          }
+        } catch (caught) {
+          return caught;
+        }
+      })();
+    });
+
+    expect(error).toBeInstanceOf(ModelBehaviorError);
+    expect((error as Error).message).toContain('response.incomplete');
+    expect(cleanedUp).toBe(true);
+    expect(received.filter((event) => event.type === 'response_done')).toEqual(
+      [],
+    );
+    expect(
+      received
+        .filter((event) => event.type === 'model')
+        .map((event) => event.event.type),
+    ).toEqual(['response.incomplete']);
+    expect(responseSpan?.spanData.response_id).toBe('resp_first_incomplete');
+    expect(responseSpan?.spanData._response).toBeUndefined();
+
+    setTracingDisabled(true);
+    const agent = new Agent({
+      name: 'TerminalFailureAgent',
+      model,
+      modelSettings: { timeoutMs: 25 },
+    });
+    const result = await new Runner().run(agent, 'hello', { stream: true });
+
+    await expect(result.completed).rejects.toThrow('response.incomplete');
+    expect(result.state.usage.requests).toBe(1);
+    expect(result.state.usage.inputTokens).toBe(3);
+    expect(result.state.usage.outputTokens).toBe(4);
+    expect(result.state.usage.totalTokens).toBe(7);
+    expect(result.state.usage.requestUsageEntries?.[0]).toMatchObject({
+      inputTokens: 3,
+      outputTokens: 4,
+      totalTokens: 7,
+      endpoint: 'responses.create',
+    });
+    expect(result.state._modelResponses).toEqual([]);
+  });
+
+  it('preserves terminal usage when cancellation precedes raw-event forwarding', async () => {
+    const controller = new AbortController();
+    let cleanedUp = false;
+    async function* fakeStream() {
+      try {
+        queueMicrotask(() => controller.abort());
+        yield {
+          type: 'response.incomplete',
+          response: {
+            id: 'resp_cancel_before_forwarding',
+            status: 'incomplete',
+            output: [],
+            usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 },
+          },
+          sequence_number: 0,
+        } as const;
+      } finally {
+        cleanedUp = true;
+      }
+    }
+    const model = new OpenAIResponsesModel(
+      {
+        responses: { create: vi.fn().mockResolvedValue(fakeStream()) },
+      } as unknown as OpenAI,
+      'model-stream',
+    );
+    const result = await new Runner().run(
+      new Agent({
+        name: 'EarlyCancellationAgent',
+        model,
+        modelSettings: { timeoutMs: 10_000 },
+      }),
+      'hello',
+      { stream: true, signal: controller.signal },
+    );
+
+    await expect(result.completed).resolves.toBeUndefined();
+    expect(result.state.usage).toMatchObject({ requests: 1, totalTokens: 7 });
+    expect(result.state.usage.requestUsageEntries).toHaveLength(1);
+    expect(result.rawResponses).toEqual([]);
+    expect(cleanedUp).toBe(true);
+  });
+
+  it('preserves terminal usage when an input guardrail closes the stream', async () => {
+    let releaseGuardrail!: () => void;
+    const guardrailGate = new Promise<void>((resolve) => {
+      releaseGuardrail = resolve;
+    });
+    let cleanedUp = false;
+    async function* fakeStream() {
+      try {
+        yield {
+          type: 'response.incomplete',
+          response: {
+            id: 'resp_guardrail_before_forwarding',
+            status: 'incomplete',
+            output: [],
+            usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 },
+          },
+          sequence_number: 0,
+        } as const;
+      } finally {
+        cleanedUp = true;
+      }
+    }
+    // Pause the real adapter's terminal event until the parallel guardrail settles.
+    class PausedTerminalModel extends OpenAIResponsesModel {
+      override async *getStreamedResponse(request: ModelRequest) {
+        for await (const event of super.getStreamedResponse(request)) {
+          releaseGuardrail();
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          yield event;
+        }
+      }
+    }
+    const model = new PausedTerminalModel(
+      {
+        responses: { create: vi.fn().mockResolvedValue(fakeStream()) },
+      } as unknown as OpenAI,
+      'model-stream',
+    );
+    const result = await new Runner().run(
+      new Agent({
+        name: 'TerminalGuardrailAgent',
+        model,
+        inputGuardrails: [
+          {
+            name: 'parallel guardrail',
+            execute: async () => {
+              await guardrailGate;
+              return { outputInfo: null, tripwireTriggered: true };
+            },
+          },
+        ],
+      }),
+      'hello',
+      { stream: true },
+    );
+
+    await expect(result.completed).rejects.toMatchObject({
+      name: 'InputGuardrailTripwireTriggered',
+    });
+    expect(result.state.usage).toMatchObject({ requests: 1, totalTokens: 7 });
+    expect(result.state.usage.requestUsageEntries).toHaveLength(1);
+    expect(result.rawResponses).toEqual([]);
+    expect(cleanedUp).toBe(true);
+  });
+
+  it.each(['default', 'custom'] as const)(
+    'preserves terminal usage when %s cancellation replaces the streamed failure',
+    async (reasonType) => {
+      setTracingDisabled(false);
+      const usageSpans: Span<any>[] = [];
+      setTraceProcessors([
+        {
+          async onTraceStart() {},
+          async onTraceEnd() {},
+          async onSpanStart() {},
+          async onSpanEnd(span: Span<any>) {
+            if (
+              span.spanData.type === 'task' ||
+              span.spanData.type === 'turn'
+            ) {
+              usageSpans.push(span);
+            }
+          },
+          async shutdown() {},
+          async forceFlush() {},
+        },
+      ]);
+      const controller = new AbortController();
+      const cancellationError =
+        reasonType === 'custom'
+          ? new Error('cancelled after terminal event')
+          : undefined;
+      let cleanedUp = false;
+      async function* fakeStream() {
+        try {
+          yield {
+            type: 'response.incomplete',
+            response: {
+              id: 'resp_incomplete_before_cancel',
+              status: 'incomplete',
+              output: [],
+              usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 },
+            },
+            sequence_number: 0,
+          } as const;
+        } finally {
+          cleanedUp = true;
+        }
+      }
+      // Control the cancellation boundary after the real adapter emits its raw event.
+      class CancelAfterTerminalModel extends OpenAIResponsesModel {
+        override async *getStreamedResponse(request: ModelRequest) {
+          for await (const event of super.getStreamedResponse(request)) {
+            yield event;
+            if (
+              event.type === 'model' &&
+              event.event.type === 'response.incomplete'
+            ) {
+              controller.abort(cancellationError);
+            }
+          }
+        }
+      }
+      const model = new CancelAfterTerminalModel(
+        {
+          responses: { create: vi.fn().mockResolvedValue(fakeStream()) },
+        } as unknown as OpenAI,
+        'model-stream',
+      );
+      const agent = new Agent({
+        name: 'TerminalCancellationAgent',
+        model,
+        modelSettings: { timeoutMs: 10_000 },
+      });
+      const result = await new Runner().run(agent, 'hello', {
+        stream: true,
+        signal: controller.signal,
+      });
+
+      if (cancellationError) {
+        await expect(result.completed).rejects.toBe(cancellationError);
+      } else {
+        await expect(result.completed).resolves.toBeUndefined();
+      }
+      expect(result.state.usage).toMatchObject({
+        requests: 1,
+        inputTokens: 3,
+        outputTokens: 4,
+        totalTokens: 7,
+      });
+      expect(result.state.usage.requestUsageEntries).toHaveLength(1);
+      expect(result.state._modelResponses).toEqual([]);
+      expect(usageSpans).toHaveLength(2);
+      for (const span of usageSpans) {
+        expect(span.spanData.usage).toMatchObject({
+          input_tokens: 3,
+          output_tokens: 4,
+        });
+      }
+      expect(cleanedUp).toBe(true);
+    },
+  );
+
+  it('closes a stalled terminal stream before runner timeout can replace the failure', async () => {
+    let cleanedUp = false;
+    async function* fakeStream() {
+      try {
+        yield {
+          type: 'response.incomplete',
+          response: {
+            id: 'resp_incomplete_before_timeout',
+            status: 'incomplete',
+            output: [],
+            usage: {},
+          },
+          sequence_number: 0,
+        } as const;
+        await new Promise<void>(() => {});
+      } finally {
+        cleanedUp = true;
+      }
+    }
+    const model = new OpenAIResponsesModel(
+      {
+        responses: { create: vi.fn().mockResolvedValue(fakeStream()) },
+      } as unknown as OpenAI,
+      'model-stream',
+    );
+    const agent = new Agent({
+      name: 'TerminalTimeoutAgent',
+      model,
+      modelSettings: { timeoutMs: 25 },
+    });
+    const result = await new Runner().run(agent, 'hello', { stream: true });
+
+    await expect(result.completed).rejects.toThrow(ModelBehaviorError);
+    expect(result.error).toBeInstanceOf(ModelBehaviorError);
+    expect((result.error as Error).message).toContain('response.incomplete');
+    expect(cleanedUp).toBe(true);
+    expect(result.state.usage.requests).toBe(1);
+  });
+
+  it.each(['response.incomplete', 'error'] as const)(
+    'records a redacted span error before yielding terminal event %s',
+    async (terminalEventType) => {
+      setTracingDisabled(false);
+      const sensitiveDetail = 'sensitive-span-detail';
+      const terminalEvent =
+        terminalEventType === 'error'
+          ? ({
+              type: 'error',
+              code: 'server_error',
+              message: sensitiveDetail,
+              param: null,
+              sequence_number: 0,
+            } satisfies OpenAIResponseStreamEvent)
+          : ({
+              type: 'response.incomplete',
+              response: {
+                id: 'resp_traced_incomplete',
+                status: 'incomplete',
+                output: [],
+                usage: {},
+                incomplete_details: { reason: sensitiveDetail },
+              },
+              sequence_number: 0,
+            } as any);
+      async function* fakeStream() {
+        yield terminalEvent;
+      }
+      const model = new OpenAIResponsesModel(
+        {
+          responses: { create: vi.fn().mockResolvedValue(fakeStream()) },
+        } as unknown as OpenAI,
+        'model-stream',
+      );
+      const setErrorSpy = vi.spyOn(Span.prototype, 'setError');
+
+      await withTrace('test', async () => {
+        const iterator = model
+          .getStreamedResponse({
+            systemInstructions: undefined,
+            input: 'data',
+            modelSettings: {},
+            tools: [],
+            outputType: 'text',
+            handoffs: [],
+            tracing: true,
+            signal: undefined,
+          } as any)
+          [Symbol.asyncIterator]();
+        const first = await iterator.next();
+
+        expect(first.value).toMatchObject({
+          type: 'model',
+          event: { type: terminalEventType },
+        });
+        expect(setErrorSpy).toHaveBeenCalledWith({
+          message: `OpenAI Responses request ended with unsuccessful terminal state "${terminalEventType}".`,
+        });
+        expect(JSON.stringify(setErrorSpy.mock.calls)).not.toContain(
+          sensitiveDetail,
+        );
+        await iterator.return?.();
+      });
+
+      setErrorSpy.mockRestore();
+      setTracingDisabled(true);
+    },
+  );
+
+  it('redacts an unsuccessful terminal response when a no-data tracing consumer stops early', async () => {
+    setTracingDisabled(false);
+    let responseSpan: Span<any> | undefined;
+    setTraceProcessors([
+      {
+        async onTraceStart() {},
+        async onTraceEnd() {},
+        async onSpanStart() {},
+        async onSpanEnd(span: Span<any>) {
+          if (span.spanData.type === 'response') {
+            responseSpan = span;
+          }
+        },
+        async shutdown() {},
+        async forceFlush() {},
+      },
+    ]);
+    const sensitiveDetail = 'sensitive-no-data-stream';
+    async function* fakeStream() {
+      yield {
+        type: 'response.incomplete',
+        response: {
+          id: 'resp_no_data_stream',
+          status: 'incomplete',
+          output: [],
+          usage: {},
+          incomplete_details: { reason: sensitiveDetail },
+        },
+        sequence_number: 0,
+      } as any;
+    }
+    const model = new OpenAIResponsesModel(
+      {
+        responses: { create: vi.fn().mockResolvedValue(fakeStream()) },
+      } as unknown as OpenAI,
+      'model-stream',
+    );
+
+    await withTrace('test', async () => {
+      const iterator = model
+        .getStreamedResponse({
+          systemInstructions: undefined,
+          input: sensitiveDetail,
+          modelSettings: {},
+          tools: [],
+          outputType: 'text',
+          handoffs: [],
+          tracing: 'enabled_without_data',
+          signal: undefined,
+        } as any)
+        [Symbol.asyncIterator]();
+
+      expect(await iterator.next()).toMatchObject({
+        value: {
+          type: 'model',
+          event: { type: 'response.incomplete' },
+        },
+      });
+      await iterator.return?.();
+    });
+
+    expect(responseSpan?.spanData.response_id).toBe('resp_no_data_stream');
+    expect(responseSpan?.spanData._input).toBeUndefined();
+    expect(responseSpan?.spanData._response).toBeUndefined();
+    expect(JSON.stringify(responseSpan?.error)).not.toContain(sensitiveDetail);
+  });
+
   it('prevents extra_body from overriding streamed request mode', async () => {
     await withTrace('test', async () => {
       const createdEvent: OpenAIResponseStreamEvent = {
@@ -4592,6 +6005,7 @@ describe('OpenAIResponsesModel', () => {
             total_tokens: 16,
             input_tokens_details: { cached_tokens: 2 },
             output_tokens_details: { reasoning_tokens: 3 },
+            provider_metric: null,
           },
         },
         sequence_number: 1,
@@ -4609,7 +6023,7 @@ describe('OpenAIResponsesModel', () => {
       const request = {
         systemInstructions: undefined,
         input: 'payload',
-        modelSettings: {},
+        modelSettings: { preserveRawUsage: true },
         tools: [],
         outputType: 'text',
         handoffs: [],
@@ -4641,6 +6055,14 @@ describe('OpenAIResponsesModel', () => {
             endpoint: 'responses.create',
           },
         ],
+      });
+      expect((responseDone as any).response.rawUsage).toEqual({
+        input_tokens: 11,
+        output_tokens: 5,
+        total_tokens: 16,
+        input_tokens_details: { cached_tokens: 2 },
+        output_tokens_details: { reasoning_tokens: 3 },
+        provider_metric: null,
       });
     });
   });
@@ -4699,6 +6121,133 @@ describe('OpenAIResponsesModel', () => {
       expect(responseDone).toBeDefined();
       expect((responseDone as any).response.id).toBe('res-stream-request-id');
       expect((responseDone as any).response.requestId).toBe('req_stream_123');
+    });
+  });
+
+  describe('compaction items', () => {
+    function fakeClientWithResponse(response: unknown) {
+      const createMock = vi.fn().mockResolvedValue(response);
+      return {
+        createMock,
+        client: {
+          responses: { create: createMock },
+        } as unknown as OpenAI,
+      };
+    }
+
+    const baseRequest = {
+      systemInstructions: undefined,
+      modelSettings: {},
+      tools: [],
+      outputType: 'text',
+      handoffs: [],
+      tracing: false,
+      signal: undefined,
+    };
+
+    it('rejects a compaction input item without ciphertext before calling the client', async () => {
+      const { client, createMock } = fakeClientWithResponse({
+        id: 'unused',
+        usage: {},
+        output: [],
+      });
+      const model = new OpenAIResponsesModel(client, 'gpt-test');
+
+      await expect(
+        withTrace('test', () =>
+          model.getResponse({
+            ...baseRequest,
+            input: [
+              {
+                type: 'compaction',
+                providerData: { provider: 'example' },
+              },
+            ],
+          } as any),
+        ),
+      ).rejects.toThrow('Compaction item missing encrypted_content');
+      expect(createMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects a malformed provider compaction output item', async () => {
+      const { client } = fakeClientWithResponse({
+        id: 'res-compaction-malformed',
+        usage: {},
+        output: [{ type: 'compaction', id: 'cmp_bad' }],
+      });
+      const model = new OpenAIResponsesModel(client, 'gpt-test');
+
+      await expect(
+        withTrace('test', () =>
+          model.getResponse({ ...baseRequest, input: 'hello' } as any),
+        ),
+      ).rejects.toThrow('Compaction item missing encrypted_content');
+    });
+
+    it('rejects a provider compaction output item with a malformed id', async () => {
+      const { client } = fakeClientWithResponse({
+        id: 'res-compaction-malformed-id',
+        usage: {},
+        output: [
+          { type: 'compaction', id: 7, encrypted_content: 'ciphertext' },
+        ],
+      });
+      const model = new OpenAIResponsesModel(client, 'gpt-test');
+
+      await expect(
+        withTrace('test', () =>
+          model.getResponse({ ...baseRequest, input: 'hello' } as any),
+        ),
+      ).rejects.toThrow('Compaction item missing encrypted_content');
+    });
+
+    it('does not persist session input when streamed provider compaction is malformed', async () => {
+      const completedEvent: OpenAIResponseStreamEvent = {
+        type: 'response.completed',
+        response: {
+          id: 'res-stream-compaction-malformed',
+          output: [{ type: 'compaction', id: 'cmp_bad' }],
+          usage: {},
+        } as any,
+        sequence_number: 0,
+      };
+      async function* fakeStream() {
+        yield completedEvent;
+      }
+      const createMock = vi.fn().mockResolvedValue(fakeStream());
+      const model = new OpenAIResponsesModel(
+        { responses: { create: createMock } } as unknown as OpenAI,
+        'gpt-test',
+      );
+      const addItems = vi.fn(async (_items: AgentInputItem[]) => {});
+      const clearSession = vi.fn(async () => {});
+      const replaceHistoryWithCompaction = vi.fn(
+        async (_items: AgentInputItem[]) => {},
+      );
+      const session: Session = {
+        getSessionId: vi.fn().mockResolvedValue('provider-stream-session'),
+        getItems: vi.fn().mockResolvedValue([]),
+        addItems,
+        popItem: vi.fn().mockResolvedValue(undefined),
+        clearSession,
+        replaceHistoryWithCompaction,
+      };
+      const agent = new Agent({
+        name: 'MalformedProviderStreamingCompactionAgent',
+        model,
+      });
+
+      const result = await new Runner().run(agent, 'persist-me', {
+        stream: true,
+        session,
+      });
+
+      await expect(result.completed).rejects.toThrow(
+        'Compaction item missing encrypted_content',
+      );
+      expect(addItems).not.toHaveBeenCalled();
+      expect(clearSession).not.toHaveBeenCalled();
+      expect(replaceHistoryWithCompaction).not.toHaveBeenCalled();
     });
   });
 

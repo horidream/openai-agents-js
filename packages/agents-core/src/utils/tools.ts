@@ -6,16 +6,26 @@ import { isZodObject } from './typeGuards';
 import type { AgentOutputType } from '../agent';
 import {
   zodJsonSchemaCompat,
+  zodJsonSchemaCompatForOpenAIStrict,
+  assertLosslessOpenAIStrictZodSchemaConversion,
   hasJsonSchemaObjectShape,
   mergeJsonSchemaDescriptions,
 } from './zodJsonSchemaCompat';
 import type { ZodObjectLike } from './zodCompat';
 import { asZodType } from './zodCompat';
 import {
-  stripStrictNullsForJsonSchema,
+  prepareOpenAIStrictToolSchema,
   stripStrictNullsForZodSchema,
   toOpenAIStrictToolSchema,
 } from './strictToolSchema';
+import {
+  assertStandardSchemaObjectRoot,
+  hasStandardSchemaMarker,
+  isStandardSchemaWithJSON,
+  standardSchemaToJsonSchema,
+  validateStandardSchema,
+  unsupportedStandardSchemaError,
+} from './standardSchema';
 
 // TypeScript struggles to infer the heavily generic types returned by the OpenAI
 // helpers, so we provide minimal wrappers that sidestep the deep instantiation.
@@ -90,9 +100,8 @@ export function toFunctionToolName(name: string): FunctionToolName {
 }
 
 /**
- * Get the schema and parser from an input type. If the input type is a ZodObject, we will convert
- * it into a JSON Schema and use Zod as parser. If the input type is a JSON schema, we use the
- * JSON.parse function to get the parser.
+ * Get the schema and parser from an input type. Supported Standard Schema and Zod values are
+ * converted to JSON Schema and retain runtime validation. Plain JSON Schema values use JSON.parse.
  * @param inputType - The input type to get the schema and parser from.
  * @param name - The name of the tool.
  * @returns The schema and parser.
@@ -105,24 +114,35 @@ export function getSchemaAndParserFromInputType<T extends ToolInputParameters>(
   } = {},
 ): {
   schema: JsonObjectSchema<any>;
-  parser: (input: string) => any;
+  parser: (input: string) => any | Promise<any>;
 } {
   const parser = (input: string) => JSON.parse(input);
 
   if (isZodObject(inputType)) {
     const useFallback = (originalError?: unknown) => {
-      const fallbackSchema = buildJsonSchemaFromZod(inputType);
+      const strictFallback = options.strict
+        ? zodJsonSchemaCompatForOpenAIStrict(inputType)
+        : undefined;
+      if (
+        strictFallback?.loweredObjectIntersection ||
+        strictFallback?.loweredPrimitiveIntersection
+      ) {
+        assertLosslessOpenAIStrictZodSchemaConversion(strictFallback);
+      }
+      const fallbackSchema = options.strict
+        ? strictFallback?.schema
+        : buildJsonSchemaFromZod(inputType);
       if (fallbackSchema) {
         return {
           schema: options.strict
             ? toOpenAIStrictToolSchema(fallbackSchema)
             : fallbackSchema,
           parser: (rawInput: string) =>
-            inputType.parse(
-              options.strict
-                ? stripStrictNullsForZodSchema(inputType, JSON.parse(rawInput))
-                : JSON.parse(rawInput),
-            ),
+            options.strict
+              ? inputType.parse(
+                  stripStrictNullsForZodSchema(inputType, JSON.parse(rawInput)),
+                )
+              : inputType.parse(JSON.parse(rawInput)),
         };
       }
 
@@ -149,18 +169,28 @@ export function getSchemaAndParserFromInputType<T extends ToolInputParameters>(
     }
 
     if (hasJsonSchemaObjectShape(formattedFunction.parameters)) {
-      const fallbackSchema = buildJsonSchemaFromZod(inputType);
+      const strictFallback = options.strict
+        ? zodJsonSchemaCompatForOpenAIStrict(inputType)
+        : undefined;
+      const fallbackSchema =
+        strictFallback?.schema ?? buildJsonSchemaFromZod(inputType);
       if (fallbackSchema) {
         mergeJsonSchemaDescriptions(
           formattedFunction.parameters as JsonObjectSchema<any>,
           fallbackSchema,
         );
       }
+      const upstreamSchema =
+        formattedFunction.parameters as JsonObjectSchema<any>;
+      const strictSchemaSource =
+        strictFallback?.loweredObjectIntersection ||
+        (strictFallback?.loweredPrimitiveIntersection &&
+          containsJsonSchemaAllOf(upstreamSchema))
+          ? useLosslessStrictFallback(strictFallback)
+          : upstreamSchema;
       return {
         schema: options.strict
-          ? toOpenAIStrictToolSchema(
-              formattedFunction.parameters as JsonObjectSchema<any>,
-            )
+          ? toOpenAIStrictToolSchema(strictSchemaSource)
           : (formattedFunction.parameters as JsonObjectSchema<any>),
         parser: options.strict
           ? (rawInput: string) =>
@@ -172,17 +202,129 @@ export function getSchemaAndParserFromInputType<T extends ToolInputParameters>(
     }
 
     return useFallback();
-  } else if (typeof inputType === 'object' && inputType !== null) {
+  } else if (isStandardSchemaWithJSON(inputType)) {
+    if (!options.strict) {
+      throw new UserError(
+        'Strict mode is required for Standard Schema parameters',
+      );
+    }
+    const inputSchema = standardSchemaToJsonSchema(inputType, 'input');
+    assertStandardSchemaObjectRoot(inputSchema, 'Tool parameter');
+    const preparedSchema = prepareOpenAIStrictToolSchema(
+      inputSchema as JsonObjectSchema<any>,
+    );
     return {
-      schema: options.strict ? toOpenAIStrictToolSchema(inputType) : inputType,
-      parser: options.strict
+      schema: preparedSchema.schema,
+      parser: (rawInput: string) =>
+        validateStandardSchema(
+          inputType,
+          preparedSchema.normalizeInput(JSON.parse(rawInput)),
+        ),
+    };
+  } else if (hasStandardSchemaMarker(inputType)) {
+    throw unsupportedStandardSchemaError();
+  } else if (typeof inputType === 'object' && inputType !== null) {
+    const jsonSchema = inputType as JsonObjectSchema<any>;
+    const preparedSchema = options.strict
+      ? prepareOpenAIStrictToolSchema(jsonSchema)
+      : undefined;
+    return {
+      schema: preparedSchema?.schema ?? jsonSchema,
+      parser: preparedSchema
         ? (rawInput: string) =>
-            stripStrictNullsForJsonSchema(inputType, JSON.parse(rawInput))
+            preparedSchema.normalizeInput(JSON.parse(rawInput))
         : parser,
     };
   }
 
-  throw new UserError('Input type is not a ZodObject or a valid JSON schema');
+  throw new UserError(
+    'Input type is not a supported Standard Schema or a valid JSON schema',
+  );
+}
+
+function useLosslessStrictFallback(
+  conversion: NonNullable<
+    ReturnType<typeof zodJsonSchemaCompatForOpenAIStrict>
+  >,
+): JsonObjectSchema<any> {
+  assertLosslessOpenAIStrictZodSchemaConversion(conversion);
+  return conversion.schema;
+}
+
+function containsJsonSchemaAllOf(
+  value: unknown,
+  visited: WeakSet<object> = new WeakSet(),
+): boolean {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    Array.isArray(value) ||
+    visited.has(value)
+  ) {
+    return false;
+  }
+  visited.add(value);
+  const schema = value as Record<string, unknown>;
+  if (Array.isArray(schema.allOf)) {
+    return true;
+  }
+
+  for (const key of [
+    'additionalItems',
+    'additionalProperties',
+    'contains',
+    'contentSchema',
+    'else',
+    'if',
+    'items',
+    'not',
+    'propertyNames',
+    'then',
+    'unevaluatedItems',
+    'unevaluatedProperties',
+  ]) {
+    const nested = schema[key];
+    if (Array.isArray(nested)) {
+      if (nested.some((entry) => containsJsonSchemaAllOf(entry, visited))) {
+        return true;
+      }
+    } else if (containsJsonSchemaAllOf(nested, visited)) {
+      return true;
+    }
+  }
+
+  for (const key of ['anyOf', 'oneOf', 'prefixItems']) {
+    const nested = schema[key];
+    if (
+      Array.isArray(nested) &&
+      nested.some((entry) => containsJsonSchemaAllOf(entry, visited))
+    ) {
+      return true;
+    }
+  }
+
+  for (const key of [
+    '$defs',
+    'definitions',
+    'dependencies',
+    'dependentSchemas',
+    'patternProperties',
+    'properties',
+  ]) {
+    const nested = schema[key];
+    if (
+      typeof nested === 'object' &&
+      nested !== null &&
+      !Array.isArray(nested) &&
+      Object.values(nested).some((entry) =>
+        containsJsonSchemaAllOf(entry, visited),
+      )
+    ) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -239,5 +381,21 @@ export function convertAgentOutputTypeToSerializable(
     return useFallback(output);
   }
 
-  return outputType;
+  if (isStandardSchemaWithJSON(outputType)) {
+    const schema = standardSchemaToJsonSchema(outputType, 'input');
+    assertStandardSchemaObjectRoot(schema, 'Agent output');
+    return {
+      type: 'json_schema',
+      name: 'output',
+      strict: true,
+      schema: prepareOpenAIStrictToolSchema(schema as JsonObjectSchema<any>)
+        .schema,
+    };
+  }
+
+  if (hasStandardSchemaMarker(outputType)) {
+    throw unsupportedStandardSchemaError();
+  }
+
+  return outputType as JsonSchemaDefinition;
 }

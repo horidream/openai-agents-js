@@ -4,7 +4,6 @@ import {
   isGitRepo,
   isMount,
   type Mount,
-  type MountProvider,
   type MountStrategy,
   type TypedMount,
 } from './entries';
@@ -32,6 +31,7 @@ import {
 } from './shared/posixPath';
 import { isRecord } from './shared/typeGuards';
 import { SandboxGitSubpathError } from './errors';
+import { typedMountProviderConfig } from './shared/typedMountConfig';
 
 export type EnvResolver = () => string | Promise<string>;
 
@@ -179,6 +179,15 @@ export class Manifest<
   readonly remoteMountCommandAllowlist: string[];
 
   constructor(init: ManifestInit<TEntries, TEnvironment> = {}) {
+    if (
+      MOUNT_CREDENTIAL_EXPOSURE_POLICY_KEYS.some(
+        (key) => key in (init as Record<string, unknown>),
+      )
+    ) {
+      throw new TypeError(
+        'In-container mount credential exposure must be configured on a trusted Manifest instance, not in a manifest init object.',
+      );
+    }
     rejectKnownSnakeCaseKeys(
       init as Record<string, unknown>,
       ['extra_path_grants', 'remote_mount_command_allowlist'],
@@ -202,6 +211,42 @@ export class Manifest<
       ...(init.remoteMountCommandAllowlist ??
         DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST),
     ];
+  }
+
+  /**
+   * Returns a trusted manifest that acknowledges exposure of mount-scoped
+   * credentials for exact in-container mount paths.
+   *
+   * This application-side policy is runtime-only. It is not accepted from
+   * manifest init objects and is never serialized into sandbox session state.
+   */
+  withInContainerMountCredentialExposureAcknowledged(
+    ...mountPaths: string[]
+  ): Manifest<TEntries, TEnvironment> {
+    return withInContainerMountCredentialExposureAcknowledgement(
+      this,
+      'mount_scoped',
+      mountPaths,
+    );
+  }
+
+  /**
+   * Returns a trusted manifest that acknowledges exposure of broad credential
+   * authority for exact in-container mount paths.
+   *
+   * Broad authority includes ambient credentials, workload or managed
+   * identity, and external credential files. This application-side policy is
+   * runtime-only. It is not accepted from manifest init objects and is never
+   * serialized into sandbox session state.
+   */
+  withInContainerMountBroadCredentialExposureAcknowledged(
+    ...mountPaths: string[]
+  ): Manifest<TEntries, TEnvironment> {
+    return withInContainerMountCredentialExposureAcknowledgement(
+      this,
+      'broad',
+      mountPaths,
+    );
   }
 
   validatedEntries(): Record<string, Entry> {
@@ -512,8 +557,92 @@ export type ManifestInput<
   TEnvironment extends ManifestEnvironment = ManifestEnvironment,
 > = Manifest<TEntries, TEnvironment> | ManifestInit<TEntries, TEnvironment>;
 
+export const MOUNT_CREDENTIAL_EXPOSURE_POLICY_KEYS = [
+  'in_container_mount_credential_exposure_allowed_paths',
+  '_in_container_mount_credential_exposure_allowed_paths',
+  'inContainerMountCredentialExposureAllowedPaths',
+  '_inContainerMountCredentialExposureAllowedPaths',
+  'in_container_mount_credential_exposure_acknowledged_paths',
+  '_in_container_mount_credential_exposure_acknowledged_paths',
+  'inContainerMountCredentialExposureAcknowledgedPaths',
+  '_inContainerMountCredentialExposureAcknowledgedPaths',
+  'in_container_mount_broad_credential_exposure_acknowledged_paths',
+  '_in_container_mount_broad_credential_exposure_acknowledged_paths',
+  'inContainerMountBroadCredentialExposureAcknowledgedPaths',
+  '_inContainerMountBroadCredentialExposureAcknowledgedPaths',
+] as const;
+
+export type InContainerMountCredentialExposureAuthority =
+  'mount_scoped' | 'broad';
+
+type InContainerMountCredentialExposurePolicy = Readonly<
+  Record<InContainerMountCredentialExposureAuthority, ReadonlySet<string>>
+>;
+
+const inContainerMountCredentialExposurePolicy = new WeakMap<
+  Manifest,
+  InContainerMountCredentialExposurePolicy
+>();
+
+export function manifestAcknowledgesInContainerMountCredentialExposure(
+  manifest: Manifest,
+  mountPath: string,
+  authority: InContainerMountCredentialExposureAuthority,
+): boolean {
+  const acknowledged =
+    inContainerMountCredentialExposurePolicy.get(manifest)?.[authority];
+  if (!acknowledged) {
+    return false;
+  }
+  const normalized = normalizeRoot(mountPath);
+  const relative = relativePathWithinRoot(manifest.root, normalized);
+  return (
+    (relative !== null && acknowledged.has(`relative:${relative}`)) ||
+    acknowledged.has(`absolute:${normalized}`)
+  );
+}
+
+export function copyManifestMountCredentialExposurePolicy(
+  target: Manifest,
+  ...sources: Manifest[]
+): void {
+  const policy: Record<
+    InContainerMountCredentialExposureAuthority,
+    Set<string>
+  > = {
+    mount_scoped: new Set<string>(),
+    broad: new Set<string>(),
+  };
+  for (const source of sources) {
+    const sourcePolicy = inContainerMountCredentialExposurePolicy.get(source);
+    for (const authority of ['mount_scoped', 'broad'] as const) {
+      for (const path of sourcePolicy?.[authority] ?? []) {
+        policy[authority].add(path);
+      }
+    }
+  }
+  if (policy.mount_scoped.size > 0 || policy.broad.size > 0) {
+    inContainerMountCredentialExposurePolicy.set(target, policy);
+  }
+}
+
+export function replaceManifestMountCredentialExposurePolicy(
+  target: Manifest,
+  source: Manifest,
+): void {
+  const policy = inContainerMountCredentialExposurePolicy.get(source);
+  if (!policy || (policy.mount_scoped.size === 0 && policy.broad.size === 0)) {
+    inContainerMountCredentialExposurePolicy.delete(target);
+    return;
+  }
+  inContainerMountCredentialExposurePolicy.set(target, {
+    mount_scoped: new Set(policy.mount_scoped),
+    broad: new Set(policy.broad),
+  });
+}
+
 export function cloneManifest(manifest: ManifestInput): Manifest {
-  return new Manifest({
+  const cloned = new Manifest({
     version: manifest.version,
     root: manifest.root,
     entries: structuredClone(manifest.entries ?? {}),
@@ -531,6 +660,60 @@ export function cloneManifest(manifest: ManifestInput): Manifest {
         DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST,
     ),
   });
+  if (manifest instanceof Manifest) {
+    copyManifestMountCredentialExposurePolicy(cloned, manifest);
+  }
+  return cloned;
+}
+
+function normalizeManifestMountPolicyPath(root: string, path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed.startsWith('/')) {
+    const relative = normalizeRelativePath(trimmed);
+    if (!relative) {
+      throw new Error(
+        'Mount credential exposure path must identify a non-root path.',
+      );
+    }
+    return `relative:${relative}`;
+  }
+  const normalized = normalizeRoot(trimmed);
+  if (normalized === '/' || normalized === normalizeRoot(root)) {
+    throw new Error(
+      'Mount credential exposure path must identify a non-root path.',
+    );
+  }
+  const relative = relativePathWithinRoot(root, normalized);
+  return relative === null ? `absolute:${normalized}` : `relative:${relative}`;
+}
+
+function withInContainerMountCredentialExposureAcknowledgement<
+  TEntries extends ManifestEntries,
+  TEnvironment extends ManifestEnvironment,
+>(
+  manifest: Manifest<TEntries, TEnvironment>,
+  authority: InContainerMountCredentialExposureAuthority,
+  mountPaths: string[],
+): Manifest<TEntries, TEnvironment> {
+  if (mountPaths.length === 0) {
+    throw new TypeError('At least one in-container mount path is required.');
+  }
+  const trusted = cloneManifest(manifest) as Manifest<TEntries, TEnvironment>;
+  const current = inContainerMountCredentialExposurePolicy.get(manifest);
+  const policy: Record<
+    InContainerMountCredentialExposureAuthority,
+    Set<string>
+  > = {
+    mount_scoped: new Set(current?.mount_scoped ?? []),
+    broad: new Set(current?.broad ?? []),
+  };
+  for (const mountPath of mountPaths) {
+    policy[authority].add(
+      normalizeManifestMountPolicyPath(manifest.root, mountPath),
+    );
+  }
+  inContainerMountCredentialExposurePolicy.set(trusted, policy);
+  return trusted;
 }
 
 export function normalizeRelativePath(path: string): string {
@@ -928,127 +1111,12 @@ function normalizeTypedMountProvider(entry: Entry): void {
   if (!isMount(entry) || entry.type === 'mount') {
     return;
   }
-
-  switch (entry.type) {
-    case 's3_mount':
-      setTypedMountProviderConfig(
-        entry,
-        's3',
-        typedMountConfig(
-          { bucket: entry.bucket },
-          {
-            prefix: entry.prefix,
-            region: entry.region,
-            endpointUrl: entry.endpointUrl,
-            s3Provider: entry.s3Provider,
-          },
-        ),
-      );
-      return;
-    case 'gcs_mount':
-      setTypedMountProviderConfig(
-        entry,
-        'gcs',
-        typedMountConfig(
-          { bucket: entry.bucket },
-          {
-            prefix: entry.prefix,
-            region: entry.region,
-            endpointUrl: entry.endpointUrl,
-          },
-        ),
-      );
-      return;
-    case 'r2_mount':
-      setTypedMountProviderConfig(
-        entry,
-        'r2',
-        typedMountConfig(
-          { bucket: entry.bucket },
-          {
-            prefix: entry.prefix,
-            accountId: entry.accountId,
-            customDomain: entry.customDomain,
-          },
-        ),
-      );
-      return;
-    case 'azure_blob_mount':
-      setTypedMountProviderConfig(
-        entry,
-        'azure_blob',
-        typedMountConfig(
-          { container: entry.container },
-          {
-            prefix: entry.prefix,
-            account: entry.account,
-            accountName: entry.accountName,
-            endpoint: entry.endpoint,
-            endpointUrl: entry.endpointUrl,
-          },
-        ),
-      );
-      return;
-    case 'box_mount':
-      setTypedMountProviderConfig(
-        entry,
-        'box',
-        typedMountConfig(
-          {},
-          {
-            path: entry.path,
-            boxSubType: entry.boxSubType,
-            rootFolderId: entry.rootFolderId,
-            impersonate: entry.impersonate,
-            ownedBy: entry.ownedBy,
-          },
-        ),
-      );
-      return;
-    case 's3_files_mount':
-      setTypedMountProviderConfig(
-        entry,
-        's3_files',
-        typedMountConfig(
-          { fileSystemId: entry.fileSystemId },
-          {
-            subpath: entry.subpath,
-            mountTargetIp: entry.mountTargetIp,
-            accessPoint: entry.accessPoint,
-            region: entry.region,
-            extraOptions: entry.extraOptions,
-          },
-        ),
-      );
-      return;
-    default:
-      return;
-  }
-}
-
-function setTypedMountProviderConfig(
-  entry: TypedMount,
-  provider: MountProvider,
-  config: Record<string, unknown>,
-): void {
+  const { provider, config } = typedMountProviderConfig(entry);
   entry.provider = entry.provider ?? provider;
   entry.config = {
     ...(entry.config ?? {}),
     ...config,
   };
-}
-
-function typedMountConfig(
-  required: Record<string, string>,
-  optional: Record<string, unknown | undefined> = {},
-): Record<string, unknown> {
-  const config: Record<string, unknown> = { ...required };
-  for (const [key, value] of Object.entries(optional)) {
-    if (value !== undefined) {
-      config[key] = value;
-    }
-  }
-  return config;
 }
 
 function rejectKnownSnakeCaseMountKeys(entry: Entry): void {

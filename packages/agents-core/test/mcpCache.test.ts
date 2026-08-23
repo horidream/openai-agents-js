@@ -1,10 +1,16 @@
-import { describe, it, expect, vi } from 'vitest';
-import { getAllMcpTools, invalidateServerToolsCache } from '../src/mcp';
+import { beforeEach, describe, it, expect, vi } from 'vitest';
+import {
+  getAllMcpTools,
+  invalidateServerToolsCache,
+  MCPServerStdio,
+  MCPServerStreamableHttp,
+  MCPServerSSE,
+} from '../src/mcp';
 import { UserError } from '../src/errors';
 import { tool, type FunctionTool } from '../src/tool';
 import { withTrace } from '../src/tracing';
 import { NodeMCPServerStdio } from '../src/shims/mcp-server/node';
-import type { CallToolResultContent, MCPServer } from '../src/mcp';
+import type { CallToolResultContent, MCPServer, MCPTool } from '../src/mcp';
 import { RunContext } from '../src/runContext';
 import { Agent } from '../src/agent';
 import { handoff } from '../src/handoff';
@@ -321,6 +327,106 @@ describe('MCP tools cache invalidation', () => {
       expect(refreshed.map((tool) => tool.name)).toEqual(['beta']);
     });
   });
+
+  it('does not cache a callable filter result that crosses invalidation', async () => {
+    let markFilterStarted!: () => void;
+    let resumeFilter!: () => void;
+    const filterStarted = new Promise<void>((resolve) => {
+      markFilterStarted = resolve;
+    });
+    const filterResumed = new Promise<void>((resolve) => {
+      resumeFilter = resolve;
+    });
+    let filterCalls = 0;
+    const server = new StubServer('filter-invalidation', [toolNamed('a')]);
+    server.toolFilter = async () => {
+      filterCalls += 1;
+      if (filterCalls === 1) {
+        markFilterStarted();
+        await filterResumed;
+      }
+      return true;
+    };
+    const params = {
+      mcpServers: [server],
+      runContext: new RunContext({}),
+      agent: new Agent({ name: 'FilterAgent' }),
+    };
+
+    const staleListing = getAllMcpTools(params);
+    await filterStarted;
+    server.toolList = [toolNamed('b')];
+    await server.invalidateToolsCache();
+    resumeFilter();
+
+    expect((await staleListing).map((tool) => tool.name)).toEqual(['a']);
+    expect((await getAllMcpTools(params)).map((tool) => tool.name)).toEqual([
+      'b',
+    ]);
+  });
+
+  it.each([
+    { cacheToolsList: true, expectedListCalls: 1, expectedFilterCalls: 1 },
+    { cacheToolsList: false, expectedListCalls: 2, expectedFilterCalls: 2 },
+  ])(
+    'isolates callable filter and FunctionTool mutations with cacheToolsList=$cacheToolsList',
+    async ({ cacheToolsList, expectedListCalls, expectedFilterCalls }) => {
+      const serverName = `filter-snapshot-${cacheToolsList}`;
+      await invalidateServerToolsCache(serverName);
+      const listedTool = toolWithNestedMetadata('original_tool');
+      const callTool = vi.fn(async () => [] as CallToolResultContent);
+      let listCalls = 0;
+      let filterCalls = 0;
+      const server: MCPServer = {
+        name: serverName,
+        cacheToolsList,
+        toolFilter: async (_context, tool) => {
+          filterCalls += 1;
+          mutateToolDefinition(tool);
+          return true;
+        },
+        async connect() {},
+        async close() {},
+        async listTools() {
+          listCalls += 1;
+          return [listedTool];
+        },
+        callTool,
+        async invalidateToolsCache() {
+          await invalidateServerToolsCache(serverName);
+        },
+      };
+      const options = {
+        mcpServers: [server],
+        convertSchemasToStrict: true,
+        runContext: new RunContext({}),
+        agent: new Agent({ name: 'FilterSnapshotAgent' }),
+      };
+
+      const firstListing = (await getAllMcpTools(options)) as FunctionTool[];
+      expectFunctionToolDefinition(firstListing[0], 'original_tool');
+      expectOriginalToolDefinition(listedTool, 'original_tool');
+
+      const firstParameters = firstListing[0].parameters as any;
+      firstListing[0].description = 'caller mutation';
+      firstParameters.required.length = 0;
+      firstParameters.properties.query.type = 'number';
+
+      const secondListing = (await getAllMcpTools(options)) as FunctionTool[];
+      expectFunctionToolDefinition(secondListing[0], 'original_tool');
+      expect(secondListing[0].parameters).not.toBe(firstParameters);
+      expectOriginalToolDefinition(listedTool, 'original_tool');
+
+      await secondListing[0].invoke(
+        new RunContext({}),
+        JSON.stringify({ query: 'safe' }),
+      );
+
+      expect(callTool).toHaveBeenCalledWith('original_tool', { query: 'safe' });
+      expect(listCalls).toBe(expectedListCalls);
+      expect(filterCalls).toBe(expectedFilterCalls);
+    },
+  );
 });
 
 describe('MCP tools static filters', () => {
@@ -966,17 +1072,17 @@ describe('Custom generateMCPToolCacheKey can include runContext in key', () => {
       // Filter that allows a tool based on runContext meta value
       const filter = async (ctx: any, tool: any) => {
         if (ctx.runContext.meta && ctx.runContext.meta.kind === 'fooUser') {
-          return tool.name === 'foo';
+          return tool.name.startsWith('foo');
         } else {
-          return tool.name === 'bar';
+          return tool.name.startsWith('bar');
         }
       };
       const server = new StubServer('custom-key-srv', tools);
       server.toolFilter = filter;
       const agent = new Agent({ name: 'A' });
-      // This cache key generator uses both agent name and runContext.meta.kind
-      const generateMCPToolCacheKey = ({ server, agent, runContext }: any) =>
-        `${server.name}:${agent ? agent.name : ''}:${runContext?.meta?.kind}`;
+      // Deliberately omit the server name so invalidation depends on the key registry.
+      const generateMCPToolCacheKey = ({ runContext }: any) =>
+        `opaque-partition-${runContext?.meta?.kind}`;
 
       // Agent 'A', runContext kind 'fooUser' => should see only 'foo'
       const context1 = new RunContext({});
@@ -1008,6 +1114,24 @@ describe('Custom generateMCPToolCacheKey can include runContext in key', () => {
         generateMCPToolCacheKey,
       });
       expect(res3.map((t: any) => t.name)).toEqual(['foo']);
+
+      server.toolList = [toolNamed('foo-updated'), toolNamed('bar-updated')];
+      await server.invalidateToolsCache();
+
+      const refreshedFoo = await getAllMcpTools({
+        mcpServers: [server],
+        runContext: context1,
+        agent,
+        generateMCPToolCacheKey,
+      });
+      const refreshedBar = await getAllMcpTools({
+        mcpServers: [server],
+        runContext: context2,
+        agent,
+        generateMCPToolCacheKey,
+      });
+      expect(refreshedFoo.map((tool) => tool.name)).toEqual(['foo_updated']);
+      expect(refreshedBar.map((tool) => tool.name)).toEqual(['bar_updated']);
     });
   });
 });
@@ -1044,4 +1168,629 @@ describe('MCP tools without tracing', () => {
     expect(tools.map((tool) => tool.name)).toEqual(['tool']);
     expect(listCalls).toBe(1);
   });
+});
+
+function toolNamed(name: string): MCPTool {
+  return {
+    name,
+    description: '',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    },
+  };
+}
+
+type MCPToolWithNestedMetadata = MCPTool & {
+  outputSchema: {
+    type: 'object';
+    properties: { answer: { type: string } };
+    required: string[];
+  };
+  annotations: { audience: string[] };
+  _meta: { owner: { name: string } };
+};
+
+function toolWithNestedMetadata(name: string): MCPToolWithNestedMetadata {
+  return {
+    name,
+    description: 'original description',
+    inputSchema: {
+      type: 'object',
+      properties: { query: { type: 'string' } },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    outputSchema: {
+      type: 'object',
+      properties: { answer: { type: 'string' } },
+      required: ['answer'],
+    },
+    annotations: { audience: ['user'] },
+    _meta: { owner: { name: 'server' } },
+  };
+}
+
+function mutateToolDefinition(tool: MCPTool): void {
+  const toolWithMetadata = tool as MCPToolWithNestedMetadata;
+  toolWithMetadata.name = 'mutated_tool';
+  toolWithMetadata.description = 'mutated description';
+  toolWithMetadata.inputSchema.required.length = 0;
+  (toolWithMetadata.inputSchema.properties.query as { type: string }).type =
+    'number';
+  toolWithMetadata.outputSchema.required.length = 0;
+  toolWithMetadata.outputSchema.properties.answer.type = 'number';
+  toolWithMetadata.annotations.audience[0] = 'assistant';
+  toolWithMetadata._meta.owner.name = 'caller';
+}
+
+function expectOriginalToolDefinition(tool: MCPTool, name: string): void {
+  const toolWithMetadata = tool as MCPToolWithNestedMetadata;
+  expect(toolWithMetadata).toEqual(toolWithNestedMetadata(name));
+}
+
+function expectFunctionToolDefinition(
+  functionTool: FunctionTool,
+  name: string,
+): void {
+  expect(functionTool.name).toBe(name);
+  expect(functionTool.description).toBe('original description');
+  expect(functionTool.parameters).toMatchObject({
+    type: 'object',
+    properties: { query: { type: 'string' } },
+    required: ['query'],
+    additionalProperties: false,
+  });
+  expect(functionTool.strict).toBe(true);
+}
+
+function createDeferredVoid() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((innerResolve) => {
+    resolve = innerResolve;
+  });
+  return { promise, resolve };
+}
+
+function createStubUnderlying(name: string, initialTools: MCPTool[]) {
+  let toolList = [...initialTools];
+  let cachedTools: MCPTool[] | undefined;
+  let cacheDirty = true;
+  let invalidateCalls = 0;
+  let listCalls = 0;
+  let connected = false;
+  let connection = 0;
+  let sessionId: string | undefined;
+  let toolsGeneration = 0;
+  let connectionStateVersion = 0;
+  let isClosed = true;
+  let connectOperation: (() => Promise<void>) | undefined;
+  let closeOperation: (() => Promise<void>) | undefined;
+  let invalidateOperation: (() => Promise<void>) | undefined;
+  let listOperation: (() => Promise<void>) | undefined;
+  const stub = {
+    name,
+    get sessionId() {
+      return sessionId;
+    },
+    async connect() {
+      const connectStateVersion = connectionStateVersion;
+      isClosed = false;
+      await connectOperation?.();
+      if (isClosed || connectStateVersion !== connectionStateVersion) {
+        throw new Error(
+          'Streamable HTTP MCP server was closed during connect.',
+        );
+      }
+      connected = true;
+      connection += 1;
+      sessionId = `${name}-${connection}`;
+      cacheDirty = true;
+    },
+    async close() {
+      isClosed = true;
+      connectionStateVersion += 1;
+      connected = false;
+      sessionId = undefined;
+      cacheDirty = true;
+      await closeOperation?.();
+    },
+    async listTools() {
+      listCalls += 1;
+      if (!connected) {
+        throw new Error(
+          'Server not initialized. Make sure you call connect() first.',
+        );
+      }
+      if (!cacheDirty && cachedTools) {
+        return cachedTools;
+      }
+      const listedTools = [...toolList];
+      const listedGeneration = toolsGeneration;
+      await listOperation?.();
+      if (listedGeneration === toolsGeneration) {
+        cachedTools = listedTools;
+        cacheDirty = false;
+      }
+      return listedTools;
+    },
+    async invalidateToolsCache() {
+      invalidateCalls += 1;
+      toolsGeneration += 1;
+      cacheDirty = true;
+      if (invalidateOperation) {
+        await invalidateOperation();
+      }
+      await invalidateServerToolsCache(name);
+    },
+    async callToolResult() {
+      if (!connected) {
+        throw new Error(
+          'Server not initialized. Make sure you call connect() first.',
+        );
+      }
+      return { content: [{ type: 'text', text: 'ok' }] };
+    },
+  };
+  return {
+    stub,
+    setTools: (tools: MCPTool[]) => (toolList = [...tools]),
+    setConnectOperation: (operation: () => Promise<void>) => {
+      connectOperation = operation;
+    },
+    setCloseOperation: (operation: () => Promise<void>) => {
+      closeOperation = operation;
+    },
+    setInvalidateOperation: (operation: () => Promise<void>) => {
+      invalidateOperation = operation;
+    },
+    setListOperation: (operation: () => Promise<void>) => {
+      listOperation = operation;
+    },
+    invalidateCalls: () => invalidateCalls,
+    listCalls: () => listCalls,
+    underlyingCachedTools: () => cachedTools,
+  };
+}
+
+const wrapperCacheCases = [
+  {
+    label: 'MCPServerStdio',
+    serverName: 'stdio-wrapper-cache',
+    createServer: () =>
+      new MCPServerStdio({
+        command: 'noop',
+        name: 'stdio-wrapper-cache',
+        cacheToolsList: true,
+      }),
+  },
+  {
+    label: 'MCPServerStreamableHttp',
+    serverName: 'streamable-http-wrapper-cache',
+    createServer: () =>
+      new MCPServerStreamableHttp({
+        url: 'http://localhost:1',
+        name: 'streamable-http-wrapper-cache',
+        cacheToolsList: true,
+      }),
+  },
+  {
+    label: 'MCPServerSSE',
+    serverName: 'sse-wrapper-cache',
+    createServer: () =>
+      new MCPServerSSE({
+        url: 'http://localhost:1',
+        name: 'sse-wrapper-cache',
+        cacheToolsList: true,
+      }),
+  },
+];
+
+describe.each(wrapperCacheCases)(
+  '$label cache invalidation',
+  ({ serverName, createServer }) => {
+    beforeEach(async () => {
+      await invalidateServerToolsCache(serverName);
+    });
+
+    function createHarness() {
+      const server = createServer();
+      const {
+        stub,
+        setTools,
+        setConnectOperation,
+        setCloseOperation,
+        setListOperation,
+        invalidateCalls,
+        listCalls,
+        underlyingCachedTools,
+      } = createStubUnderlying(serverName, [toolWithNestedMetadata('a')]);
+      (server as unknown as { underlying: typeof stub }).underlying = stub;
+      return {
+        server,
+        setTools,
+        setConnectOperation,
+        setCloseOperation,
+        setListOperation,
+        invalidateCalls,
+        listCalls,
+        underlyingCachedTools,
+      };
+    }
+
+    it('does not expose its cached tool definitions to callers', async () => {
+      const { server, listCalls } = createHarness();
+      await server.connect();
+
+      const firstListing = await server.listTools();
+      const firstTool = firstListing[0];
+      firstListing.length = 0;
+      mutateToolDefinition(firstTool);
+
+      const secondListing = await server.listTools();
+
+      expect(secondListing.map((tool) => tool.name)).toEqual(['a']);
+      expect(secondListing[0]).not.toBe(firstTool);
+      expectOriginalToolDefinition(secondListing[0], 'a');
+      expect(listCalls()).toBe(1);
+    });
+
+    it('does not expose underlying tool definitions without wrapper caching', async () => {
+      const { server, underlyingCachedTools } = createHarness();
+      server.cacheToolsList = false;
+      await server.connect();
+
+      const listing = await server.listTools();
+      const listedTool = listing[0];
+      listing.length = 0;
+      mutateToolDefinition(listedTool);
+
+      expect(underlyingCachedTools()?.map((tool) => tool.name)).toEqual(['a']);
+      expectOriginalToolDefinition(underlyingCachedTools()![0], 'a');
+    });
+
+    it('returns fresh shared tools after explicit invalidation', async () => {
+      const { server, setTools, invalidateCalls } = createHarness();
+      await server.connect();
+      expect((await getAllMcpTools([server])).map((tool) => tool.name)).toEqual(
+        ['a'],
+      );
+
+      setTools([toolNamed('b')]);
+      const callsBeforeInvalidation = invalidateCalls();
+      await server.invalidateToolsCache();
+
+      expect(invalidateCalls()).toBe(callsBeforeInvalidation + 1);
+      expect((await getAllMcpTools([server])).map((tool) => tool.name)).toEqual(
+        ['b'],
+      );
+    });
+
+    it('does not restore stale tools from a listing crossing invalidation', async () => {
+      const { server, setTools } = createHarness();
+      await server.connect();
+      expect((await getAllMcpTools([server])).map((tool) => tool.name)).toEqual(
+        ['a'],
+      );
+
+      setTools([toolNamed('b')]);
+      const invalidation = server.invalidateToolsCache();
+      const crossingListing = getAllMcpTools([server]);
+      const crossingExpectation = expect(crossingListing).rejects.toThrow(
+        'server lifecycle operation is in progress',
+      );
+      await invalidation;
+
+      await crossingExpectation;
+      expect((await getAllMcpTools([server])).map((tool) => tool.name)).toEqual(
+        ['b'],
+      );
+    });
+
+    it('rejects a listing invalidated before its wrapper cache commit', async () => {
+      const { server, setTools, setListOperation } = createHarness();
+      await server.connect();
+      const listStarted = createDeferredVoid();
+      const resumeList = createDeferredVoid();
+      setListOperation(async () => {
+        listStarted.resolve();
+        await resumeList.promise;
+      });
+
+      const staleListing = server.listTools();
+      await listStarted.promise;
+      setTools([toolNamed('b')]);
+      await server.invalidateToolsCache();
+      resumeList.resolve();
+
+      await expect(staleListing).rejects.toThrow(
+        'MCP tool listing became stale before it completed',
+      );
+      expect((await server.listTools()).map((tool) => tool.name)).toEqual([
+        'b',
+      ]);
+    });
+
+    it('rejects listings while reconnect is in progress', async () => {
+      const { server, setTools, setConnectOperation } = createHarness();
+      await server.connect();
+      expect((await getAllMcpTools([server])).map((tool) => tool.name)).toEqual(
+        ['a'],
+      );
+
+      const connectStarted = createDeferredVoid();
+      const resumeConnect = createDeferredVoid();
+      setConnectOperation(async () => {
+        connectStarted.resolve();
+        await resumeConnect.promise;
+      });
+      setTools([toolNamed('b')]);
+
+      const reconnect = server.connect();
+      await connectStarted.promise;
+      await expect(getAllMcpTools([server])).rejects.toThrow(
+        'server lifecycle operation is in progress',
+      );
+      resumeConnect.resolve();
+      await reconnect;
+
+      expect((await getAllMcpTools([server])).map((tool) => tool.name)).toEqual(
+        ['b'],
+      );
+    });
+
+    it('rejects listings while close is in progress', async () => {
+      const { server, setCloseOperation } = createHarness();
+      await server.connect();
+      expect((await getAllMcpTools([server])).map((tool) => tool.name)).toEqual(
+        ['a'],
+      );
+
+      const closeStarted = createDeferredVoid();
+      const resumeClose = createDeferredVoid();
+      setCloseOperation(async () => {
+        closeStarted.resolve();
+        await resumeClose.promise;
+      });
+
+      const close = server.close();
+      await closeStarted.promise;
+      await expect(getAllMcpTools([server])).rejects.toThrow(
+        'server lifecycle operation is in progress',
+      );
+      resumeClose.resolve();
+      await close;
+
+      await expect(getAllMcpTools([server])).rejects.toThrow(
+        'Server not initialized',
+      );
+    });
+
+    it('releases the lifecycle guard after a failed reconnect', async () => {
+      const { server, setTools, setConnectOperation } = createHarness();
+      await server.connect();
+      await getAllMcpTools([server]);
+      setTools([toolNamed('b')]);
+      setConnectOperation(async () => {
+        throw new Error('connect failed');
+      });
+
+      await expect(server.connect()).rejects.toThrow('connect failed');
+
+      expect((await getAllMcpTools([server])).map((tool) => tool.name)).toEqual(
+        ['b'],
+      );
+    });
+
+    it('does not advertise shared cached tools after close', async () => {
+      const { server } = createHarness();
+      await server.connect();
+      expect((await getAllMcpTools([server])).map((tool) => tool.name)).toEqual(
+        ['a'],
+      );
+
+      await server.close();
+
+      await expect(getAllMcpTools([server])).rejects.toThrow(
+        'Server not initialized',
+      );
+    });
+
+    it('returns tools from the current connection after reconnect', async () => {
+      const { server, setTools } = createHarness();
+      await server.connect();
+      expect((await getAllMcpTools([server])).map((tool) => tool.name)).toEqual(
+        ['a'],
+      );
+
+      setTools([toolNamed('b')]);
+      await server.connect();
+
+      expect((await getAllMcpTools([server])).map((tool) => tool.name)).toEqual(
+        ['b'],
+      );
+    });
+  },
+);
+
+it('snapshots sessionless streamable HTTP tool listings', async () => {
+  const serverName = 'streamable-http-sessionless-tools';
+  await invalidateServerToolsCache(serverName);
+  const server = new MCPServerStreamableHttp({
+    url: 'http://localhost:1',
+    name: serverName,
+    cacheToolsList: true,
+  });
+  const listedTools = [toolNamed('a')];
+  const stub = {
+    name: serverName,
+    sessionId: undefined,
+    async connect() {},
+    async close() {},
+    async invalidateToolsCache() {},
+    async listTools() {
+      return listedTools;
+    },
+    async callToolResult(toolName: string) {
+      if (!listedTools.some((tool) => tool.name === toolName)) {
+        throw new Error(`Tool ${toolName} was not listed.`);
+      }
+      return { content: [{ type: 'text', text: 'ok' }] };
+    },
+  };
+  (server as unknown as { underlying: typeof stub }).underlying = stub;
+  await server.connect();
+
+  const returnedTools = await server.listTools();
+  returnedTools.length = 0;
+
+  await expect(server.callTool('a', {})).resolves.toEqual([
+    { type: 'text', text: 'ok' },
+  ]);
+
+  const uncachedServer = new MCPServerStreamableHttp({
+    url: 'http://localhost:1',
+    name: `${serverName}-uncached`,
+    cacheToolsList: false,
+  });
+  (uncachedServer as unknown as { underlying: typeof stub }).underlying = stub;
+  await uncachedServer.connect();
+
+  const uncachedReturnedTools = await uncachedServer.listTools();
+  expect(uncachedReturnedTools).not.toBe(listedTools);
+  uncachedReturnedTools.length = 0;
+
+  await expect(uncachedServer.callTool('a', {})).resolves.toEqual([
+    { type: 'text', text: 'ok' },
+  ]);
+});
+
+it('starts streamable HTTP close before yielding', async () => {
+  const serverName = 'streamable-http-immediate-close';
+  await invalidateServerToolsCache(serverName);
+  const server = new MCPServerStreamableHttp({
+    url: 'http://localhost:1',
+    name: serverName,
+    cacheToolsList: true,
+  });
+  const { stub, setCloseOperation } = createStubUnderlying(serverName, [
+    toolNamed('a'),
+  ]);
+  (server as unknown as { underlying: typeof stub }).underlying = stub;
+  const closeStarted = createDeferredVoid();
+  const resumeClose = createDeferredVoid();
+  setCloseOperation(async () => {
+    closeStarted.resolve();
+    await resumeClose.promise;
+  });
+  await server.connect();
+
+  const closing = server.close();
+  const toolCallExpectation = expect(server.callTool('a', {})).rejects.toThrow(
+    'Server not initialized',
+  );
+  await closeStarted.promise;
+  resumeClose.resolve();
+
+  await closing;
+  await toolCallExpectation;
+});
+
+it('keeps close authoritative over a pending streamable HTTP connect', async () => {
+  const serverName = 'streamable-http-connect-close-order';
+  await invalidateServerToolsCache(serverName);
+  const server = new MCPServerStreamableHttp({
+    url: 'http://localhost:1',
+    name: serverName,
+    cacheToolsList: true,
+  });
+  const { stub, setConnectOperation } = createStubUnderlying(serverName, [
+    toolNamed('a'),
+  ]);
+  (server as unknown as { underlying: typeof stub }).underlying = stub;
+  const connectStarted = createDeferredVoid();
+  const resumeConnect = createDeferredVoid();
+  setConnectOperation(async () => {
+    connectStarted.resolve();
+    await resumeConnect.promise;
+  });
+
+  const connecting = server.connect();
+  const connectingExpectation = expect(connecting).rejects.toThrow(
+    'Streamable HTTP MCP server was closed during connect',
+  );
+  const closing = server.close();
+  await connectStarted.promise;
+  resumeConnect.resolve();
+
+  await closing;
+  await connectingExpectation;
+  expect(server.sessionId).toBeUndefined();
+});
+
+it('keeps the lifecycle guard active until all branches settle', async () => {
+  const serverName = 'streamable-http-lifecycle-settlement';
+  await invalidateServerToolsCache(serverName);
+  const server = new MCPServerStreamableHttp({
+    url: 'http://localhost:1',
+    name: serverName,
+    cacheToolsList: true,
+  });
+  const { stub, setConnectOperation, setInvalidateOperation } =
+    createStubUnderlying(serverName, [toolNamed('a')]);
+  (server as unknown as { underlying: typeof stub }).underlying = stub;
+  const connectStarted = createDeferredVoid();
+  const resumeConnect = createDeferredVoid();
+  setConnectOperation(async () => {
+    connectStarted.resolve();
+    await resumeConnect.promise;
+  });
+  setInvalidateOperation(async () => {
+    throw new Error('invalidation failed');
+  });
+
+  const connecting = server.connect();
+  const connectingExpectation = expect(connecting).rejects.toThrow(
+    'invalidation failed',
+  );
+  await connectStarted.promise;
+  const listingExpectation = expect(server.listTools()).rejects.toThrow(
+    'server lifecycle operation is in progress',
+  );
+  resumeConnect.resolve();
+
+  await listingExpectation;
+  await connectingExpectation;
+});
+
+it('observes synchronous failures from both lifecycle branches', async () => {
+  const serverName = 'streamable-http-synchronous-lifecycle-failures';
+  await invalidateServerToolsCache(serverName);
+  const server = new MCPServerStreamableHttp({
+    url: 'http://localhost:1',
+    name: serverName,
+    cacheToolsList: true,
+  });
+  const { stub } = createStubUnderlying(serverName, [toolNamed('a')]);
+  let invalidateCalls = 0;
+  let connectCalls = 0;
+  const syncThrowingStub = {
+    ...stub,
+    invalidateToolsCache() {
+      invalidateCalls += 1;
+      throw new Error('invalidation failed');
+    },
+    connect() {
+      connectCalls += 1;
+      throw new Error('connect failed');
+    },
+  };
+  (server as unknown as { underlying: typeof syncThrowingStub }).underlying =
+    syncThrowingStub;
+
+  await expect(server.connect()).rejects.toThrow('invalidation failed');
+  expect(invalidateCalls).toBe(1);
+  expect(connectCalls).toBe(1);
 });

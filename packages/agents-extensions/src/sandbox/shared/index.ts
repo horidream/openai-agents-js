@@ -29,9 +29,13 @@ export {
   manifestContainsLocalSource,
   mergeManifestDelta,
   mergeManifestEntryDelta,
+  prepareManifestMounts,
   serializeManifestRecord,
 } from './manifest';
-export type { ManifestMaterializationOptions } from './manifest';
+export type {
+  ManifestMaterializationOptions,
+  ManifestMountMaterializationContext,
+} from './manifest';
 export {
   assertSandboxEntryMetadataSupported,
   assertSandboxManifestMetadataSupported,
@@ -66,6 +70,7 @@ export {
   writePtyStdin,
 } from './pty';
 export {
+  resolveRemoteSandboxEffectivePath,
   resolveSandboxAbsolutePath,
   resolveSandboxRelativePath,
   resolveSandboxWorkdir,
@@ -91,13 +96,17 @@ export {
   createRunAsRemoteEditor,
   manifestMaterializationOptionsWithRunAs,
   readRunAsRemoteFile,
+  runAsRemoteDirectoryExists,
   runAsRemotePathExists,
   sandboxUserShellCommand,
   writeRunAsRemoteText,
   type RemoteRunAsCommandResult,
   type RemoteRunAsCommandRunner,
 } from './runAs';
-export { probeRemoteSandboxPathExists } from './pathProbe';
+export {
+  probeRemoteSandboxDirectoryExists,
+  probeRemoteSandboxPathExists,
+} from './pathProbe';
 export {
   RemoteSandboxSessionBase,
   type RemoteSandboxCommandKind,
@@ -107,7 +116,10 @@ export {
 } from './sessionBase';
 export {
   assertRemoteSandboxSessionStateCanResume,
+  assertRemoteSandboxSessionStateUsable,
   deserializeRemoteSandboxSessionStateValues,
+  isRemoteSandboxSessionStateUnsafe,
+  markRemoteSandboxSessionStateUnsafe,
   rehydrateRemoteSandboxSessionStateValues,
   serializeRemoteSandboxSessionState,
 } from './sessionState';

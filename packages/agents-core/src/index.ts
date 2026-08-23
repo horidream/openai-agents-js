@@ -36,6 +36,7 @@ export {
   MaxTurnsExceededError,
   ModelBehaviorError,
   ModelRefusalError,
+  ModelTimeoutError,
   OutputGuardrailTripwireTriggered,
   ToolInputGuardrailTripwireTriggered,
   ToolOutputGuardrailTripwireTriggered,
@@ -96,6 +97,8 @@ export {
 export { assistant, system, user } from './helpers/message';
 export {
   extractAllTextOutput,
+  RunCompactionItem,
+  RunInputItem,
   RunHandoffCallItem,
   RunHandoffOutputItem,
   RunItem,
@@ -198,6 +201,7 @@ export type {
   ToolErrorFormatter,
   ToolErrorFormatterArgs,
   ToolExecutionConfig,
+  ToolNameCollisionPolicy,
   ToolNotFoundBehavior,
   ToolErrorKind,
   ReasoningItemIdPolicy,
@@ -239,6 +243,7 @@ export {
   ToolAllowedCaller,
   ToolAllowedCallers,
 } from './tool';
+export type { StandardSchemaWithJSON } from './utils/standardSchema';
 export type {
   ClientToolSearchExecutor,
   ClientToolSearchExecutorArgs,
@@ -325,17 +330,25 @@ export { RequestUsage, Usage } from './usage';
 export type { RequestUsageInput, UsageInput } from './usage';
 export type {
   Session,
+  RunContextAwareSession,
   SessionInputCallback,
   SessionHistoryMutation,
   SessionHistoryRewriteArgs,
   SessionHistoryRewriteAwareSession,
+  SessionHistoryAppendItemsTransaction,
+  SessionHistoryReplaceSuffixTransaction,
+  SessionHistoryTransaction,
+  SessionHistoryTransactionArgs,
+  SessionHistoryTransactionAwareSession,
   OpenAIResponsesCompactionArgs,
   OpenAIResponsesCompactionAwareSession,
   OpenAIResponsesCompactionResult,
 } from './memory/session';
 export {
   isOpenAIResponsesCompactionAwareSession,
+  isRunContextAwareSession,
   isSessionHistoryRewriteAwareSession,
+  isSessionHistoryTransactionAwareSession,
 } from './memory/session';
 export { applySessionHistoryMutations } from './memory/historyMutations';
 export { MemorySession } from './memory/memorySession';

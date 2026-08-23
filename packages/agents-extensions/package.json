@@ -2,7 +2,7 @@
   "name": "@openai/agents-extensions",
   "repository": "https://github.com/openai/openai-agents-js",
   "homepage": "https://openai.github.io/openai-agents-js/",
-  "version": "0.14.2",
+  "version": "0.17.0",
   "description": "Extensions for the OpenAI Agents SDK",
   "author": "OpenAI <support@openai.com>",
   "main": "dist/index.js",
@@ -144,7 +144,7 @@
     "modal": "0.7.6",
     "undici-types": "6.21.0",
     "ws": "^8.21.0",
-    "zod": "^4.0.0"
+    "zod": "^4.2.0"
   },
   "files": [
     "dist"

@@ -1,14 +1,29 @@
 import type { Stream } from 'openai/streaming';
 import type { CompletionUsage } from 'openai/resources/completions';
-import { protocol, UserError } from '@openai/agents-core';
-import { ChatCompletion, ChatCompletionChunk } from 'openai/resources/chat';
-import { FAKE_ID } from './openaiChatCompletionsModel';
+import { ModelBehaviorError, protocol, UserError } from '@openai/agents-core';
+import { snapshotRawUsage } from '@openai/agents-core/utils/internal';
+import {
+  ChatCompletion,
+  type ChatCompletionAudio,
+  ChatCompletionChunk,
+} from 'openai/resources/chat';
+import { FAKE_ID } from './openaiItemIds';
 import { OPENAI_CHAT_COMPLETIONS_RAW_MODEL_EVENT_SOURCE } from './rawModelEvents';
 import logger from './logger';
+import {
+  CONTENT_FILTER_REFUSAL_MESSAGE,
+  shouldSynthesizeContentFilterRefusal,
+} from './openaiChatCompletionsContentFilter';
+import {
+  createTruncatedEmptyChatCompletionError,
+  isTruncatedEmptyChatCompletion,
+} from './openaiChatCompletionsTruncation';
 
 type StreamingState = {
   started: boolean;
   text_content: protocol.OutputText | null;
+  audio: ChatCompletionAudioSnapshot | null;
+  annotations: ChatCompletionAnnotation[];
   messageItemId: string | undefined;
   refusal_content: protocol.Refusal | null;
   function_calls: Record<number, protocol.FunctionCallItem>;
@@ -18,15 +33,122 @@ type StreamingState = {
   hasWarnedUnsupportedChoice: boolean;
 };
 
+type ChatCompletionAudioSnapshot = Partial<ChatCompletionAudio> &
+  Record<string, unknown>;
+
+type ChatCompletionAnnotation = NonNullable<
+  ChatCompletion['choices'][number]['message']['annotations']
+>[number];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function appendAudioDelta(
+  snapshot: ChatCompletionAudioSnapshot | null,
+  rawAudio: unknown,
+): ChatCompletionAudioSnapshot {
+  if (!isRecord(rawAudio)) {
+    throw new ModelBehaviorError(
+      'Chat Completions stream returned malformed audio output: expected delta.audio to be an object.',
+    );
+  }
+
+  const audio = snapshot ?? {};
+  for (const [key, value] of Object.entries(rawAudio)) {
+    if (value === undefined || value === null) {
+      continue;
+    }
+    if (key === 'data') {
+      if (typeof value !== 'string') {
+        throw new ModelBehaviorError(
+          'Chat Completions stream returned malformed audio output: expected delta.audio.data to be a string.',
+        );
+      }
+      audio.data = `${audio.data ?? ''}${value}`;
+    } else if (key === 'transcript') {
+      if (typeof value !== 'string') {
+        throw new ModelBehaviorError(
+          'Chat Completions stream returned malformed audio output: expected delta.audio.transcript to be a string.',
+        );
+      }
+      audio.transcript = `${audio.transcript ?? ''}${value}`;
+    } else {
+      Object.defineProperty(audio, key, {
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+  }
+  return audio;
+}
+
+function normalizeUrlCitations(
+  rawAnnotations: unknown,
+): ChatCompletionAnnotation[] {
+  if (!Array.isArray(rawAnnotations)) {
+    return [];
+  }
+
+  const annotations: ChatCompletionAnnotation[] = [];
+  for (const annotation of rawAnnotations) {
+    if (
+      !isRecord(annotation) ||
+      annotation.type !== 'url_citation' ||
+      !isRecord(annotation.url_citation)
+    ) {
+      continue;
+    }
+
+    const { start_index, end_index, url, title } = annotation.url_citation;
+    if (
+      typeof start_index !== 'number' ||
+      !Number.isFinite(start_index) ||
+      typeof end_index !== 'number' ||
+      !Number.isFinite(end_index) ||
+      typeof url !== 'string' ||
+      typeof title !== 'string'
+    ) {
+      continue;
+    }
+
+    annotations.push({
+      type: 'url_citation',
+      url_citation: { start_index, end_index, url, title },
+    });
+  }
+  return annotations;
+}
+
+function isSameUrlCitation(
+  left: ChatCompletionAnnotation,
+  right: ChatCompletionAnnotation,
+): boolean {
+  return (
+    left.url_citation.start_index === right.url_citation.start_index &&
+    left.url_citation.end_index === right.url_citation.end_index &&
+    left.url_citation.url === right.url_citation.url &&
+    left.url_citation.title === right.url_citation.title
+  );
+}
+
 export async function* convertChatCompletionsStreamToResponses(
   response: ChatCompletion,
   stream: Stream<ChatCompletionChunk>,
-  options: { strictFeatureValidation?: boolean } = {},
+  options: {
+    strictFeatureValidation?: boolean;
+    preserveRawUsage?: boolean;
+  } = {},
 ): AsyncIterable<protocol.StreamEvent> {
   let usage: CompletionUsage | undefined = undefined;
+  let rawUsage: Record<string, unknown> | undefined;
   const state: StreamingState = {
     started: false,
     text_content: null,
+    audio: null,
+    annotations: [],
     messageItemId: undefined,
     refusal_content: null,
     function_calls: {},
@@ -38,8 +160,42 @@ export async function* convertChatCompletionsStreamToResponses(
   const strictFeatureValidation = options.strictFeatureValidation ?? false;
 
   for await (const chunk of stream) {
+    // Usage is not always reported on the final chunk: some OpenAI-compatible
+    // providers or gateways may emit a later chunk without usage after
+    // reporting usage, so only overwrite it when the current chunk actually
+    // carries usage data. Capture raw usage before exposing the chunk to the
+    // consumer so later mutations cannot change the snapshot.
+    if ((chunk as any).usage) {
+      const usagePayload = (chunk as any).usage as CompletionUsage;
+      if (options.preserveRawUsage === true) {
+        rawUsage = snapshotRawUsage(usagePayload);
+      }
+      usage = (rawUsage as CompletionUsage | undefined) ?? usagePayload;
+    }
+
     if (chunk.id && (response.id === FAKE_ID || !response.id)) {
       response.id = chunk.id;
+    }
+
+    const audioDelta = chunk.choices?.find(
+      (choice) => choice.index === 0,
+    )?.delta;
+    if (
+      audioDelta &&
+      Object.prototype.hasOwnProperty.call(audioDelta, 'audio')
+    ) {
+      const rawAudio = (audioDelta as { audio?: unknown }).audio;
+      if (rawAudio !== undefined && rawAudio !== null) {
+        let audioSnapshot: unknown;
+        try {
+          audioSnapshot = structuredClone(rawAudio);
+        } catch {
+          throw new ModelBehaviorError(
+            'Chat Completions stream returned malformed audio output: expected delta.audio to be cloneable.',
+          );
+        }
+        state.audio = appendAudioDelta(state.audio, audioSnapshot);
+      }
     }
 
     if (!state.started) {
@@ -60,14 +216,6 @@ export async function* convertChatCompletionsStreamToResponses(
         rawModelEventSource: OPENAI_CHAT_COMPLETIONS_RAW_MODEL_EVENT_SOURCE,
       },
     };
-
-    // Usage is not always reported on the final chunk: some OpenAI-compatible
-    // providers or gateways may emit a later chunk without usage after
-    // reporting usage, so only overwrite it when the current chunk actually
-    // carries usage data.
-    if ((chunk as any).usage) {
-      usage = (chunk as any).usage;
-    }
 
     if (!chunk.choices || chunk.choices.length === 0) continue;
 
@@ -103,7 +251,7 @@ export async function* convertChatCompletionsStreamToResponses(
         state.text_content = {
           text: '',
           type: 'output_text',
-          providerData: { annotations: [] },
+          providerData: { annotations: state.annotations },
         };
         state.messageItemId =
           response.id && response.id !== FAKE_ID ? response.id : undefined;
@@ -117,6 +265,20 @@ export async function* convertChatCompletionsStreamToResponses(
         },
       };
       state.text_content.text += delta.content;
+    }
+
+    // Some providers emit URL citations with text or on a later annotation-only chunk.
+    if (state.text_content) {
+      const deltaAnnotations = (delta as { annotations?: unknown }).annotations;
+      for (const annotation of normalizeUrlCitations(deltaAnnotations)) {
+        if (
+          !state.annotations.some((existing) =>
+            isSameUrlCitation(existing, annotation),
+          )
+        ) {
+          state.annotations.push(annotation);
+        }
+      }
     }
 
     if (
@@ -176,12 +338,45 @@ export async function* convertChatCompletionsStreamToResponses(
   const outputs: protocol.OutputModelItem[] = [];
   const outputItemId = response.id || FAKE_ID;
 
+  if (
+    shouldSynthesizeContentFilterRefusal({
+      finishReason: state.finishReason,
+      hasOutput: Boolean(
+        state.text_content?.text ||
+        state.audio !== null ||
+        state.refusal_content?.refusal ||
+        Object.keys(state.function_calls).length > 0 ||
+        state.ignored_tool_call_indexes.size > 0,
+      ),
+    })
+  ) {
+    state.refusal_content = {
+      type: 'refusal',
+      refusal: CONTENT_FILTER_REFUSAL_MESSAGE,
+    };
+  }
+
   if (state.reasoning) {
     outputs.push({
       type: 'reasoning',
       content: [],
       rawContent: [{ type: 'reasoning_text', text: state.reasoning }],
     });
+  }
+
+  let audioContent: protocol.AudioContent | null = null;
+  if (state.audio) {
+    const { data, ...providerData } = state.audio;
+    if (typeof data !== 'string') {
+      throw new ModelBehaviorError(
+        'Chat Completions stream ended with audio output but no audio data.',
+      );
+    }
+    audioContent = {
+      type: 'audio',
+      audio: data,
+      providerData,
+    };
   }
 
   if (state.text_content || state.refusal_content) {
@@ -195,6 +390,14 @@ export async function* convertChatCompletionsStreamToResponses(
     outputs.push({
       id: state.messageItemId ?? outputItemId,
       content,
+      role: 'assistant',
+      type: 'message',
+      status: 'completed',
+    });
+  } else if (audioContent) {
+    outputs.push({
+      id: outputItemId,
+      content: [audioContent],
       role: 'assistant',
       type: 'message',
       status: 'completed',
@@ -228,6 +431,19 @@ export async function* convertChatCompletionsStreamToResponses(
     completion_tokens_details: usage?.completion_tokens_details,
   };
 
+  if (
+    isTruncatedEmptyChatCompletion({
+      finishReason: state.finishReason,
+      hasText: Boolean(state.text_content?.text),
+      hasRefusal: Boolean(state.refusal_content?.refusal),
+      hasAudio: state.audio !== null,
+      hasReasoning: state.reasoning.length > 0,
+      hasFunctionCall: Object.keys(state.function_calls).length > 0,
+    })
+  ) {
+    throw createTruncatedEmptyChatCompletionError();
+  }
+
   // Compose final response
   const finalEvent: protocol.StreamEventResponseCompleted = {
     type: 'response_done',
@@ -245,6 +461,7 @@ export async function* convertChatCompletionsStreamToResponses(
             (usage as any)?.completion_tokens_details?.reasoning_tokens ?? 0,
         },
       },
+      ...(options.preserveRawUsage === true ? { rawUsage } : {}),
       output: outputs,
     },
   };
@@ -268,8 +485,14 @@ function buildTraceChoice(
 
   const content = state.text_content?.text ?? null;
   const refusal = state.refusal_content?.refusal ?? null;
+  const audio = state.audio;
 
-  if (content === null && refusal === null && toolCalls.length === 0) {
+  if (
+    content === null &&
+    refusal === null &&
+    audio === null &&
+    toolCalls.length === 0
+  ) {
     return undefined;
   }
 
@@ -282,6 +505,12 @@ function buildTraceChoice(
       role: 'assistant',
       content,
       refusal,
+      ...(audio
+        ? { audio: structuredClone(audio) as ChatCompletionAudio }
+        : {}),
+      ...(state.annotations.length > 0
+        ? { annotations: [...state.annotations] }
+        : {}),
       ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
     },
   };

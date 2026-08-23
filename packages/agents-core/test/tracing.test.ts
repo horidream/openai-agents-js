@@ -1,4 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  afterAll,
+  vi,
+} from 'vitest';
 
 import {
   timeIso,
@@ -29,7 +37,6 @@ import {
 } from '../src/tracing/processor';
 
 import coreLogger from '../src/logger';
-import { allowConsole } from '../../../helpers/tests/console-guard';
 
 import {
   withTrace,
@@ -66,14 +73,23 @@ import { Agent } from '../src/agent';
 import { StreamedRunResult } from '../src/result';
 import { RunContext } from '../src/runContext';
 import { RunState } from '../src/runState';
-import { FakeModel, fakeModelMessage, FakeModelProvider } from './stubs';
+import { fakeModelMessage, ScriptedModelProvider } from './stubs';
 import { Usage } from '../src/usage';
-import * as protocol from '../src/types/protocol';
 import { setDefaultModelProvider } from '../src/providers';
 import { AsyncLocalStorage as BrowserAsyncLocalStorage } from '../src/shims/shims-browser';
 import { supportsProcessLifecycleEvents as workerdSupportsProcessLifecycleEvents } from '../src/shims/shims-workerd';
+import { ScriptedModel, modelResponse, modelStream } from '../src/testing';
+import type { StreamEvent } from '../src/types/protocol';
 
 const ALS_SYMBOL = Symbol.for('openai.agents.core.asyncLocalStorage');
+const originalProcessMaxListeners = process.getMaxListeners();
+
+// This file intentionally constructs many providers to exercise lifecycle
+// listeners. Raise the limit locally so Node does not report a false leak.
+process.setMaxListeners(originalProcessMaxListeners + 20);
+afterAll(() => {
+  process.setMaxListeners(originalProcessMaxListeners);
+});
 
 class TestExporter implements TracingExporter {
   public exported: Array<(Trace | Span<any>)[]> = [];
@@ -480,7 +496,6 @@ describe('Trace & Span lifecycle', () => {
 
   it('does not force exit when beforeExit tracing cleanup times out', async () => {
     vi.useFakeTimers();
-    allowConsole(['warn']);
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
       throw new Error('process.exit should not be called');
@@ -633,7 +648,7 @@ describe('Span creation inherits tracing fields from parents', () => {
 
 describe('Runner tracing configuration', () => {
   beforeEach(() => {
-    setDefaultModelProvider(new FakeModelProvider());
+    setDefaultModelProvider(new ScriptedModelProvider());
     setTracingDisabled(false);
   });
 
@@ -648,11 +663,11 @@ describe('Runner tracing configuration', () => {
 
     const agent = new Agent({
       name: 'TestAgent',
-      model: new FakeModel([
-        {
+      model: new ScriptedModel([
+        modelResponse({
           output: [fakeModelMessage('hi')],
           usage: new Usage(),
-        },
+        }),
       ]),
     });
 
@@ -669,7 +684,6 @@ describe('Runner tracing configuration', () => {
 
 describe('ConsoleSpanExporter', () => {
   it('skips export when tracing is disabled', async () => {
-    allowConsole(['log']);
     const debugSpy = vi.spyOn(coreLogger, 'debug').mockImplementation(() => {});
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     setTracingDisabled(true);
@@ -688,7 +702,6 @@ describe('ConsoleSpanExporter', () => {
   });
 
   it('logs traces and spans when tracing is enabled', async () => {
-    allowConsole(['log']);
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const modelDataSpy = vi
       .spyOn(coreLogger, 'dontLogModelData', 'get')
@@ -745,7 +758,6 @@ describe('ConsoleSpanExporter', () => {
   ])(
     'redacts console-exported trace data when model=%s or tool=%s logging is disabled',
     async (dontLogModelData, dontLogToolData) => {
-      allowConsole(['log']);
       const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       vi.spyOn(coreLogger, 'dontLogModelData', 'get').mockReturnValue(
         dontLogModelData,
@@ -1526,7 +1538,7 @@ describe('withTrace & span helpers (integration)', () => {
 
   it('streaming run waits for stream loop to complete before calling onTraceEnd', async () => {
     // Set up model provider
-    setDefaultModelProvider(new FakeModelProvider());
+    setDefaultModelProvider(new ScriptedModelProvider());
 
     const traceStartTimes: number[] = [];
     const traceEndTimes: number[] = [];
@@ -1556,35 +1568,24 @@ describe('withTrace & span helpers (integration)', () => {
     const orderProcessor = new OrderTrackingProcessor();
     setTraceProcessors([orderProcessor]);
 
-    // Create a fake model that supports streaming
-    class StreamingFakeModel extends FakeModel {
-      async *getStreamedResponse(
-        _request: any,
-      ): AsyncIterable<protocol.StreamEvent> {
-        const response = await this.getResponse(_request);
-        yield {
-          type: 'response_done',
-          response: {
-            id: 'resp-1',
-            usage: {
-              requests: 1,
-              inputTokens: 0,
-              outputTokens: 0,
-              totalTokens: 0,
-            },
-            output: response.output,
-          },
-        } as any;
-      }
-    }
-
     const agent = new Agent({
       name: 'TestAgent',
-      model: new StreamingFakeModel([
-        {
-          output: [fakeModelMessage('Final output')],
-          usage: new Usage(),
-        },
+      model: new ScriptedModel([
+        modelStream([
+          {
+            type: 'response_done',
+            response: {
+              id: 'resp-1',
+              usage: {
+                requests: 1,
+                inputTokens: 0,
+                outputTokens: 0,
+                totalTokens: 0,
+              },
+              output: [fakeModelMessage('Final output')],
+            },
+          } as StreamEvent,
+        ]),
       ]),
     });
 

@@ -18,7 +18,6 @@ import { execa } from 'execa';
  *   node scripts/run-example-starts.mjs --include-external       # include scripts needing extra services
  *   node scripts/run-example-starts.mjs --fail-fast              # stop after first failure
  *   node scripts/run-example-starts.mjs --print-auto-skip        # show the auto-skip list and exit
- *   node scripts/run-example-starts.mjs --collect <main_log> [--output <path>]  # generate rerun list from a main log
  *
  * Via package.json:
  *   pnpm examples:start-all --dry-run
@@ -42,6 +41,7 @@ export const EXTERNAL_COMMAND_KEYWORDS = [
   'dapr',
   'playwright',
 ];
+export const EXTERNAL_STARTS = new Set(['ai-sdk:start']);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -70,6 +70,8 @@ export const DEFAULT_INTERACTIVE_INPUTS = new Map([
 ]);
 
 export const EXCLUDED_STARTS = new Set([
+  // This Expo development-client app requires a native build and an interactive simulator or device.
+  'realtime-react-native:start',
   // The documented entrypoint for this example is `dev`; `next start` is only for a built app server.
   'realtime-next:start',
   // This server is intended for manual browser-driven demo flows, not unattended batch validation.
@@ -90,6 +92,29 @@ const CONDITIONAL_AUTO_SKIP_RULES = [
   },
 ];
 
+export const CODEX_SANDBOX_AUTO_SKIP = new Map([
+  [
+    'agent-patterns:start:hosted-multi-agent',
+    "Codex sandbox does not support this example's WebSocket connection",
+  ],
+  [
+    'sandbox:start:e2b',
+    'Codex sandbox blocks this external sandbox provider connection',
+  ],
+  [
+    'sandbox:start:runloop',
+    'Codex sandbox blocks this external sandbox provider connection',
+  ],
+  [
+    'tools:start:computer-use',
+    'Codex sandbox blocks the local Playwright browser process',
+  ],
+  [
+    'tools:start:computer-use-hitl',
+    'Codex sandbox blocks the local Playwright browser process',
+  ],
+]);
+
 export const DEFAULT_AUTO_SKIP = [
   // Tends to loop multiple times and produce very long output; skip in auto runs.
   'agent-patterns:start:llm-as-a-judge',
@@ -97,6 +122,8 @@ export const DEFAULT_AUTO_SKIP = [
   'connectors:start',
   // Approval-prompt example that still needs manual input.
   'mcp:start:hosted-mcp-on-approval',
+  // This remote worker can return an HTML provider restriction instead of the API response.
+  'sandbox:start:cloudflare',
   // Temporarily disabled due to the credential issues.
   'sandbox:start:vercel',
   // Depends on a local Codex binary that macOS may quarantine or remove.
@@ -151,9 +178,6 @@ const parseArgs = (args) => {
   const defaultInteractiveMode = envInteractiveMode ?? 'auto';
 
   let printAutoSkip = false;
-  let collectLog = null;
-  let collectOutput = null;
-
   let includeServer = defaultIncludeServer;
   let includeInteractive = defaultIncludeInteractive;
   let includeAudio = defaultIncludeAudio;
@@ -215,18 +239,6 @@ const parseArgs = (args) => {
       continue;
     }
 
-    if (arg === '--collect') {
-      collectLog = args[index + 1] ?? null;
-      index += 1;
-      continue;
-    }
-
-    if (arg === '--output') {
-      collectOutput = args[index + 1] ?? null;
-      index += 1;
-      continue;
-    }
-
     console.warn(`Ignoring unknown argument: ${arg}`);
   }
 
@@ -241,8 +253,6 @@ const parseArgs = (args) => {
     failFast,
     verbose,
     printAutoSkip,
-    collectLog,
-    collectOutput,
   };
 };
 
@@ -340,102 +350,30 @@ const getStartName = (startOrName) =>
 const isExcludedStart = (startOrName) =>
   EXCLUDED_STARTS.has(getStartName(startOrName));
 
-const getConditionalAutoSkipReason = (startOrName) => {
+export const getConditionalAutoSkipReason = (
+  startOrName,
+  environment = process.env,
+) => {
   const name = getStartName(startOrName);
+
+  if (environment.CODEX_SANDBOX?.trim()) {
+    const codexSandboxReason = CODEX_SANDBOX_AUTO_SKIP.get(name);
+    if (codexSandboxReason) {
+      return codexSandboxReason;
+    }
+  }
+
   const rule = CONDITIONAL_AUTO_SKIP_RULES.find((entry) => entry.name === name);
   if (!rule) {
     return null;
   }
 
   const missingEnv = rule.requiredEnv.find((key) => {
-    const value = process.env[key];
+    const value = environment[key];
     return typeof value !== 'string' || value.trim().length === 0;
   });
 
   return missingEnv ? rule.reason : null;
-};
-
-const detectTagsFromName = (name) => {
-  const lower = name.toLowerCase();
-  const tags = new Set();
-  if (
-    SERVER_COMMAND_KEYWORDS.some((keyword) => lower.includes(keyword)) ||
-    SERVER_PATH_KEYWORDS.some((keyword) => lower.includes(keyword))
-  ) {
-    tags.add('server');
-  }
-  if (AUDIO_PATH_KEYWORDS.some((keyword) => lower.includes(keyword))) {
-    tags.add('audio');
-  }
-  if (EXTERNAL_COMMAND_KEYWORDS.some((keyword) => lower.includes(keyword))) {
-    tags.add('external');
-  }
-  return tags;
-};
-
-export const collectRerunFromLog = ({
-  logPath,
-  includeServer = false,
-  includeAudio = false,
-  includeExternal = false,
-  autoSkipSet = loadAutoSkip(),
-}) => {
-  if (!logPath) {
-    throw new Error('logPath is required for collectRerunFromLog');
-  }
-  const tableRow = /^(passed|failed|skipped|unknown)\s+([^\s]+)/;
-  const entries = {};
-  const lines = readFileSync(logPath, 'utf-8').split(/\r?\n/);
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const m = tableRow.exec(trimmed);
-    if (m) {
-      let [, status, name] = m;
-      if (name.includes('…')) {
-        const prefix = name.split('…', 1)[0];
-        for (const existing of Object.keys(entries)) {
-          if (existing.startsWith(prefix)) {
-            name = existing;
-            break;
-          }
-        }
-      }
-      entries[name] = status;
-      continue;
-    }
-    const skip = /^↷ Skipping ([^ ]+)/.exec(trimmed);
-    if (skip) {
-      entries[skip[1]] = 'skipped';
-      continue;
-    }
-    const fail = /!! ([^ ]+) exited with (\d+)/.exec(trimmed);
-    if (fail) {
-      entries[fail[1]] = `failed:${fail[2]}`;
-    }
-  }
-
-  const allowedByFlags = (name) => {
-    const tags = detectTagsFromName(name);
-    if (tags.has('server') && !includeServer) return false;
-    if (tags.has('audio') && !includeAudio) return false;
-    if (tags.has('external') && !includeExternal) return false;
-    return true;
-  };
-
-  return [...Object.entries(entries)]
-    .filter(
-      ([name, status]) =>
-        !isExcludedStart(name) &&
-        status !== 'passed' &&
-        status !== 'pending' &&
-        !autoSkipSet.has(name) &&
-        !getConditionalAutoSkipReason(name) &&
-        (!status.startsWith('skipped') || allowedByFlags(name)),
-    )
-    .map(([name]) => name)
-    .sort((a, b) => a.localeCompare(b));
 };
 
 const matchesFilter = (start, filter) => {
@@ -471,6 +409,7 @@ const detectTags = (start) => {
   }
 
   if (
+    EXTERNAL_STARTS.has(getStartName(start)) ||
     EXTERNAL_COMMAND_KEYWORDS.some((keyword) => commandLower.includes(keyword))
   ) {
     tags.add('external');
@@ -1052,35 +991,10 @@ const main = async () => {
     failFast,
     verbose,
     printAutoSkip,
-    collectLog,
-    collectOutput,
   } = parseArgs(process.argv.slice(2));
 
   const starts = await collectStartScripts(filter);
   const autoSkipSet = loadAutoSkip();
-
-  if (collectLog) {
-    const resolvedLog = path.isAbsolute(collectLog)
-      ? collectLog
-      : path.resolve(process.cwd(), collectLog);
-    const list = collectRerunFromLog({
-      logPath: resolvedLog,
-      includeServer,
-      includeAudio,
-      includeExternal,
-      autoSkipSet,
-    });
-    if (collectOutput) {
-      const outPath = path.isAbsolute(collectOutput)
-        ? collectOutput
-        : path.resolve(process.cwd(), collectOutput);
-      await fs.writeFile(outPath, list.join('\n'), 'utf-8');
-      console.log(`Wrote ${list.length} entries to ${outPath}`);
-    } else {
-      for (const item of list) console.log(item);
-    }
-    return 0;
-  }
 
   if (printAutoSkip) {
     console.log('Auto-skip list (source: EXAMPLES_AUTO_SKIP or defaults):');

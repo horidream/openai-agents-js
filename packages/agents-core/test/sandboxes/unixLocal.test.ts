@@ -11,15 +11,20 @@ import {
 } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { gzipSync } from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   EnvValueReference,
+  inContainerMountStrategy,
   Manifest,
   InMemoryRemoteSnapshotStore,
   NoopSnapshotSpec,
   registerEnvValueReference,
+  SandboxMountError,
+  s3Mount,
   skills,
   UnixLocalSandboxClient,
+  UnixLocalSandboxSession,
   urlForExposedPort,
 } from '../../src/sandbox/local';
 import {
@@ -28,10 +33,11 @@ import {
   materializeLocalWorkspaceManifestMounts,
   pathExists,
 } from '../../src/sandbox/sandboxes/shared/localWorkspace';
+import { rebindPersistedMountCredentials } from '../../src/sandbox/internal';
 
 const ONE_BY_ONE_PNG = Uint8Array.from(
   Buffer.from(
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAE/wH+gZ6kWQAAAABJRU5ErkJggg==',
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVR4nGP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==',
     'base64',
   ),
 );
@@ -121,6 +127,39 @@ describe('UnixLocalSandboxClient', () => {
     expect(output).toContain('/workspace');
     expect(output).toContain('hello sandbox');
     expect(output).toContain('pixel.png');
+  });
+
+  it('rejects replacing active mounts before local filesystem effects', async () => {
+    const manifest = new Manifest({
+      entries: {
+        remote: s3Mount({
+          bucket: 'private',
+          mountStrategy: inContainerMountStrategy(),
+        }),
+      },
+    });
+    const session = new UnixLocalSandboxSession({
+      state: {
+        manifest,
+        workspaceRootPath: rootDir,
+        workspaceRootOwned: false,
+        environment: {},
+      },
+    });
+
+    await expect(
+      session.materializeEntry({ path: 'remote', entry: { type: 'dir' } }),
+    ).rejects.toThrow(/cannot be removed or replaced.*remote/u);
+    await expect(
+      session.applyManifest(
+        new Manifest({ entries: { remote: { type: 'dir' } } }),
+      ),
+    ).rejects.toThrow(/cannot be removed or replaced.*remote/u);
+
+    expect(session.state.manifest.entries.remote?.type).toBe('s3_mount');
+    await expect(stat(join(rootDir, 'remote'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
   });
 
   it('translates command paths only at the manifest root boundary', async () => {
@@ -601,9 +640,9 @@ describe('UnixLocalSandboxClient', () => {
               mountStrategy: { type: 'in_container' },
             },
           },
-        }),
+        }).withInContainerMountCredentialExposureAcknowledged('data'),
       ),
-    ).rejects.toThrow(/does not support this mount entry: data/);
+    ).rejects.toThrow(/SDK-supported strategy/u);
 
     const session = await client.create(new Manifest());
     await expect(
@@ -673,7 +712,10 @@ describe('UnixLocalSandboxClient', () => {
 
     await session.close();
     const resumed = await client.resume(
-      await client.deserializeSessionState(serialized),
+      rebindPersistedMountCredentials(
+        await client.deserializeSessionState(serialized),
+        session.state.manifest,
+      ),
     );
     const initialOutput = await resumed.execCommand({
       cmd: 'cat mounted/external/input.txt',
@@ -872,6 +914,40 @@ describe('UnixLocalSandboxClient', () => {
     );
   });
 
+  it('allows view_image only for explicitly granted absolute paths', async () => {
+    const grantedDir = join(rootDir, 'granted-images');
+    await mkdir(grantedDir);
+    const grantedImagePath = join(grantedDir, 'granted.png');
+    const ungrantedImagePath = join(
+      rootDir,
+      'ungranted-images',
+      'ungranted.png',
+    );
+    await writeFile(grantedImagePath, ONE_BY_ONE_PNG);
+
+    const client = new UnixLocalSandboxClient({
+      workspaceBaseDir: rootDir,
+    });
+    const session = await client.create(
+      new Manifest({
+        extraPathGrants: [{ path: grantedDir, readOnly: true }],
+      }),
+    );
+
+    await expect(
+      session.viewImage({ path: grantedImagePath }),
+    ).resolves.toMatchObject({
+      type: 'image',
+      image: {
+        data: expect.any(Uint8Array),
+        mediaType: 'image/png',
+      },
+    });
+    await expect(
+      session.viewImage({ path: ungrantedImagePath }),
+    ).rejects.toThrow(/escapes the workspace root/);
+  });
+
   it('rejects symlink escapes in filesystem helpers', async () => {
     const outsideDir = join(rootDir, 'outside');
     await mkdir(outsideDir);
@@ -963,6 +1039,27 @@ describe('UnixLocalSandboxClient', () => {
     );
   });
 
+  it('rejects credentialed mount mutations before resolving runAs', async () => {
+    const client = new UnixLocalSandboxClient({
+      workspaceBaseDir: rootDir,
+    });
+    const session = await client.create(new Manifest());
+
+    await expect(
+      session.materializeEntry({
+        path: 'remote',
+        entry: s3Mount({
+          bucket: 'private',
+          accessKeyId: 'access-key',
+          secretAccessKey: 'secret-key',
+          mountStrategy: inContainerMountStrategy(),
+        }),
+        runAs: 'missing-sandbox-user',
+      }),
+    ).rejects.toBeInstanceOf(SandboxMountError);
+    expect(session.state.manifest.entries).not.toHaveProperty('remote');
+  });
+
   it('supports apply_patch and view_image inside the sandbox', async () => {
     const client = new UnixLocalSandboxClient({
       workspaceBaseDir: rootDir,
@@ -1041,6 +1138,113 @@ describe('UnixLocalSandboxClient', () => {
         mediaType: 'image/svg+xml',
       },
     });
+  });
+
+  it('validates raster content while preserving SVG filename compatibility', async () => {
+    const client = new UnixLocalSandboxClient({
+      workspaceBaseDir: rootDir,
+    });
+    const session = await client.create(
+      new Manifest({
+        entries: {
+          'fake.png': {
+            type: 'file',
+            content: 'not an image\n',
+          },
+          'payload.bin': {
+            type: 'file',
+            content: ONE_BY_ONE_PNG,
+          },
+          'commented.svg': {
+            type: 'file',
+            content: '<!-- generated -->\n<svg></svg>',
+          },
+          'vector.svgz': {
+            type: 'file',
+            content: Uint8Array.from(gzipSync('<svg></svg>')),
+          },
+        },
+      }),
+    );
+
+    await expect(session.viewImage({ path: 'fake.png' })).rejects.toThrow(
+      'Unsupported image format for view_image: fake.png',
+    );
+    await expect(
+      session.viewImage({ path: 'payload.bin' }),
+    ).resolves.toMatchObject({
+      type: 'image',
+      image: { mediaType: 'image/png' },
+    });
+    await expect(
+      session.viewImage({ path: 'commented.svg' }),
+    ).resolves.toMatchObject({
+      type: 'image',
+      image: { mediaType: 'image/svg+xml' },
+    });
+    await expect(
+      session.viewImage({ path: 'vector.svgz' }),
+    ).resolves.toMatchObject({
+      type: 'image',
+      image: { mediaType: 'image/svg+xml' },
+    });
+  });
+
+  it('applies stacked anchors through the sandbox editor', async () => {
+    const client = new UnixLocalSandboxClient({
+      workspaceBaseDir: rootDir,
+    });
+    const session = await client.create(
+      new Manifest({
+        entries: {
+          'stacked.py': {
+            type: 'file',
+            content: [
+              'class First',
+              '    def target():',
+              '        return 0',
+              '',
+              'class Second',
+              '    def helper():',
+              '        pass',
+              '',
+              '    def target():',
+              '        pass',
+              '',
+            ].join('\n'),
+          },
+        },
+      }),
+    );
+
+    await session.createEditor().updateFile({
+      type: 'update_file',
+      path: 'stacked.py',
+      diff: [
+        '@@ class Second',
+        '@@     def target():',
+        '-        pass',
+        '+        return 1',
+      ].join('\n'),
+    });
+
+    await expect(
+      readFile(join(session.state.workspaceRootPath, 'stacked.py'), 'utf8'),
+    ).resolves.toBe(
+      [
+        'class First',
+        '    def target():',
+        '        return 0',
+        '',
+        'class Second',
+        '    def helper():',
+        '        pass',
+        '',
+        '    def target():',
+        '        return 1',
+        '',
+      ].join('\n'),
+    );
   });
 
   it('rejects hostPath before applying a manifest delta', async () => {
@@ -1601,7 +1805,6 @@ describe('UnixLocalSandboxClient', () => {
       entries: {
         data: {
           type: 'mount',
-          source: 's3://bucket/data',
           mountStrategy: { type: 'in_container' },
         },
       },
@@ -1617,9 +1820,7 @@ describe('UnixLocalSandboxClient', () => {
       },
     });
 
-    expect(calls).toEqual([
-      { logicalPath: 'data', source: 's3://bucket/data' },
-    ]);
+    expect(calls).toEqual([{ logicalPath: 'data', source: undefined }]);
   });
 
   it('materializes parent mount targets before nested targets', async () => {
@@ -1630,19 +1831,16 @@ describe('UnixLocalSandboxClient', () => {
       entries: {
         parent: {
           type: 'mount',
-          source: 's3://bucket/parent',
           mountPath: 'mounted',
           mountStrategy: { type: 'in_container' },
         },
         child: {
           type: 'mount',
-          source: 's3://bucket/child',
           mountPath: 'mounted/cache',
           mountStrategy: { type: 'in_container' },
         },
         other: {
           type: 'mount',
-          source: 's3://bucket/other',
           mountStrategy: { type: 'in_container' },
         },
       },
@@ -1665,7 +1863,6 @@ describe('UnixLocalSandboxClient', () => {
       entries: {
         child: {
           type: 'mount',
-          source: 's3://bucket/child',
           mountPath: 'mounted/cache',
           mountStrategy: { type: 'in_container' },
         },
@@ -1675,7 +1872,6 @@ describe('UnixLocalSandboxClient', () => {
         },
         parent: {
           type: 'mount',
-          source: 's3://bucket/parent',
           mountPath: 'mounted',
           mountStrategy: { type: 'in_container' },
         },

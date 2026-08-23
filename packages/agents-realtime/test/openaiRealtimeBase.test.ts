@@ -8,7 +8,7 @@ import {
   expectTypeOf,
 } from 'vitest';
 import type { MessageEvent as WebSocketMessageEvent } from 'ws';
-import type { RealtimeClientMessage } from '../src/clientMessages';
+import type { RealtimeClientMessage, RealtimeSessionConfig } from '../src';
 import {
   DEFAULT_OPENAI_REALTIME_SESSION_CONFIG,
   OpenAIRealtimeBase,
@@ -64,6 +64,7 @@ describe('OpenAIRealtimeBase helpers', () => {
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -121,6 +122,25 @@ describe('OpenAIRealtimeBase helpers', () => {
     expect((base as any)._rawSessionConfig).toEqual(payload.session);
   });
 
+  it('clones raw events when structuredClone is unavailable', () => {
+    vi.stubGlobal('structuredClone', undefined);
+    const base = new TestBase();
+    const rawListener = vi.fn();
+    base.on('*', rawListener);
+
+    (base as any)._onMessage({
+      data: JSON.stringify({
+        type: 'session.updated',
+        session: { id: 'session_1', instructions: 'hello' },
+      }),
+    });
+
+    expect(rawListener).toHaveBeenCalledWith({
+      type: 'session.updated',
+      session: { id: 'session_1', instructions: 'hello' },
+    });
+  });
+
   it('merges session config defaults', () => {
     const base = new TestBase();
     const config = (base as any)._getMergedSessionConfig({
@@ -152,6 +172,46 @@ describe('OpenAIRealtimeBase helpers', () => {
     expect(config.model).toBe('gpt-realtime-2.1');
     expect(config.parallel_tool_calls).toBe(false);
     expect(config.reasoning).toEqual({ effort: 'low' });
+  });
+
+  it('forwards GA input audio transcription options', () => {
+    const base = new TestBase();
+    const contextualTranscriptionConfig = {
+      audio: {
+        input: {
+          transcription: {
+            model: 'gpt-transcribe',
+            keywords: ['LegalOn', 'TomoniAI'],
+            languages: ['ja', 'en'],
+            prompt: 'A Japanese conversation about LegalOn and TomoniAI.',
+          },
+        },
+      },
+    } satisfies Partial<RealtimeSessionConfig>;
+    const lowLatencyTranscriptionConfig = {
+      audio: {
+        input: {
+          transcription: {
+            model: 'gpt-live-transcribe',
+            delay: 'low',
+          },
+        },
+      },
+    } satisfies Partial<RealtimeSessionConfig>;
+
+    const contextualPayload = base.buildSessionPayload(
+      contextualTranscriptionConfig,
+    );
+    const lowLatencyPayload = base.buildSessionPayload(
+      lowLatencyTranscriptionConfig,
+    );
+
+    expect(contextualPayload.audio?.input?.transcription).toEqual(
+      contextualTranscriptionConfig.audio.input.transcription,
+    );
+    expect(lowLatencyPayload.audio?.input?.transcription).toEqual(
+      lowLatencyTranscriptionConfig.audio.input.transcription,
+    );
   });
 
   it('preserves explicit null audio input config values', () => {
@@ -691,6 +751,75 @@ describe('OpenAIRealtimeBase helpers', () => {
     expect(approvals[0]?.serverLabel).toBe('s1');
   });
 
+  it('reaches session history when the server omits status', async () => {
+    const { RealtimeSession } = await import('../src/realtimeSession');
+    const { RealtimeAgent } = await import('../src/realtimeAgent');
+
+    const transport = new TestBase();
+    const session = new RealtimeSession(new RealtimeAgent({ name: 'a' }), {
+      transport,
+    });
+    await session.connect({ apiKey: 'test' });
+    const historyEvents: any[][] = [];
+    session.on('history_updated', (history) =>
+      historyEvents.push([...history]),
+    );
+
+    (transport as any)._onMessage({
+      data: JSON.stringify({
+        type: 'conversation.item.added',
+        event_id: 'e1',
+        item: {
+          id: 'u1',
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'hello' }],
+        },
+        previous_item_id: null,
+      }),
+    });
+
+    expect(session.history.map((item) => item.itemId)).toEqual(['u1']);
+    expect(session.history[0]).toMatchObject({ status: 'in_progress' });
+    expect(historyEvents.at(-1)?.map((item) => item.itemId)).toEqual(['u1']);
+  });
+
+  it('normalizes missing statuses and preserves explicit statuses', () => {
+    const base = new TestBase();
+    const updates: any[] = [];
+    base.on('item_update', (item) => updates.push(item));
+
+    const send = (type: string, id: string, status?: string) =>
+      (base as any)._onMessage({
+        data: JSON.stringify({
+          type,
+          event_id: `e_${id}`,
+          item: {
+            id,
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'hi' }],
+            ...(status ? { status } : {}),
+          },
+          previous_item_id: null,
+        }),
+      });
+
+    send('conversation.item.added', 'a1');
+    send('conversation.item.done', 'd1');
+    send('conversation.item.retrieved', 'r1');
+    send('conversation.item.done', 'p1', 'in_progress');
+    send('conversation.item.done', 'i1', 'incomplete');
+
+    expect(updates.map((update) => [update.itemId, update.status])).toEqual([
+      ['a1', 'in_progress'],
+      ['d1', 'completed'],
+      ['r1', 'completed'],
+      ['p1', 'in_progress'],
+      ['i1', 'incomplete'],
+    ]);
+  });
+
   it('emits function_call and mcp call updates on output items', () => {
     const base = new TestBase();
     const funcs: any[] = [];
@@ -863,6 +992,31 @@ describe('OpenAIRealtimeBase helpers', () => {
     });
 
     expect(deltas[0]).toMatchObject({
+      delta: 'hi',
+      itemId: 'item1',
+      responseId: 'r1',
+    });
+  });
+
+  it('emits output text delta events', () => {
+    const base = new TestBase();
+    const deltas: any[] = [];
+    base.on('output_text_delta', (delta) => deltas.push(delta));
+
+    (base as any)._onMessage({
+      data: JSON.stringify({
+        type: 'response.output_text.delta',
+        event_id: 'd1',
+        item_id: 'item1',
+        content_index: 0,
+        delta: 'hi',
+        output_index: 0,
+        response_id: 'r1',
+      }),
+    });
+
+    expect(deltas[0]).toMatchObject({
+      type: 'output_text_delta',
       delta: 'hi',
       itemId: 'item1',
       responseId: 'r1',

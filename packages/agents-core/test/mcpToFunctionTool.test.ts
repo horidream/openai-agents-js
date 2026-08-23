@@ -7,9 +7,126 @@ import { sanitizeMcpTransportError } from '../src/mcpLogging';
 import { withTrace } from '../src/tracing';
 import { withCustomSpan } from '../src/tracing/createSpans';
 import { getCurrentSpan } from '../src/tracing';
+import { UserError } from '../src/errors';
+
+const SCHEMA_DEPTH_ERROR =
+  'JSON schema is too deeply nested to process safely. Simplify or flatten the schema, or disable strict mode.';
+
+function createNestedObjectSchema(depth: number): Record<string, any> {
+  const root = {
+    type: 'object',
+    properties: {},
+    required: [],
+  } as Record<string, any>;
+  let current = root;
+
+  for (let index = 0; index < depth; index += 1) {
+    const child = {
+      type: 'object',
+      properties: {},
+      required: [],
+    };
+    current.properties.child = child;
+    current = child;
+  }
+
+  return root;
+}
+
+function createSegmentedReferenceSchema(): Record<string, any> {
+  const definitions: Record<string, Record<string, unknown>> = {
+    terminal: { type: 'string' },
+  };
+  const properties: Record<string, Record<string, unknown>> = {};
+  const required: string[] = [];
+  let previousReference = '#/$defs/terminal';
+
+  for (let segment = 0; segment < 2; segment += 1) {
+    for (let index = 0; index < 60; index += 1) {
+      const name = `segment${segment}_${index}`;
+      definitions[name] = {
+        $ref:
+          index < 59
+            ? `#/$defs/segment${segment}_${index + 1}`
+            : previousReference,
+      };
+    }
+    previousReference = `#/$defs/segment${segment}_0`;
+    const checkpoint = `checkpoint${segment}`;
+    properties[checkpoint] = { $ref: previousReference };
+    required.push(checkpoint);
+  }
+
+  return { type: 'object', properties, required, $defs: definitions };
+}
+
+function createRecursiveDefinitionSchema(): Record<string, any> {
+  return {
+    type: 'object',
+    properties: {
+      root: { $ref: '#/$defs/node' },
+    },
+    required: ['root'],
+    additionalProperties: false,
+    $defs: {
+      node: {
+        type: 'object',
+        properties: {
+          value: { type: 'string' },
+          children: {
+            type: 'array',
+            items: { $ref: '#/$defs/node' },
+          },
+        },
+        required: ['value', 'children'],
+        additionalProperties: false,
+      },
+    },
+  };
+}
+
+function createWideRecursiveDefinitionSchema(): Record<string, any> {
+  const definitions: Record<string, Record<string, unknown>> = {};
+  for (let index = 0; index < 100; index += 1) {
+    definitions[`node${index}`] = { $ref: '#' };
+  }
+
+  return {
+    type: 'object',
+    properties: {},
+    required: [],
+    additionalProperties: false,
+    $defs: definitions,
+  };
+}
+
+function captureMcpConversionError(callback: () => unknown): unknown {
+  try {
+    callback();
+    return undefined;
+  } catch (error) {
+    return error;
+  }
+}
+
+function convertExpectingStrictFallback(
+  convert: () => ReturnType<typeof mcpToFunctionTool>,
+): ReturnType<typeof mcpToFunctionTool> {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  try {
+    const functionTool = convert();
+    expect(warn).toHaveBeenCalledWith(
+      'Error converting MCP schema to strict mode:',
+      expect.anything(),
+    );
+    return functionTool;
+  } finally {
+    warn.mockRestore();
+  }
+}
 
 describe('mcpToFunctionTool', () => {
-  it('builds strict and non-strict tools based on schema settings', () => {
+  it('preserves non-strict behavior when schema conversion is disabled', () => {
     const server: MCPServer = {
       name: 'stub',
       cacheToolsList: false,
@@ -20,23 +137,25 @@ describe('mcpToFunctionTool', () => {
       invalidateToolsCache: async () => {},
     };
 
-    const strictTool = mcpToFunctionTool(
-      {
-        name: 'strict',
-        description: '',
-        inputSchema: {
-          type: 'object',
-          properties: { foo: { type: 'string' } },
-          required: [],
-          additionalProperties: true,
-        },
-      } as any,
-      server,
-      false,
+    const explicitlyOpenTool = convertExpectingStrictFallback(() =>
+      mcpToFunctionTool(
+        {
+          name: 'strict',
+          description: '',
+          inputSchema: {
+            type: 'object',
+            properties: { foo: { type: 'string' } },
+            required: [],
+            additionalProperties: true,
+          },
+        } as any,
+        server,
+        false,
+      ),
     );
 
-    expect(strictTool.strict).toBe(true);
-    expect(strictTool.parameters.additionalProperties).toBe(false);
+    expect(explicitlyOpenTool.strict).toBe(false);
+    expect(explicitlyOpenTool.parameters.additionalProperties).toBe(true);
 
     const nonStrictTool = mcpToFunctionTool(
       {
@@ -753,7 +872,6 @@ describe('mcpToFunctionTool', () => {
         inputSchema: {
           type: 'object',
           properties: { foo: { type: 'string' } },
-          additionalProperties: true,
         },
       } as any,
       server,
@@ -763,6 +881,278 @@ describe('mcpToFunctionTool', () => {
     expect(strictTool.strict).toBe(true);
     expect(strictTool.parameters.additionalProperties).toBe(false);
     expect(strictTool.parameters.required).toEqual(['foo']);
+  });
+
+  it('preserves recursive local definitions during explicit strict conversion', () => {
+    const callTool = vi.fn(async () => []);
+    const server: MCPServer = {
+      name: 'recursive-schema-server',
+      cacheToolsList: false,
+      connect: async () => {},
+      close: async () => {},
+      listTools: async () => [],
+      callTool,
+      invalidateToolsCache: async () => {},
+    };
+    const inputSchema = createRecursiveDefinitionSchema();
+    const original = structuredClone(inputSchema);
+
+    const strictTool = mcpToFunctionTool(
+      {
+        name: 'recursive_schema',
+        description: '',
+        inputSchema,
+      } as any,
+      server,
+      true,
+    );
+
+    expect(strictTool.strict).toBe(true);
+    expect(strictTool.parameters.properties.root).toEqual({
+      $ref: '#/$defs/node',
+    });
+    expect(
+      (strictTool.parameters as any).$defs.node.properties.children.items,
+    ).toEqual({ $ref: '#/$defs/node' });
+    expect(inputSchema).toEqual(original);
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it('preserves wide shallow recursive definitions during explicit strict conversion', () => {
+    const callTool = vi.fn(async () => []);
+    const server: MCPServer = {
+      name: 'wide-recursive-schema-server',
+      cacheToolsList: false,
+      connect: async () => {},
+      close: async () => {},
+      listTools: async () => [],
+      callTool,
+      invalidateToolsCache: async () => {},
+    };
+    const inputSchema = createWideRecursiveDefinitionSchema();
+    const original = structuredClone(inputSchema);
+
+    const strictTool = mcpToFunctionTool(
+      {
+        name: 'wide_recursive_schema',
+        description: '',
+        inputSchema,
+      } as any,
+      server,
+      true,
+    );
+
+    expect(strictTool.strict).toBe(true);
+    expect((strictTool.parameters as any).$defs.node0).toEqual({ $ref: '#' });
+    expect((strictTool.parameters as any).$defs.node99).toEqual({ $ref: '#' });
+    expect(inputSchema).toEqual(original);
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['physical nesting', () => createNestedObjectSchema(1_000), true],
+    [
+      'required-only shared reference suffixes',
+      createSegmentedReferenceSchema,
+      false,
+    ],
+  ])(
+    'rejects overly deep explicit strict conversion from %s and preserves non-strict conversion',
+    (_name, createSchema, additionalProperties) => {
+      const callTool = vi.fn(async () => []);
+      const server: MCPServer = {
+        name: 'deep-schema-server',
+        cacheToolsList: false,
+        connect: async () => {},
+        close: async () => {},
+        listTools: async () => [],
+        callTool,
+        invalidateToolsCache: async () => {},
+      };
+      const inputSchema = createSchema();
+      inputSchema.additionalProperties = additionalProperties;
+      const mcpTool = {
+        name: 'deep_schema',
+        description: '',
+        inputSchema,
+      } as any;
+
+      const error = captureMcpConversionError(() =>
+        mcpToFunctionTool(mcpTool, server, true),
+      );
+
+      expect(error).toBeInstanceOf(UserError);
+      expect(error).not.toBeInstanceOf(RangeError);
+      expect((error as Error).message).toBe(SCHEMA_DEPTH_ERROR);
+      expect(callTool).not.toHaveBeenCalled();
+      expect(inputSchema.additionalProperties).toBe(additionalProperties);
+
+      const convertNonStrict = () => mcpToFunctionTool(mcpTool, server, false);
+      const nonStrictTool = additionalProperties
+        ? convertExpectingStrictFallback(convertNonStrict)
+        : convertNonStrict();
+
+      expect(nonStrictTool.strict).toBe(false);
+      expect(nonStrictTool.parameters.properties).toBe(inputSchema.properties);
+      expect(nonStrictTool.parameters.additionalProperties).toBe(true);
+      expect(inputSchema.additionalProperties).toBe(additionalProperties);
+      expect(callTool).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['properties omitted', { type: 'object' }],
+    ['empty properties', { type: 'object', properties: {} }],
+    [
+      'explicitly open with declared properties',
+      {
+        type: 'object',
+        properties: { known: { type: 'string' } },
+        additionalProperties: true,
+      },
+    ],
+    [
+      'schema-valued additional properties',
+      {
+        type: 'object',
+        properties: {},
+        additionalProperties: { type: 'string' },
+      },
+    ],
+  ])('falls back for free-form root schemas: %s', (_name, inputSchema) => {
+    const server: MCPServer = {
+      name: 'free-form-root-server',
+      cacheToolsList: false,
+      connect: async () => {},
+      close: async () => {},
+      listTools: async () => [],
+      callTool: async () => [],
+      invalidateToolsCache: async () => {},
+    };
+    const inputSchemaRecord = inputSchema as Record<string, any>;
+    const originalSchema = structuredClone(inputSchema);
+
+    const functionTool = convertExpectingStrictFallback(() =>
+      mcpToFunctionTool(
+        {
+          name: 'free_form_root',
+          description: '',
+          inputSchema,
+        } as any,
+        server,
+        true,
+      ),
+    );
+
+    expect(functionTool.strict).toBe(false);
+    expect(functionTool.parameters).toEqual({
+      ...inputSchema,
+      type: 'object',
+      properties: inputSchemaRecord.properties ?? {},
+      required: [],
+      additionalProperties:
+        'additionalProperties' in inputSchema
+          ? inputSchemaRecord.additionalProperties
+          : true,
+    });
+    expect(inputSchema).toEqual(originalSchema);
+  });
+
+  it.each([
+    [
+      'object property',
+      {
+        type: 'object',
+        properties: {
+          payload: { type: 'object', properties: {} },
+        },
+        required: ['payload'],
+        additionalProperties: false,
+      },
+    ],
+    [
+      'array item',
+      {
+        type: 'object',
+        properties: {
+          payload: {
+            type: 'array',
+            items: { type: 'object' },
+          },
+        },
+        required: ['payload'],
+        additionalProperties: false,
+      },
+    ],
+  ])('preserves nested free-form schemas: %s', (_name, inputSchema) => {
+    const server: MCPServer = {
+      name: 'free-form-nested-server',
+      cacheToolsList: false,
+      connect: async () => {},
+      close: async () => {},
+      listTools: async () => [],
+      callTool: async () => [],
+      invalidateToolsCache: async () => {},
+    };
+    const originalSchema = structuredClone(inputSchema);
+
+    const functionTool = convertExpectingStrictFallback(() =>
+      mcpToFunctionTool(
+        {
+          name: 'free_form_nested',
+          description: '',
+          inputSchema,
+        } as any,
+        server,
+        true,
+      ),
+    );
+
+    expect(functionTool.strict).toBe(false);
+    expect(functionTool.parameters).toEqual(originalSchema);
+    expect(inputSchema).toEqual(originalSchema);
+  });
+
+  it.each([
+    ['empty input schema', {}],
+    [
+      'explicitly closed empty object',
+      { type: 'object', additionalProperties: false },
+    ],
+    [
+      'declared property',
+      {
+        type: 'object',
+        properties: { value: { type: 'string' } },
+      },
+    ],
+  ])('keeps strict-compatible MCP schemas strict: %s', (_name, inputSchema) => {
+    const server: MCPServer = {
+      name: 'strict-compatible-server',
+      cacheToolsList: false,
+      connect: async () => {},
+      close: async () => {},
+      listTools: async () => [],
+      callTool: async () => [],
+      invalidateToolsCache: async () => {},
+    };
+    const inputSchemaRecord = inputSchema as Record<string, any>;
+
+    const functionTool = mcpToFunctionTool(
+      {
+        name: 'strict_compatible',
+        description: '',
+        inputSchema,
+      } as any,
+      server,
+      true,
+    );
+
+    expect(functionTool.strict).toBe(true);
+    expect(functionTool.parameters.additionalProperties).toBe(false);
+    expect(functionTool.parameters.required).toEqual(
+      Object.keys(inputSchemaRecord.properties ?? {}),
+    );
   });
 
   it('annotates the current span when invoking the tool', async () => {

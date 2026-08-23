@@ -12,6 +12,8 @@ export const nextStepSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('next_step_final_output'),
     output: z.string(),
+    responseAccepted: z.literal(true).optional(),
+    localFinalizationStarted: z.literal(true).optional(),
   }),
   z.object({
     type: z.literal('next_step_run_again'),
@@ -32,6 +34,7 @@ export class SingleStepResult {
     public newStepItems: RunItem[],
     public nextStep: NextStep,
     public finalOutputSource?: FinalOutputSource,
+    public toolInvocationCommitItems: RunItem[] = newStepItems,
   ) {}
 
   get generatedItems(): RunItem[] {

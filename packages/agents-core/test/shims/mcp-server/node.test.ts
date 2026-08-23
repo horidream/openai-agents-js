@@ -15,12 +15,13 @@ import {
 } from '../../../src/shims/mcp-server/node';
 import { mcpToFunctionTool } from '../../../src/mcp';
 import { RunContext } from '../../../src/runContext';
-import { TransportSendOptions } from '@modelcontextprotocol/sdk/shared/transport';
-import { JSONRPCMessage } from '@modelcontextprotocol/sdk/types';
-import { DEFAULT_REQUEST_TIMEOUT_MSEC } from '@modelcontextprotocol/sdk/shared/protocol';
+import {
+  DEFAULT_REQUEST_TIMEOUT_MSEC,
+  type JSONRPCMessage,
+  type TransportSendOptions,
+} from '@modelcontextprotocol/client';
 import type { Logger } from '../../../src/logger';
 import { connectMcpServers } from '../../../src/mcpServers';
-import { allowConsole } from '../../../../../helpers/tests/console-guard';
 
 let lastConnectOptions: any;
 let lastListToolsOptions: any;
@@ -32,14 +33,14 @@ let lastCallToolOptions: any;
 let lastCallToolParams: any;
 let lastReadResourceOptions: any;
 let lastReadResourceParams: any;
+let lastClientOptions: any;
 let callToolImplementation:
-  ((params: any, resultSchema: any, options: any) => Promise<any>) | undefined;
+  ((params: any, options: any) => Promise<any>) | undefined;
 let connectImplementation:
   ((transport: any, options: any) => Promise<void>) | undefined;
 let listToolsImplementation:
   ((params: any, options: any) => Promise<any>) | undefined;
 let listToolsCalls: Array<{ params: any; options: any }>;
-let clientToolMetadataCacheCalls: any[][];
 let listResourcesImplementation:
   ((params: any, options: any) => Promise<any>) | undefined;
 let terminateSessionImplementation: (() => Promise<void>) | undefined;
@@ -92,6 +93,63 @@ function createDeferred() {
   return { promise, resolve };
 }
 
+async function expectCachedToolsInvalidatedImmediately(server: {
+  connect(): Promise<void>;
+  close(): Promise<void>;
+  listTools(): Promise<Array<{ name: string }>>;
+  invalidateToolsCache(): Promise<void>;
+}): Promise<void> {
+  let currentToolName = 'old-tool';
+  listToolsImplementation = async () => ({
+    tools: [createMockTool(currentToolName)],
+  });
+
+  await server.connect();
+  expect((await server.listTools()).map((tool) => tool.name)).toEqual([
+    'old-tool',
+  ]);
+
+  currentToolName = 'new-tool';
+  const invalidation = server.invalidateToolsCache();
+  const crossingListing = server.listTools();
+  await invalidation;
+
+  expect((await crossingListing).map((tool) => tool.name)).toEqual([
+    'new-tool',
+  ]);
+  expect((await server.listTools()).map((tool) => tool.name)).toEqual([
+    'new-tool',
+  ]);
+  await server.close();
+}
+
+async function expectInvalidationClearsListedToolMetadata(server: {
+  connect(): Promise<void>;
+  close(): Promise<void>;
+  listTools(): Promise<Array<{ name: string }>>;
+  invalidateToolsCache(): Promise<void>;
+  callTool(
+    toolName: string,
+    args: Record<string, unknown> | null,
+  ): Promise<unknown>;
+}): Promise<void> {
+  listToolsImplementation = async () => ({
+    tools: [
+      createMockTool('task-tool', {
+        execution: { taskSupport: 'required' },
+      }),
+    ],
+  });
+
+  await server.connect();
+  await server.listTools();
+  await server.invalidateToolsCache();
+
+  await expect(server.callTool('task-tool', {})).resolves.toBeDefined();
+  expect(lastCallToolOptions?.toolDefinition).toBeUndefined();
+  await server.close();
+}
+
 function getErrorGraphText(value: unknown, seen = new Set<object>()): string {
   if (
     value === null ||
@@ -136,6 +194,21 @@ function createCapturingLogger() {
   } satisfies Logger;
 }
 
+async function expectConsoleErrors<T>(
+  expectedCalls: unknown[][],
+  callback: () => Promise<T>,
+): Promise<T> {
+  const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+  try {
+    const result = await callback();
+    expect(errorSpy.mock.calls).toEqual(expectedCalls);
+    return result;
+  } finally {
+    errorSpy.mockRestore();
+  }
+}
+
 beforeEach(() => {
   lastConnectOptions = undefined;
   lastListToolsOptions = undefined;
@@ -147,11 +220,11 @@ beforeEach(() => {
   lastCallToolParams = undefined;
   lastReadResourceOptions = undefined;
   lastReadResourceParams = undefined;
+  lastClientOptions = undefined;
   callToolImplementation = undefined;
   connectImplementation = undefined;
   listToolsImplementation = undefined;
   listToolsCalls = [];
-  clientToolMetadataCacheCalls = [];
   listResourcesImplementation = undefined;
   terminateSessionImplementation = undefined;
   retainCallToolSignalListener = false;
@@ -159,24 +232,18 @@ beforeEach(() => {
 
 describe('NodeMCPServerStdio', () => {
   beforeAll(() => {
-    vi.mock(
-      '@modelcontextprotocol/sdk/client/stdio.js',
-      async (importOriginal) => {
-        return {
-          ...(await importOriginal()),
-          StdioClientTransport: MockStdioClientTransport,
-        };
-      },
-    );
-    vi.mock(
-      '@modelcontextprotocol/sdk/client/index.js',
-      async (importOriginal) => {
-        return {
-          ...(await importOriginal()),
-          Client: MockClient,
-        };
-      },
-    );
+    vi.doMock('@modelcontextprotocol/client/stdio', async (importOriginal) => {
+      return {
+        ...(await importOriginal()),
+        StdioClientTransport: MockStdioClientTransport,
+      };
+    });
+    vi.doMock('@modelcontextprotocol/client', async (importOriginal) => ({
+      ...(await importOriginal()),
+      Client: MockClient,
+      SSEClientTransport: MockSSEClientTransport,
+      StreamableHTTPClientTransport: MockStreamableHTTPClientTransport,
+    }));
   });
   test('should be available', async () => {
     const server = new NodeMCPServerStdio({
@@ -189,19 +256,21 @@ describe('NodeMCPServerStdio', () => {
     expect(server.cacheToolsList).toBe(true);
     await server.connect();
     expect(lastConnectOptions?.timeout).toBe(5000);
+    expect(lastClientOptions?.versionNegotiation).toEqual({ mode: 'auto' });
+    expect(lastClientOptions?.listMaxPages).toBe(0);
     await server.close();
   });
 
-  test('installed MCP client should support aggregate tool metadata caching', async () => {
+  test('installed MCP client should support automatic tool pagination', async () => {
     const { Client } = await vi.importActual<
-      typeof import('@modelcontextprotocol/sdk/client/index.js')
-    >('@modelcontextprotocol/sdk/client/index.js');
+      typeof import('@modelcontextprotocol/client')
+    >('@modelcontextprotocol/client');
     const client = new Client({
       name: 'metadata-compatibility-test',
       version: '1.0.0',
     });
 
-    expect(typeof (client as any).cacheToolMetadata).toBe('function');
+    expect(typeof client.listTools).toBe('function');
   });
 
   test('should apply custom client session timeout when connecting', async () => {
@@ -237,6 +306,9 @@ describe('NodeMCPServerStdio', () => {
     expect(lastCallToolOptions?.timeout).toBe(DEFAULT_REQUEST_TIMEOUT_MSEC);
     expect(lastCallToolOptions?.signal).toBeDefined();
     expect(lastCallToolOptions?.signal).not.toBe(controller.signal);
+    expect(lastCallToolOptions?.toolDefinition).toMatchObject({
+      name: 'mock-tool',
+    });
 
     await server.close();
   });
@@ -246,7 +318,7 @@ describe('NodeMCPServerStdio', () => {
     const callStarted = new Promise<void>((resolve) => {
       markCallStarted = resolve;
     });
-    callToolImplementation = async (_params, _resultSchema, options) => {
+    callToolImplementation = async (_params, options) => {
       markCallStarted?.();
       return new Promise((_, reject) => {
         options.signal.addEventListener(
@@ -377,8 +449,6 @@ describe('NodeMCPServerStdio', () => {
     const pendingTools = server.listTools();
     await continuationStarted.promise;
 
-    expect(clientToolMetadataCacheCalls).toEqual([]);
-
     continuation.resolve();
     const tools = await pendingTools;
     const cachedTools = await server.listTools();
@@ -395,12 +465,6 @@ describe('NodeMCPServerStdio', () => {
     expect(listToolsCalls.map((call) => call.options.timeout)).toEqual([
       6000, 6000,
     ]);
-    expect(
-      clientToolMetadataCacheCalls.map((tools) =>
-        tools.map((tool) => tool.name),
-      ),
-    ).toEqual([['first-tool', 'second-tool']]);
-
     await server.close();
   });
 
@@ -433,8 +497,6 @@ describe('NodeMCPServerStdio', () => {
     await expect(staleListing).rejects.toThrow(
       'MCP tool listing became stale before it completed.',
     );
-    expect(clientToolMetadataCacheCalls).toEqual([]);
-
     listToolsImplementation = async () => ({
       tools: [createMockTool('refreshed-tool')],
     });
@@ -443,6 +505,26 @@ describe('NodeMCPServerStdio', () => {
     ]);
 
     await server.close();
+  });
+
+  test('should stop serving cached tools when invalidation starts', async () => {
+    await expectCachedToolsInvalidatedImmediately(
+      new NodeMCPServerStdio({
+        name: 'immediate-stdio-invalidation',
+        fullCommand: 'test',
+        cacheToolsList: true,
+      }),
+    );
+  });
+
+  test('should clear listed tool metadata on invalidation', async () => {
+    await expectInvalidationClearsListedToolMetadata(
+      new NodeMCPServerStdio({
+        name: 'stdio-invalidation-metadata',
+        fullCommand: 'test',
+        cacheToolsList: true,
+      }),
+    );
   });
 
   test('should reject a tool listing from a replaced session', async () => {
@@ -475,37 +557,12 @@ describe('NodeMCPServerStdio', () => {
     await expect(staleListing).rejects.toThrow(
       'MCP tool listing became stale before it completed.',
     );
-    expect(clientToolMetadataCacheCalls).toEqual([]);
-
     listToolsImplementation = async () => ({
       tools: [createMockTool('new-session-tool')],
     });
     expect((await server.listTools()).map((tool) => tool.name)).toEqual([
       'new-session-tool',
     ]);
-
-    await server.close();
-  });
-
-  test('should limit missing metadata caching failures to tool listing', async () => {
-    const server = new NodeMCPServerStdio({
-      name: 'missing-metadata-cache',
-      fullCommand: 'test',
-    });
-
-    await server.connect();
-    const session = (server as any).session;
-    session.request = vi.fn(async () => ({
-      tools: [createMockTool('uncommitted-tool')],
-    }));
-    session.cacheToolMetadata = undefined;
-
-    const resources = await server.listResources();
-    expect(resources.resources[0].uri).toBe('file:///mock-resource.txt');
-    await expect(server.listTools()).rejects.toThrow(
-      'The installed MCP SDK does not support tool metadata caching required for paginated tool listing.',
-    );
-    expect(session.request).not.toHaveBeenCalled();
 
     await server.close();
   });
@@ -534,14 +591,17 @@ describe('NodeMCPServerStdio', () => {
     });
     expect(lastListResourcesParams).toEqual({ cursor: 'resource-cursor' });
     expect(lastListResourcesOptions?.timeout).toBe(7000);
+    expect(lastListResourcesOptions?.cacheMode).toBeUndefined();
     expect(lastListResourceTemplatesParams).toEqual({
       cursor: 'template-cursor',
     });
     expect(lastListResourceTemplatesOptions?.timeout).toBe(7000);
+    expect(lastListResourceTemplatesOptions?.cacheMode).toBeUndefined();
     expect(lastReadResourceParams).toEqual({
       uri: 'file:///mock-resource.txt',
     });
     expect(lastReadResourceOptions?.timeout).toBe(7000);
+    expect(lastReadResourceOptions?.cacheMode).toBe('refresh');
 
     await server.close();
   });
@@ -585,8 +645,9 @@ class MockClient {
     name: string;
     version: string;
   };
-  constructor(options: { name: string; version: string }) {
+  constructor(options: { name: string; version: string }, clientOptions?: any) {
     this.options = options;
+    lastClientOptions = clientOptions;
   }
   connect(_transport: any, options?: any): Promise<void> {
     lastConnectOptions = options;
@@ -595,28 +656,36 @@ class MockClient {
     }
     return Promise.resolve();
   }
-  cacheToolMetadata(tools: any[]): void {
-    clientToolMetadataCacheCalls.push(tools);
+  getServerCapabilities(): Record<string, unknown> {
+    return { tools: {}, resources: {} };
   }
-  async request(request: any, _resultSchema: any, options?: any): Promise<any> {
-    if (request.method !== 'tools/list') {
-      throw new Error(`Unexpected request method: ${request.method}`);
+  getProtocolEra(): 'legacy' {
+    return 'legacy';
+  }
+  request(request: any, options?: any): Promise<any> {
+    switch (request.method) {
+      case 'resources/list':
+        return this.listResources(request.params, options);
+      case 'resources/templates/list':
+        return this.listResourceTemplates(request.params, options);
+      case 'tools/list':
+        lastListToolsOptions = options;
+        listToolsCalls.push({ params: request.params, options });
+        return listToolsImplementation
+          ? listToolsImplementation(request.params, options)
+          : Promise.resolve({ tools: [createMockTool('mock-tool')] });
+      default:
+        throw new Error(`Unexpected mock MCP request: ${request.method}`);
     }
-    const params = request.params;
-    lastListToolsOptions = options;
-    listToolsCalls.push({ params, options });
-    return listToolsImplementation
-      ? await listToolsImplementation(params, options)
-      : { tools: [createMockTool('mock-tool')] };
   }
-  callTool(_params: any, _resultSchema?: any, options?: any): Promise<any> {
+  callTool(_params: any, options?: any): Promise<any> {
     lastCallToolParams = _params;
     lastCallToolOptions = options;
     if (retainCallToolSignalListener && options?.signal) {
       options.signal.addEventListener('abort', () => {});
     }
     if (callToolImplementation) {
-      return callToolImplementation(_params, _resultSchema, options);
+      return callToolImplementation(_params, options);
     }
     return Promise.resolve({
       content: [{ type: 'text', text: 'ok' }],
@@ -713,24 +782,23 @@ class MockSSEClientTransport {
 }
 
 describe('NodeMCPServerSSE', () => {
-  beforeAll(() => {
-    vi.mock(
-      '@modelcontextprotocol/sdk/client/sse.js',
-      async (importOriginal) => {
-        return {
-          ...(await importOriginal()),
-          SSEClientTransport: MockSSEClientTransport,
-        };
-      },
+  test('should stop serving cached tools when invalidation starts', async () => {
+    await expectCachedToolsInvalidatedImmediately(
+      new NodeMCPServerSSE({
+        url: 'https://example.com/sse',
+        name: 'immediate-sse-invalidation',
+        cacheToolsList: true,
+      }),
     );
-    vi.mock(
-      '@modelcontextprotocol/sdk/client/index.js',
-      async (importOriginal) => {
-        return {
-          ...(await importOriginal()),
-          Client: MockClient,
-        };
-      },
+  });
+
+  test('should clear listed tool metadata on invalidation', async () => {
+    await expectInvalidationClearsListedToolMetadata(
+      new NodeMCPServerSSE({
+        url: 'https://example.com/sse',
+        name: 'sse-invalidation-metadata',
+        cacheToolsList: true,
+      }),
     );
   });
 
@@ -957,12 +1025,15 @@ describe('NodeMCPServerSSE', () => {
         url: CREDENTIAL_ENDPOINT,
         logger,
       });
-      allowConsole(['error']);
 
-      const session = await connectMcpServers([server], {
-        strict: true,
-        suppressAbortError: true,
-      });
+      const session = await expectConsoleErrors(
+        [['Failed to connect MCP server:', 'object']],
+        () =>
+          connectMcpServers([server], {
+            strict: true,
+            suppressAbortError: true,
+          }),
+      );
 
       expect(session.errors.get(server)).toMatchObject({
         name: 'AbortError',
@@ -1109,8 +1180,6 @@ describe('NodeMCPServerSSE', () => {
       undefined,
       { cursor: 'repeated-cursor' },
     ]);
-    expect(clientToolMetadataCacheCalls).toEqual([]);
-
     listToolsCalls = [];
     listToolsImplementation = async () => ({
       tools: [createMockTool('recovered-tool')],
@@ -1129,7 +1198,7 @@ describe('NodeMCPServerSSE', () => {
     const callStarted = new Promise<void>((resolve) => {
       markCallStarted = resolve;
     });
-    callToolImplementation = async (_params, _resultSchema, options) => {
+    callToolImplementation = async (_params, options) => {
       markCallStarted?.();
       return new Promise((_, reject) => {
         options.signal.addEventListener(
@@ -1262,29 +1331,28 @@ class MockStreamableHTTPClientTransport {
 }
 
 describe('NodeMCPServerStreamableHttp', () => {
-  beforeAll(() => {
-    vi.mock(
-      '@modelcontextprotocol/sdk/client/streamableHttp.js',
-      async (importOriginal) => {
-        return {
-          ...(await importOriginal()),
-          StreamableHTTPClientTransport: MockStreamableHTTPClientTransport,
-        };
-      },
-    );
-    vi.mock(
-      '@modelcontextprotocol/sdk/client/index.js',
-      async (importOriginal) => {
-        return {
-          ...(await importOriginal()),
-          Client: MockClient,
-        };
-      },
+  beforeEach(() => {
+    MockStreamableHTTPClientTransport.instances = [];
+  });
+
+  test('should stop serving cached tools when invalidation starts', async () => {
+    await expectCachedToolsInvalidatedImmediately(
+      new NodeMCPServerStreamableHttp({
+        url: 'https://example.com/stream',
+        name: 'immediate-streamable-http-invalidation',
+        cacheToolsList: true,
+      }),
     );
   });
 
-  beforeEach(() => {
-    MockStreamableHTTPClientTransport.instances = [];
+  test('should clear listed tool metadata on invalidation', async () => {
+    await expectInvalidationClearsListedToolMetadata(
+      new NodeMCPServerStreamableHttp({
+        url: 'https://example.com/stream',
+        name: 'streamable-http-invalidation-metadata',
+        cacheToolsList: true,
+      }),
+    );
   });
 
   test('should apply session timeout when connecting', async () => {
@@ -1487,7 +1555,7 @@ describe('NodeMCPServerStreamableHttp', () => {
     await server.close();
   });
 
-  test('should redact cursors from later tool page errors and restore metadata', async () => {
+  test('should redact cursors from later tool page errors', async () => {
     const opaqueCursor = 'SECRET_OPAQUE_CURSOR';
     const unsafeError = new Error(`Continuation failed for ${opaqueCursor}`);
     listToolsImplementation = async (params) => {
@@ -1517,7 +1585,19 @@ describe('NodeMCPServerStreamableHttp', () => {
       undefined,
       { cursor: opaqueCursor },
     ]);
-    expect(clientToolMetadataCacheCalls.at(-1)).toEqual([]);
+
+    const firstPageError = new Error('First page failed');
+    listToolsImplementation = async () => {
+      throw firstPageError;
+    };
+    await expect(server.listTools()).rejects.toBe(firstPageError);
+
+    listToolsImplementation = async () => ({
+      tools: [createMockTool('recovered-tool')],
+    });
+    expect((await server.listTools()).map((tool) => tool.name)).toEqual([
+      'recovered-tool',
+    ]);
 
     await server.close();
   });
@@ -1527,7 +1607,7 @@ describe('NodeMCPServerStreamableHttp', () => {
     const callStarted = new Promise<void>((resolve) => {
       markCallStarted = resolve;
     });
-    callToolImplementation = async (_params, _resultSchema, options) => {
+    callToolImplementation = async (_params, options) => {
       markCallStarted?.();
       return new Promise((_, reject) => {
         options.signal.addEventListener(

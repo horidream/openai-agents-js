@@ -3,6 +3,7 @@ import { z } from 'zod';
 import {
   Agent,
   MemorySession,
+  ModelBehaviorError,
   OutputGuardrailTripwireTriggered,
   RequestUsage,
   Runner,
@@ -25,8 +26,6 @@ import {
   withGenerationSpan,
   withTrace,
   withTraceContext,
-  type Model,
-  type ModelRequest,
   type ModelResponse,
   type MCPServer,
   type OpenAIResponsesCompactionResult,
@@ -38,7 +37,17 @@ import { defaultProcessor } from '../src/tracing/processor';
 import { mergeAgentToolRunConfig } from '../src/agentToolRunConfig';
 import { SandboxRuntimeManager } from '../src/sandbox/runtime';
 import { AsyncLocalStorage as BrowserAsyncLocalStorage } from '../src/shims/shims-browser';
-import { fakeModelMessage, FakeModel } from './stubs';
+import { fakeModelMessage } from './stubs';
+import logger from '../src/logger';
+import {
+  ScriptedModel,
+  modelError,
+  modelResponder,
+  modelResponse,
+  modelStream,
+  modelStreamResponder,
+  type RecordedModelCall,
+} from '../src/testing';
 
 class RecordingProcessor implements TracingProcessor {
   readonly spansStarted: Span<any>[] = [];
@@ -58,102 +67,89 @@ class RecordingProcessor implements TracingProcessor {
   async forceFlush(): Promise<void> {}
 }
 
-class StreamingModel implements Model {
-  private readonly responses: ModelResponse[];
-
+class StreamingModel extends ScriptedModel {
   constructor(response: ModelResponse | ModelResponse[]) {
-    this.responses = Array.isArray(response) ? [...response] : [response];
-  }
-
-  async getResponse(_request: ModelRequest): Promise<ModelResponse> {
-    throw new Error('Use getStreamedResponse for this model.');
-  }
-
-  async *getStreamedResponse(
-    _request: ModelRequest,
-  ): AsyncIterable<StreamEvent> {
-    const response = this.responses.shift();
-    if (!response) {
-      throw new Error('No response found.');
-    }
-    yield {
-      type: 'response_done',
-      response: {
-        id: 'stream-response',
-        output: response.output,
-        usage: response.usage,
-      },
-    } as StreamEvent;
+    const responses = Array.isArray(response) ? response : [response];
+    super(
+      responses.map((item) =>
+        modelStream([
+          {
+            type: 'response_done',
+            response: {
+              id: 'stream-response',
+              output: item.output,
+              usage: item.usage,
+            },
+          } as StreamEvent,
+        ]),
+      ),
+    );
   }
 }
 
-class FailingModel implements Model {
-  constructor(private readonly error: Error) {}
-
-  async getResponse(): Promise<ModelResponse> {
-    throw this.error;
-  }
-
-  async *getStreamedResponse(): AsyncIterable<StreamEvent> {
-    throw this.error;
-    yield* [] as StreamEvent[];
+class FailingModel extends ScriptedModel {
+  constructor(error: Error) {
+    super([modelError(error)]);
   }
 }
 
-class HangingStreamingModel implements Model {
-  async getResponse(): Promise<ModelResponse> {
-    throw new Error('Use getStreamedResponse for this model.');
-  }
-
-  async *getStreamedResponse(
-    request: ModelRequest,
-  ): AsyncIterable<StreamEvent> {
-    const abortError = new Error('aborted');
-    abortError.name = 'AbortError';
-    const signal = request.signal;
-    await new Promise((_resolve, reject) => {
-      if (signal?.aborted) {
-        reject(abortError);
-        return;
-      }
-      signal?.addEventListener('abort', () => reject(abortError), {
-        once: true,
-      });
-    });
-    yield* [] as StreamEvent[];
+class HangingStreamingModel extends ScriptedModel {
+  constructor() {
+    super([
+      modelStreamResponder((call) =>
+        (async function* () {
+          const abortError = new Error('aborted');
+          abortError.name = 'AbortError';
+          const signal = call.request.signal;
+          await new Promise((_resolve, reject) => {
+            if (signal?.aborted) {
+              reject(abortError);
+              return;
+            }
+            signal?.addEventListener('abort', () => reject(abortError), {
+              once: true,
+            });
+          });
+          yield* [] as StreamEvent[];
+        })(),
+      ),
+    ]);
   }
 }
 
-class AbortReconciliationUsageModel implements Model {
-  async getResponse(): Promise<ModelResponse> {
-    return responseWithSpecificUsage(7, 3);
-  }
-
-  async *getStreamedResponse(): AsyncIterable<StreamEvent> {
-    yield {
-      type: 'model',
-      event: {
-        type: 'response.created',
-        response: { id: 'response-before-abort' },
-      },
-    } as StreamEvent;
-    yield {
-      type: 'model',
-      event: {
-        type: 'response.output_item.done',
-        item: {
-          type: 'function_call',
-          id: 'function-call-before-abort',
-          call_id: 'call-before-abort',
-          name: 'slow_tool',
-          arguments: '{}',
-          status: 'completed',
-        },
-      },
-    } as StreamEvent;
-    const abortError = new Error('aborted');
-    abortError.name = 'AbortError';
-    throw abortError;
+class AbortReconciliationUsageModel extends ScriptedModel {
+  constructor() {
+    super([
+      modelStreamResponder(() =>
+        (async function* () {
+          yield {
+            type: 'model',
+            event: {
+              type: 'response.created',
+              response: { id: 'response-before-abort' },
+            },
+          } as StreamEvent;
+          yield {
+            type: 'model',
+            event: {
+              type: 'response.output_item.done',
+              item: {
+                type: 'function_call',
+                id: 'function-call-before-abort',
+                call_id: 'call-before-abort',
+                name: 'slow_tool',
+                arguments: '{}',
+                status: 'completed',
+              },
+            },
+          } as StreamEvent;
+          const abortError = new Error('aborted');
+          abortError.name = 'AbortError';
+          throw abortError;
+        })(),
+      ),
+      modelResponse(responseWithSpecificUsage(7, 3)),
+    ]);
   }
 }
 
@@ -206,113 +202,91 @@ function createBarrier(participantCount: number) {
   };
 }
 
-class CoordinatedModel implements Model {
-  private readonly responses: ModelResponse[];
-  private callCount = 0;
-
+class CoordinatedModel extends ScriptedModel {
   constructor(
     response: ModelResponse | ModelResponse[],
-    private readonly waitForPeers: () => Promise<void>,
-    private readonly waitBeforeResponse?: Promise<void>,
+    waitForPeers: () => Promise<void>,
+    waitBeforeResponse?: Promise<void>,
   ) {
-    this.responses = Array.isArray(response) ? [...response] : [response];
-  }
-
-  async getResponse(_request: ModelRequest): Promise<ModelResponse> {
-    if (this.callCount === 0) {
-      await this.waitForPeers();
-      await this.waitBeforeResponse;
-    }
-    this.callCount += 1;
-    const response = this.responses.shift();
-    if (!response) {
-      throw new Error('No coordinated response found.');
-    }
-    return response;
-  }
-
-  getStreamedResponse(_request: ModelRequest): AsyncIterable<StreamEvent> {
-    throw new Error('Streaming is not supported by this model.');
+    const responses = Array.isArray(response) ? response : [response];
+    super(
+      responses.map((item, index) =>
+        index === 0
+          ? modelResponder(async () => {
+              await waitForPeers();
+              await waitBeforeResponse;
+              return item;
+            })
+          : modelResponse(item),
+      ),
+    );
   }
 }
 
-class CoordinatedTracingModel implements Model {
-  constructor(
-    private readonly label: string,
-    private readonly waitForPeers: () => Promise<void>,
-  ) {}
-
-  async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    return withGenerationSpan(
-      async () => {
-        await this.waitForPeers();
-        return responseWithoutUsage();
-      },
-      { data: { model: this.label } },
-      request._internal?.tracingParent,
-    );
-  }
-
-  getStreamedResponse(_request: ModelRequest): AsyncIterable<StreamEvent> {
-    throw new Error('Streaming is not supported by this model.');
+class CoordinatedTracingModel extends ScriptedModel {
+  constructor(label: string, waitForPeers: () => Promise<void>) {
+    super([
+      modelResponder((call) =>
+        withGenerationSpan(
+          async () => {
+            await waitForPeers();
+            return responseWithoutUsage();
+          },
+          { data: { model: label } },
+          call.request._internal?.tracingParent,
+        ),
+      ),
+    ]);
   }
 }
 
-class RetryingTracingModel implements Model {
-  private attempts = 0;
-
-  async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    return withGenerationSpan(
-      async () => {
-        this.attempts += 1;
-        if (this.attempts === 1) {
-          const error = new Error('Rate limited');
-          (error as Error & { statusCode?: number }).statusCode = 429;
-          throw error;
-        }
-        return responseWithSpecificUsage(7, 3);
-      },
-      { data: { model: `retry-attempt-${this.attempts + 1}` } },
-      request._internal?.tracingParent,
-    );
-  }
-
-  getStreamedResponse(_request: ModelRequest): AsyncIterable<StreamEvent> {
-    throw new Error('Streaming is not supported by this model.');
-  }
-}
-
-class CoordinatedStreamingTracingModel implements Model {
-  constructor(
-    private readonly label: string,
-    private readonly waitForPeers: () => Promise<void>,
-  ) {}
-
-  async getResponse(): Promise<ModelResponse> {
-    throw new Error('Use getStreamedResponse for this model.');
-  }
-
-  async *getStreamedResponse(
-    request: ModelRequest,
-  ): AsyncIterable<StreamEvent> {
-    const span = createGenerationSpan(
-      { data: { model: this.label } },
-      request._internal?.tracingParent,
-    );
-    span.start();
-    try {
-      await this.waitForPeers();
-      yield {
-        type: 'response_done',
-        response: {
-          id: `stream-response-${this.label}`,
-          output: responseWithoutUsage().output,
-          usage: new Usage(),
+class RetryingTracingModel extends ScriptedModel {
+  constructor() {
+    let attempts = 0;
+    const respond = (call: RecordedModelCall) =>
+      withGenerationSpan(
+        async () => {
+          attempts += 1;
+          if (attempts === 1) {
+            const error = new Error('Rate limited');
+            (error as Error & { statusCode?: number }).statusCode = 429;
+            throw error;
+          }
+          return responseWithSpecificUsage(7, 3);
         },
-      } as StreamEvent;
-    } finally {
-      span.end();
-    }
+        { data: { model: `retry-attempt-${attempts + 1}` } },
+        call.request._internal?.tracingParent,
+      );
+    super([modelResponder(respond), modelResponder(respond)]);
+  }
+}
+
+class CoordinatedStreamingTracingModel extends ScriptedModel {
+  constructor(label: string, waitForPeers: () => Promise<void>) {
+    super([
+      modelStreamResponder((call) =>
+        (async function* () {
+          const span = createGenerationSpan(
+            { data: { model: label } },
+            call.request._internal?.tracingParent,
+          );
+          span.start();
+          try {
+            await waitForPeers();
+            yield {
+              type: 'response_done',
+              response: {
+                id: `stream-response-${label}`,
+                output: responseWithoutUsage().output,
+                usage: new Usage(),
+              },
+            } as StreamEvent;
+          } finally {
+            span.end();
+          }
+        })(),
+      ),
+    ]);
   }
 }
 
@@ -445,7 +419,7 @@ function createNestedAgentToolScenario(
 ) {
   const nestedAgent = new Agent({
     name: 'Nested agent',
-    model: new FakeModel([responseWithUsage()]),
+    model: new ScriptedModel([modelResponse(responseWithUsage())]),
   });
   const nestedTool = nestedAgent.asTool({
     toolName: 'nested_agent',
@@ -463,9 +437,9 @@ function createNestedAgentToolScenario(
   });
   const outerAgent = new Agent({
     name: 'Outer agent',
-    model: new FakeModel([
-      agentToolCallResponse(nestedTool.name),
-      responseWithUsage(),
+    model: new ScriptedModel([
+      modelResponse(agentToolCallResponse(nestedTool.name)),
+      modelResponse(responseWithUsage()),
     ]),
     tools: [nestedTool],
   });
@@ -529,7 +503,7 @@ function responseWithoutUsage(): ModelResponse {
 function createApprovedAgentToolScenario(stream: boolean) {
   const nestedAgent = new Agent({
     name: 'Approved nested agent',
-    model: new FakeModel([responseWithUsage()]),
+    model: new ScriptedModel([modelResponse(responseWithUsage())]),
   });
   const nestedTool = nestedAgent.asTool({
     toolName: 'approved_nested_agent',
@@ -542,7 +516,9 @@ function createApprovedAgentToolScenario(stream: boolean) {
   ];
   const outerAgent = new Agent({
     name: 'Outer approval agent',
-    model: stream ? new StreamingModel(responses) : new FakeModel(responses),
+    model: stream
+      ? new StreamingModel(responses)
+      : new ScriptedModel(Array.from(responses, modelResponse)),
     tools: [nestedTool],
   });
   return outerAgent;
@@ -576,7 +552,7 @@ describe('runner task and turn tracing', () => {
   it('creates task and turn spans by default with Python-compatible usage', async () => {
     const agent = new Agent({
       name: 'Researcher',
-      model: new FakeModel([responseWithUsage()]),
+      model: new ScriptedModel([modelResponse(responseWithUsage())]),
     });
     const runner = new Runner({ workflowName: 'Tracing parity workflow' });
 
@@ -635,10 +611,148 @@ describe('runner task and turn tracing', () => {
     });
   });
 
+  it.each([false, true])(
+    'uses the Runner workflow name for a task span inside an outer trace (stream=%s)',
+    async (stream) => {
+      const response = responseWithoutUsage();
+      const agent = new Agent({
+        name: 'Nested trace agent',
+        model: stream
+          ? new StreamingModel(response)
+          : new ScriptedModel([modelResponse(response)]),
+      });
+      const runner = new Runner({ workflowName: 'Inner workflow' });
+      let outerTraceId: string | undefined;
+
+      await withTrace('Outer workflow', async (trace) => {
+        outerTraceId = trace.traceId;
+        if (stream) {
+          const result = await runner.run(agent, 'hello', { stream: true });
+          await result.completed;
+        } else {
+          await runner.run(agent, 'hello');
+        }
+      });
+
+      const taskSpan = spanOfType(processor, 'task');
+      expect(taskSpan.spanData.name).toBe('Inner workflow');
+      expect(taskSpan.traceId).toBe(outerTraceId);
+      expect(taskSpan.parentId).toBeNull();
+    },
+  );
+
+  it.each([false, true])(
+    'preserves a restored workflow name for resumed task spans (stream=%s)',
+    async (stream) => {
+      const approvalTool = tool({
+        name: 'restore_workflow_name_tool',
+        description: 'Requires approval.',
+        parameters: z.object({}),
+        needsApproval: true,
+        execute: async () => 'approved',
+      });
+      const responses = [
+        approvalResponse(approvalTool.name),
+        responseWithoutUsage(),
+      ];
+      const agent = new Agent({
+        name: 'Restored workflow agent',
+        model: stream
+          ? new StreamingModel(responses)
+          : new ScriptedModel(Array.from(responses, modelResponse)),
+        tools: [approvalTool],
+      });
+      const firstRunner = new Runner({ workflowName: 'Stored workflow' });
+      const first = stream
+        ? await firstRunner.run(agent, 'hello', { stream: true })
+        : await firstRunner.run(agent, 'hello');
+      if ('completed' in first) {
+        await first.completed;
+      }
+
+      const restoredState = await RunState.fromString(
+        agent,
+        first.state.toString(),
+      );
+      restoredState.approve(restoredState.getInterruptions()[0]);
+      const endedBeforeResume = processor.spansEnded.length;
+      const resumed = stream
+        ? await new Runner().run(agent, restoredState, { stream: true })
+        : await new Runner().run(agent, restoredState);
+      if ('completed' in resumed) {
+        await resumed.completed;
+      }
+
+      const taskSpan = processor.spansEnded
+        .slice(endedBeforeResume)
+        .find((span) => span.spanData.type === 'task');
+      expect(taskSpan?.spanData.name).toBe('Stored workflow');
+      expect(taskSpan?.traceId).toBe(restoredState._trace?.traceId);
+      expect(taskSpan?.parentId).toBeNull();
+    },
+  );
+
+  it.each([false, true])(
+    'uses the Runner workflow name when resumed state has no trace (stream=%s)',
+    async (stream) => {
+      const approvalTool = tool({
+        name: 'resume_without_trace_tool',
+        description: 'Requires approval.',
+        parameters: z.object({}),
+        needsApproval: true,
+        execute: async () => 'approved',
+      });
+      const responses = [
+        approvalResponse(approvalTool.name),
+        responseWithoutUsage(),
+      ];
+      const agent = new Agent({
+        name: 'Resume without trace agent',
+        model: stream
+          ? new StreamingModel(responses)
+          : new ScriptedModel(Array.from(responses, modelResponse)),
+        tools: [approvalTool],
+      });
+      const firstRunner = new Runner({ tracingDisabled: true });
+      const first = stream
+        ? await firstRunner.run(agent, 'hello', { stream: true })
+        : await firstRunner.run(agent, 'hello');
+      if ('completed' in first) {
+        await first.completed;
+      }
+
+      const restoredState = await RunState.fromString(
+        agent,
+        first.state.toString(),
+      );
+      restoredState.approve(restoredState.getInterruptions()[0]);
+      const endedBeforeResume = processor.spansEnded.length;
+      let outerTraceId: string | undefined;
+
+      await withTrace('Outer workflow', async (trace) => {
+        outerTraceId = trace.traceId;
+        const runner = new Runner({ workflowName: 'Inner workflow' });
+        const resumed = stream
+          ? await runner.run(agent, restoredState, { stream: true })
+          : await runner.run(agent, restoredState);
+        if ('completed' in resumed) {
+          await resumed.completed;
+        }
+      });
+
+      const taskSpan = processor.spansEnded
+        .slice(endedBeforeResume)
+        .find((span) => span.spanData.type === 'task');
+      expect(taskSpan?.spanData.name).toBe('Inner workflow');
+      expect(taskSpan?.traceId).toBe(outerTraceId);
+      expect(taskSpan?.parentId).toBeNull();
+    },
+  );
+
   it('omits only task and turn spans when explicitly disabled', async () => {
     const agent = new Agent({
       name: 'Researcher',
-      model: new FakeModel([responseWithUsage()]),
+      model: new ScriptedModel([modelResponse(responseWithUsage())]),
     });
     const runner = new Runner({
       tracing: { includeTaskAndTurnSpans: false },
@@ -663,7 +777,7 @@ describe('runner task and turn tracing', () => {
         name: 'Researcher',
         model: stream
           ? new StreamingModel(response)
-          : new FakeModel([response]),
+          : new ScriptedModel([modelResponse(response)]),
       });
       const runner = new Runner({ tracingDisabled: true });
 
@@ -689,9 +803,9 @@ describe('runner task and turn tracing', () => {
     });
     const agent = new Agent({
       name: 'Re-enabled tracing agent',
-      model: new FakeModel([
-        agentToolCallResponse(approvalTool.name),
-        responseWithoutUsage(),
+      model: new ScriptedModel([
+        modelResponse(agentToolCallResponse(approvalTool.name)),
+        modelResponse(responseWithoutUsage()),
       ]),
       tools: [approvalTool],
     });
@@ -736,7 +850,7 @@ describe('runner task and turn tracing', () => {
           : 'Globally re-enabled tracing agent',
         model: stream
           ? new StreamingModel(responses)
-          : new FakeModel(responses),
+          : new ScriptedModel(Array.from(responses, modelResponse)),
         tools: [approvalTool],
       });
 
@@ -901,9 +1015,11 @@ describe('runner task and turn tracing', () => {
     });
     const outerAgent = new Agent({
       name: 'Outer parallel agent',
-      model: new FakeModel([
-        parallelAgentToolCallResponse([nestedToolA.name, nestedToolB.name]),
-        responseWithoutUsage(),
+      model: new ScriptedModel([
+        modelResponse(
+          parallelAgentToolCallResponse([nestedToolA.name, nestedToolB.name]),
+        ),
+        modelResponse(responseWithoutUsage()),
       ]),
       tools: [nestedToolA, nestedToolB],
     });
@@ -1050,9 +1166,11 @@ describe('runner task and turn tracing', () => {
     });
     const outerAgent = new Agent({
       name: 'Opt-out outer parallel agent',
-      model: new FakeModel([
-        parallelAgentToolCallResponse([nestedToolA.name, nestedToolB.name]),
-        responseWithoutUsage(),
+      model: new ScriptedModel([
+        modelResponse(
+          parallelAgentToolCallResponse([nestedToolA.name, nestedToolB.name]),
+        ),
+        modelResponse(responseWithoutUsage()),
       ]),
       tools: [nestedToolA, nestedToolB],
     });
@@ -1104,11 +1222,11 @@ describe('runner task and turn tracing', () => {
     const waitForBothModels = createBarrier(2);
     const targetAgentA = new Agent({
       name: 'Nested handoff target A',
-      model: new FakeModel([responseWithoutUsage()]),
+      model: new ScriptedModel([modelResponse(responseWithoutUsage())]),
     });
     const targetAgentB = new Agent({
       name: 'Nested handoff target B',
-      model: new FakeModel([responseWithoutUsage()]),
+      model: new ScriptedModel([modelResponse(responseWithoutUsage())]),
     });
     const handoffA = handoff(targetAgentA);
     const handoffB = handoff(targetAgentB);
@@ -1138,9 +1256,11 @@ describe('runner task and turn tracing', () => {
     });
     const outerAgent = new Agent({
       name: 'Outer parallel handoff agent',
-      model: new FakeModel([
-        parallelAgentToolCallResponse([nestedToolA.name, nestedToolB.name]),
-        responseWithoutUsage(),
+      model: new ScriptedModel([
+        modelResponse(
+          parallelAgentToolCallResponse([nestedToolA.name, nestedToolB.name]),
+        ),
+        modelResponse(responseWithoutUsage()),
       ]),
       tools: [nestedToolA, nestedToolB],
     });
@@ -1175,12 +1295,12 @@ describe('runner task and turn tracing', () => {
     );
     const nestedAgentA = new Agent({
       name: 'Nested MCP agent A',
-      model: new FakeModel([responseWithoutUsage()]),
+      model: new ScriptedModel([modelResponse(responseWithoutUsage())]),
       mcpServers: [serverA],
     });
     const nestedAgentB = new Agent({
       name: 'Nested MCP agent B',
-      model: new FakeModel([responseWithoutUsage()]),
+      model: new ScriptedModel([modelResponse(responseWithoutUsage())]),
       mcpServers: [serverB],
     });
     const nestedToolA = nestedAgentA.asTool({
@@ -1193,9 +1313,11 @@ describe('runner task and turn tracing', () => {
     });
     const outerAgent = new Agent({
       name: 'Outer parallel MCP agent',
-      model: new FakeModel([
-        parallelAgentToolCallResponse([nestedToolA.name, nestedToolB.name]),
-        responseWithoutUsage(),
+      model: new ScriptedModel([
+        modelResponse(
+          parallelAgentToolCallResponse([nestedToolA.name, nestedToolB.name]),
+        ),
+        modelResponse(responseWithoutUsage()),
       ]),
       tools: [nestedToolA, nestedToolB],
     });
@@ -1234,9 +1356,11 @@ describe('runner task and turn tracing', () => {
     );
     const agent = new Agent({
       name: 'Parallel MCP tool agent',
-      model: new FakeModel([
-        parallelAgentToolCallResponse([serverA.toolName, serverB.toolName]),
-        responseWithoutUsage(),
+      model: new ScriptedModel([
+        modelResponse(
+          parallelAgentToolCallResponse([serverA.toolName, serverB.toolName]),
+        ),
+        modelResponse(responseWithoutUsage()),
       ]),
       mcpServers: [serverA, serverB],
     });
@@ -1292,9 +1416,9 @@ describe('runner task and turn tracing', () => {
       expect(preparedTool).toBeDefined();
       const agent = new Agent({
         name: 'MCP URL redaction agent',
-        model: new FakeModel([
-          agentToolCallResponse(preparedTool!.name),
-          responseWithoutUsage(),
+        model: new ScriptedModel([
+          modelResponse(agentToolCallResponse(preparedTool!.name)),
+          modelResponse(responseWithoutUsage()),
         ]),
         mcpServers: [server],
         mcpConfig: { includeServerInToolNames: true },
@@ -1840,7 +1964,7 @@ describe('runner task and turn tracing', () => {
     const runner = new Runner();
     const nonStreamingAgent = new Agent({
       name: 'Non-streaming compaction agent',
-      model: new FakeModel([responseWithUsage()]),
+      model: new ScriptedModel([modelResponse(responseWithUsage())]),
     });
 
     await runner.run(nonStreamingAgent, 'hello', {
@@ -1883,7 +2007,7 @@ describe('runner task and turn tracing', () => {
           : 'Compaction failure agent',
         model: stream
           ? new StreamingModel(responseWithUsage())
-          : new FakeModel([responseWithUsage()]),
+          : new ScriptedModel([modelResponse(responseWithUsage())]),
       });
       const runner = new Runner();
       const session = new FailingCompactionSession();
@@ -1929,7 +2053,7 @@ describe('runner task and turn tracing', () => {
   it('marks the task span when non-streaming session writes fail', async () => {
     const agent = new Agent({
       name: 'Session write failure agent',
-      model: new FakeModel([responseWithUsage()]),
+      model: new ScriptedModel([modelResponse(responseWithUsage())]),
     });
 
     const session = new FailingAddItemsSession();
@@ -1958,7 +2082,7 @@ describe('runner task and turn tracing', () => {
           : 'Sandbox cleanup failure agent',
         model: stream
           ? new StreamingModel(responseWithUsage())
-          : new FakeModel([responseWithUsage()]),
+          : new ScriptedModel([modelResponse(responseWithUsage())]),
       });
 
       try {
@@ -2002,7 +2126,7 @@ describe('runner task and turn tracing', () => {
           : 'Output guardrail tracing agent',
         model: stream
           ? new StreamingModel(responseWithoutUsage())
-          : new FakeModel([responseWithoutUsage()]),
+          : new ScriptedModel([modelResponse(responseWithoutUsage())]),
         outputGuardrails: [
           {
             name: 'delayed output guardrail',
@@ -2078,7 +2202,7 @@ describe('runner task and turn tracing', () => {
             ? new FailingModel(failureError)
             : stream
               ? new StreamingModel(response)
-              : new FakeModel([response]),
+              : new ScriptedModel([modelResponse(response)]),
         tools: failure === 'tool' ? [failingTool] : [],
         outputGuardrails:
           failure === 'guardrail'
@@ -2136,7 +2260,7 @@ describe('runner task and turn tracing', () => {
         outputType: z.object({ summary: z.string() }),
         model: stream
           ? new StreamingModel(response)
-          : new FakeModel([response]),
+          : new ScriptedModel([modelResponse(response)]),
       });
       const runner = new Runner();
       const options = {
@@ -2166,9 +2290,214 @@ describe('runner task and turn tracing', () => {
     },
   );
 
+  it.each([
+    ['redacted trace', false, false],
+    ['redacted trace streamed', false, true],
+    ['sensitive trace', true, false],
+    ['sensitive trace streamed', true, true],
+  ] as const)(
+    '%s controls recovered structured-output error details',
+    async (_mode, traceIncludeSensitiveData, stream) => {
+      const secret = 'SECRET_RECOVERED_FINAL_OUTPUT_TRACE_4212';
+      const response: ModelResponse = {
+        output: [fakeModelMessage(JSON.stringify({ summary: secret }))],
+        usage: new Usage(),
+      };
+      const agent = new Agent({
+        name: 'Recovered structured-output tracing agent',
+        outputType: z.object({ summary: z.string() }),
+        model: stream
+          ? new StreamingModel(response)
+          : new ScriptedModel([modelResponse(response)]),
+      });
+      let parserCalls = 0;
+      agent.processFinalOutput = (output: string) => {
+        parserCalls += 1;
+        if (parserCalls === 1) {
+          throw new Error(`Overridden parser rejected ${output}`);
+        }
+        return JSON.parse(output);
+      };
+      const flagSpy = vi
+        .spyOn(logger, 'dontLogModelData', 'get')
+        .mockReturnValue(false);
+      const runner = new Runner({ traceIncludeSensitiveData });
+      const options = {
+        errorHandlers: {
+          invalidFinalOutput: () => ({
+            finalOutput: { summary: 'safe fallback' },
+          }),
+        },
+      };
+
+      try {
+        if (stream) {
+          const result = await runner.run(agent, 'hello', {
+            ...options,
+            stream: true,
+          });
+          await result.completed;
+          expect(result.finalOutput).toEqual({ summary: 'safe fallback' });
+        } else {
+          const result = await runner.run(agent, 'hello', options);
+          expect(result.finalOutput).toEqual({ summary: 'safe fallback' });
+        }
+      } finally {
+        flagSpy.mockRestore();
+      }
+
+      expect(spanOfType(processor, 'task').error).toBeNull();
+      expect(parserCalls).toBeGreaterThanOrEqual(2);
+      const turnError = spanOfType(processor, 'turn').error;
+      const renderedTurnError = JSON.stringify(turnError);
+      if (traceIncludeSensitiveData) {
+        expect(renderedTurnError).toContain(secret);
+      } else {
+        expect(turnError).toEqual({
+          message:
+            'Invalid output type: final assistant output did not match the expected schema.',
+          data: {},
+        });
+        expect(renderedTurnError).not.toContain(secret);
+      }
+    },
+  );
+
+  it.each([
+    ['redacted', true, false],
+    ['redacted streamed', true, true],
+    ['diagnostic', false, false],
+    ['diagnostic streamed', false, true],
+  ] as const)(
+    '%s structured-output errors follow the model-data policy in span callbacks',
+    async (_mode, dontLogModelData, stream) => {
+      const secret = 'SECRET_FINAL_OUTPUT_SPAN_4207';
+      const response: ModelResponse = {
+        output: [fakeModelMessage(JSON.stringify({ summary: secret }))],
+        usage: new Usage(),
+      };
+      const agent = new Agent({
+        name: 'Structured output span agent',
+        outputType: z.object({ summary: z.string() }),
+        model: stream
+          ? new StreamingModel(response)
+          : new ScriptedModel([modelResponse(response)]),
+      });
+      agent.processFinalOutput = (output: string): never => {
+        throw new Error(`Overridden parser rejected ${output}`);
+      };
+      const flagSpy = vi
+        .spyOn(logger, 'dontLogModelData', 'get')
+        .mockReturnValue(dontLogModelData);
+
+      try {
+        if (stream) {
+          const result = await new Runner().run(agent, 'hello', {
+            stream: true,
+          });
+          await expect(result.completed).rejects.toBeInstanceOf(
+            ModelBehaviorError,
+          );
+        } else {
+          await expect(new Runner().run(agent, 'hello')).rejects.toBeInstanceOf(
+            ModelBehaviorError,
+          );
+        }
+      } finally {
+        flagSpy.mockRestore();
+      }
+
+      const renderedErrors = JSON.stringify([
+        ...processor.spanErrorsAtEnd.values(),
+      ]);
+      if (dontLogModelData) {
+        expect(renderedErrors).not.toContain(secret);
+      } else {
+        expect(renderedErrors).toContain(secret);
+      }
+    },
+  );
+
+  it.each([false, true])(
+    'keeps redacted guardrail parser and persistence errors out of span callbacks (stream=%s)',
+    async (stream) => {
+      const parserSecret = 'SECRET_GUARDRAIL_PARSER_SPAN_4210';
+      const persistenceSecret = 'SECRET_GUARDRAIL_PERSISTENCE_SPAN_4211';
+      const response: ModelResponse = {
+        output: [fakeModelMessage(JSON.stringify({ summary: parserSecret }))],
+        usage: new Usage(),
+      };
+      const agent = new Agent({
+        name: 'Guardrail persistence tracing agent',
+        outputType: z.object({ summary: z.string() }),
+        model: stream
+          ? new StreamingModel(response)
+          : new ScriptedModel([modelResponse(response)]),
+      });
+      let parserCalls = 0;
+      agent.processFinalOutput = (output: string) => {
+        parserCalls += 1;
+        if (parserCalls === 1) {
+          return JSON.parse(output);
+        }
+        throw new Error(`Guardrail parser rejected ${output}`);
+      };
+      class RejectingPersistenceSession extends MemorySession {
+        override async applyHistoryTransaction(): Promise<void> {
+          throw new Error(`Persistence rejected ${persistenceSecret}`);
+        }
+      }
+      const flagSpy = vi
+        .spyOn(logger, 'dontLogModelData', 'get')
+        .mockReturnValue(true);
+      const runner = new Runner({
+        outputGuardrails: [
+          {
+            name: 'never runs after parser failure',
+            execute: vi.fn(async () => ({
+              tripwireTriggered: false,
+              outputInfo: {},
+            })),
+          },
+        ],
+      });
+
+      let error: unknown;
+      try {
+        if (stream) {
+          const result = await runner.run(agent, 'hello', {
+            stream: true,
+            session: new RejectingPersistenceSession(),
+          });
+          await result.completed;
+        } else {
+          await runner.run(agent, 'hello', {
+            session: new RejectingPersistenceSession(),
+          });
+        }
+      } catch (caught) {
+        error = caught;
+      } finally {
+        flagSpy.mockRestore();
+      }
+
+      expect(error).toBeInstanceOf(ModelBehaviorError);
+      expect((error as Error & { cause?: unknown }).cause).toBeUndefined();
+      expect(parserCalls).toBe(2);
+      const renderedErrors = JSON.stringify([
+        ...processor.spanErrorsAtEnd.values(),
+      ]);
+      expect(renderedErrors).not.toContain(parserSecret);
+      expect(renderedErrors).not.toContain(persistenceSecret);
+    },
+  );
+
   it.each([false, true])(
     'marks task and turn spans when an error handler fails (stream=%s)',
     async (stream) => {
+      const flagSpy = vi
+        .spyOn(logger, 'dontLogModelData', 'get')
+        .mockReturnValue(false);
       const response: ModelResponse = {
         output: [fakeModelMessage('not valid json')],
         usage: new Usage(),
@@ -2178,7 +2507,7 @@ describe('runner task and turn tracing', () => {
         outputType: z.object({ summary: z.string() }),
         model: stream
           ? new StreamingModel(response)
-          : new FakeModel([response]),
+          : new ScriptedModel([modelResponse(response)]),
       });
       const handlerError = new Error('error handler failure');
       const options = {
@@ -2208,6 +2537,7 @@ describe('runner task and turn tracing', () => {
           data: { error: String(handlerError) },
         });
       }
+      flagSpy.mockRestore();
     },
   );
 
@@ -2235,7 +2565,7 @@ describe('runner task and turn tracing', () => {
   it('uses invocation-local usage and a fresh agent span when resuming', async () => {
     const agent = new Agent({
       name: 'Resumed agent',
-      model: new FakeModel([responseWithUsage()]),
+      model: new ScriptedModel([modelResponse(responseWithUsage())]),
     });
     const state = new RunState(new RunContext(), 'hello', agent, 10);
     state._context.usage.add(
@@ -2290,7 +2620,7 @@ describe('runner task and turn tracing', () => {
           : 'Interrupted span agent',
         model: stream
           ? new StreamingModel(response)
-          : new FakeModel([response]),
+          : new ScriptedModel([modelResponse(response)]),
         tools: [approvalTool],
       });
 
@@ -2334,7 +2664,7 @@ describe('runner task and turn tracing', () => {
           : 'Opt-out interrupted span agent',
         model: stream
           ? new StreamingModel(responses)
-          : new FakeModel(responses),
+          : new ScriptedModel(Array.from(responses, modelResponse)),
         tools: [approvalTool],
       });
       const runner = new Runner({
@@ -2403,7 +2733,9 @@ describe('runner task and turn tracing', () => {
           : 'Mixed-config approval agent',
         model: stream
           ? new StreamingModel([approvalResponse(approvalTool.name)])
-          : new FakeModel([approvalResponse(approvalTool.name)]),
+          : new ScriptedModel([
+              modelResponse(approvalResponse(approvalTool.name)),
+            ]),
         tools: [approvalTool],
       });
 
@@ -2485,7 +2817,7 @@ describe('runner task and turn tracing', () => {
           : 'Disable tracing on resume agent',
         model: stream
           ? new StreamingModel(responses)
-          : new FakeModel(responses),
+          : new ScriptedModel(Array.from(responses, modelResponse)),
         tools: [approvalTool],
       });
       const firstRunner = new Runner({
@@ -2531,9 +2863,9 @@ describe('runner task and turn tracing', () => {
     });
     const agent = new Agent({
       name: 'Approval agent',
-      model: new FakeModel([
-        approvalResponse(approvalTool.name),
-        responseWithUsage(),
+      model: new ScriptedModel([
+        modelResponse(approvalResponse(approvalTool.name)),
+        modelResponse(responseWithUsage()),
       ]),
       tools: [approvalTool],
     });
@@ -2649,7 +2981,7 @@ describe('runner task and turn tracing', () => {
         name: agentName,
         model: stream
           ? new StreamingModel(responses)
-          : new FakeModel(responses),
+          : new ScriptedModel(Array.from(responses, modelResponse)),
         tools: [approvalTool],
       });
       const runner = new Runner();
@@ -2804,7 +3136,9 @@ describe('runner task and turn tracing', () => {
     });
     const agent = new Agent({
       name: 'Failing approval agent',
-      model: new FakeModel([approvalResponse(approvalTool.name)]),
+      model: new ScriptedModel([
+        modelResponse(approvalResponse(approvalTool.name)),
+      ]),
       tools: [approvalTool],
     });
     const runner = new Runner();
