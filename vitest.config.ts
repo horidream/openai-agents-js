@@ -106,6 +106,7 @@ function createProjects(reviewTestProfile: boolean) {
           'scripts/released-api-contract.test.mjs',
           'scripts/run-integration-tests-managed.test.mjs',
           'scripts/workflow-contracts.test.mjs',
+          'docs/src/scripts/headingAnchors.test.ts',
         ],
       },
     },
@@ -138,7 +139,6 @@ export default defineConfig(({ mode }) => {
       coverage: {
         provider: 'v8',
         reporter: ['text', 'html', 'json', 'json-summary', 'lcov'],
-        all: true,
         include: ['packages/**/src/**/*.ts'],
         exclude: ['**/*.d.ts', 'packages/**/test/**', 'packages/**/dist/**'],
       },

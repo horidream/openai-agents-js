@@ -1,9 +1,11 @@
 import { z } from 'zod';
 import { randomUUID } from '@openai/agents-core/_shims';
-import { Agent } from './agent';
+import { Agent, type ToolUseBehavior } from './agent';
 import type { Handoff } from './handoff';
 import { getAgentToolSourceAgent } from './agentToolSourceRegistry';
 import { buildAgentIdentityMap } from './runStateIdentity';
+import { getToolSearchAgentName } from './runner/toolSearchAttribution';
+import { rehydrateLegacyCompactionRunItems } from './runStateLegacyCompaction';
 export { buildAgentIdentityMap } from './runStateIdentity';
 import {
   RunMessageOutputItem,
@@ -27,11 +29,19 @@ import {
   toAgentInputList,
   type ReasoningItemIdPolicy,
 } from './runner/items';
+import { normalizeItemsForSessionPersistence } from './runner/sessionItems';
 import { getServerConversationOwner } from './runner/conversation';
 import { AgentToolUseTracker } from './runner/toolUseTracker';
 import { nextStepSchema, NextStep } from './runner/steps';
 import { createToolRunFunction, type ProcessedResponse } from './runner/types';
-import { hasBlockedOutputExecutionEffect } from './runner/blockedOutputPersistence';
+import {
+  getCurrentResponseToolOutputGuardrailResultStart,
+  hasBlockedOutputExecutionEffect,
+  hasDeterministicTerminalToolOutputSource,
+  hasPendingApprovedToolInputCompaction,
+  hasTerminalToolOutputSource,
+  restoreCurrentResponseToolOutputGuardrailResultStart,
+} from './runner/blockedOutputPersistence';
 import type { AgentSpanData, Span } from './tracing/spans';
 import { ModelBehaviorError, SystemError, UserError } from './errors';
 import { getGlobalTraceProvider } from './tracing/provider';
@@ -51,6 +61,7 @@ import type {
   ToolOutputGuardrailResult,
 } from './toolGuardrail';
 import { safeExecute } from './utils/safeExecute';
+import { toSmartString } from './utils/smartString';
 import {
   getClientToolSearchExecutor,
   getToolSearchRuntimeRoutingKey,
@@ -161,8 +172,12 @@ import {
  *   same canonical approval identity, and adds sandbox session-state envelope version 4
  *   so Docker network-isolation state cannot be consumed by older SDKs that would drop it
  *   during container replacement.
- * - 1.20: Adds sandbox session-state envelope version 5 so Docker labels cannot be
- *   consumed by older SDKs that would drop them during container replacement.
+ * - 1.20: Preserves resolved function identities on tool call items and adds sandbox
+ *   session-state envelope version 5 so Docker labels cannot be
+ *   consumed by older SDKs that would drop them during container replacement, preserves
+ *   exact current-response ownership for serialized approval resumes, and checkpoints
+ *   unacknowledged ordinary Session appends completed during approval resume, including
+ *   filtered handoff input held until its source append settles.
  */
 export const CURRENT_SCHEMA_VERSION = '1.20' as const;
 export const SUPPORTED_SCHEMA_VERSIONS = [
@@ -249,6 +264,125 @@ type PendingSessionHistoryTransaction = z.infer<
   typeof pendingSessionHistoryTransactionSchema
 >;
 
+const pendingSessionWriteBaseSchema = {
+  sessionId: z.string().min(1),
+  alreadyPersistedCount: z.number().int().min(0),
+  persistedItemCount: z.number().int().min(1),
+  reasoningItemIdPolicy: z.enum(['preserve', 'omit']),
+  // Kept separately from canonical append items until the source turn is durable.
+  handoffInput: z.lazy(() => handoffInputSnapshotSchema).optional(),
+  terminalToolFinalization: z
+    .object({
+      behavior: z.enum([
+        'stop_on_first_tool',
+        'stop_at_tool_names',
+        'function',
+      ]),
+      selectedCallId: z.string().min(1).optional(),
+      selectedGeneratedItemIndex: z.number().int().min(0).optional(),
+      finalOutput: z.string(),
+    })
+    .strict()
+    .optional(),
+};
+
+const pendingSessionWriteSchema = z.discriminatedUnion('phase', [
+  z
+    .object({
+      ...pendingSessionWriteBaseSchema,
+      phase: z.literal('prepared'),
+    })
+    .strict(),
+  z
+    .object({
+      ...pendingSessionWriteBaseSchema,
+      phase: z.literal('append_ready'),
+      beforeItems: z.array(protocol.ModelItem),
+      comparableAppendItems: z.array(protocol.ModelItem).min(1),
+    })
+    .strict(),
+  z
+    .object({
+      ...pendingSessionWriteBaseSchema,
+      phase: z.literal('compaction_pending'),
+    })
+    .strict(),
+]);
+
+export type PendingSessionWrite = z.infer<typeof pendingSessionWriteSchema>;
+
+type PendingSessionWriteItemOwnership = Pick<
+  PendingSessionWrite,
+  | 'sessionId'
+  | 'alreadyPersistedCount'
+  | 'persistedItemCount'
+  | 'reasoningItemIdPolicy'
+>;
+
+export function getPendingSessionWriteAppendItems(
+  state: RunState<any, any>,
+  pending: PendingSessionWriteItemOwnership,
+): AgentInputItem[] {
+  const ownedItems = normalizeItemsForSessionPersistence(
+    extractOutputItemsFromRunItems(
+      state._generatedItems.slice(
+        pending.alreadyPersistedCount,
+        pending.persistedItemCount,
+      ),
+      pending.reasoningItemIdPolicy,
+    ),
+  );
+  if (ownedItems.length === 0) {
+    throw new UserError(
+      'RunState pending Session write does not own a persistable generated item.',
+    );
+  }
+  const inputPrefix =
+    state._currentTurnSessionHistoryTransactionInputItems ?? [];
+  if (
+    (inputPrefix.length > 0 &&
+      state._currentTurnSessionHistoryTransactionSessionId === undefined) ||
+    (state._currentTurnSessionHistoryTransactionSessionId !== undefined &&
+      state._currentTurnSessionHistoryTransactionSessionId !==
+        pending.sessionId)
+  ) {
+    throw new UserError(
+      'RunState pending Session write input is missing its transaction-aware Session binding.',
+    );
+  }
+  return normalizeItemsForSessionPersistence([...inputPrefix, ...ownedItems]);
+}
+
+type PendingSessionWriteTerminalProducer = {
+  behavior: ToolUseBehavior;
+  resultCallIds: string[];
+  resultItems: RunToolCallOutputItem[];
+  selectedCallId?: string;
+  finalOutput: string;
+};
+
+const pendingSessionWriteTerminalProducers = new WeakMap<
+  RunState<any, any>,
+  PendingSessionWriteTerminalProducer
+>();
+
+export function recordPendingSessionWriteTerminalProducer(
+  state: RunState<any, any>,
+  producer: PendingSessionWriteTerminalProducer | undefined,
+): void {
+  if (producer) {
+    pendingSessionWriteTerminalProducers.set(state, producer);
+  } else {
+    pendingSessionWriteTerminalProducers.delete(state);
+  }
+}
+
+export function clearPendingSessionWriteTerminalProducer(
+  state: RunState<any, any>,
+): void {
+  pendingSessionWriteTerminalProducers.delete(state);
+}
+
 type RunStateContextOverrideOptions<TContext> = {
   contextOverride?: RunContext<TContext>;
   contextStrategy?: ContextOverrideStrategy;
@@ -283,9 +417,27 @@ function getSerializedLocalToolIdentity(
   toolCall: LocalToolCall,
   approvalNames: ReadonlyMap<string, string>,
   agent: Agent<any, any>,
+  functionToolStateKey?: string,
 ): string | undefined {
   if (toolCall.type === 'function_call') {
-    return getFunctionToolStateKeyForCall(toolCall, toolCall.name);
+    const callIdentity = getFunctionToolStateKeyForCall(
+      toolCall,
+      toolCall.name,
+    );
+    if (functionToolStateKey !== undefined) {
+      if (
+        functionToolStateKey !== callIdentity &&
+        (getToolCallNamespace(toolCall) ||
+          functionToolStateKey !==
+            getFunctionToolLookupKey(toolCall.name, toolCall.name))
+      ) {
+        throw new UserError(
+          'RunState function tool identity does not match its call.',
+        );
+      }
+      return functionToolStateKey;
+    }
+    return callIdentity;
   }
   const callId = getToolInvocationCallId(toolCall);
   if (callId) {
@@ -497,6 +649,8 @@ function inferCompletedToolInvocations(generatedItems: readonly RunItem[]): {
   const ambiguous = new Map<Agent<any, any>, Set<string>>();
   const evidence = new Map<Agent<any, any>, Map<string, RunItem[]>>();
 
+  // Completed calls retain their execution-time identity even when a handoff
+  // filter removes discovery history. Completion evidence is checked separately.
   for (const item of generatedItems) {
     if (item instanceof RunToolApprovalItem) {
       const callId = getToolInvocationCallId(item.rawItem);
@@ -654,6 +808,7 @@ function inferCompletedToolInvocations(generatedItems: readonly RunItem[]): {
         rawItem,
         approvalNames.get(item.agent) ?? new Map(),
         item.agent,
+        item.functionToolStateKey,
       );
       const agentPending = getAgentInvocationMap(pendingLocalCalls, item.agent);
       const previousPending = agentPending.get(callId);
@@ -882,12 +1037,20 @@ function validateToolInvocationCompletionEvidence(
         toolCall.type === 'function_call'
           ? callItem instanceof RunToolApprovalItem
             ? (callItem.functionToolStateKey ?? callItem.name)
-            : getFunctionToolLegacyStateKeyFromStateKey(toolName ?? '') ===
-                getFunctionToolLegacyStateKeyFromStateKey(
-                  getFunctionToolStateKeyForCall(toolCall, toolCall.name) ?? '',
+            : callItem.functionToolStateKey !== undefined
+              ? getSerializedLocalToolIdentity(
+                  toolCall,
+                  new Map(),
+                  agent,
+                  callItem.functionToolStateKey,
                 )
-              ? toolName
-              : undefined
+              : getFunctionToolLegacyStateKeyFromStateKey(toolName ?? '') ===
+                  getFunctionToolLegacyStateKeyFromStateKey(
+                    getFunctionToolStateKeyForCall(toolCall, toolCall.name) ??
+                      '',
+                  )
+                ? toolName
+                : undefined
           : callItem instanceof RunToolApprovalItem
             ? callItem.name
             : toolName;
@@ -1284,6 +1447,7 @@ const itemSchema = z.discriminatedUnion('type', [
     type: z.literal('tool_call_item'),
     rawItem: protocol.ToolCallItem.or(protocol.HostedToolCallItem),
     agent: serializedAgentSchema,
+    functionToolStateKey: z.string().optional(),
   }),
   z.object({
     type: z.literal('tool_call_output_item'),
@@ -1500,6 +1664,11 @@ const sandboxStateSchema = z.object({
   sessionsByAgent: z.record(z.string(), sandboxSessionEntrySchema),
 });
 
+const handoffInputSnapshotSchema = z.object({
+  originalInput: z.string().or(z.array(protocol.ModelItem)),
+  generatedItems: z.array(itemSchema),
+});
+
 const serializedProcessedResponseSchema = z.object({
   newItems: z.array(itemSchema),
   toolsUsed: z.array(z.string()),
@@ -1521,6 +1690,8 @@ const serializedProcessedResponseSchema = z.object({
       z.object({
         toolCall: z.any(),
         toolName: z.string(),
+        // Describes the error only; persisted input cannot select search execution.
+        reason: z.literal('not_loaded').optional(),
       }),
     )
     .optional(),
@@ -1572,6 +1743,19 @@ const serializedProcessedResponseSchema = z.object({
     )
     .optional(),
 });
+
+const currentResponseGeneratedItemOwnershipSchema = z
+  .object({
+    generatedItemStartIndex: z.number().int().min(0),
+    generatedItemEndIndexExclusive: z.number().int().min(0),
+    interruptionGeneratedItemIndexes: z.array(z.number().int().min(0)),
+    toolOutputGuardrailResultStartIndex: z.number().int().min(0),
+  })
+  .strict();
+
+type CurrentResponseGeneratedItemOwnership = z.infer<
+  typeof currentResponseGeneratedItemOwnershipSchema
+>;
 
 const guardrailFunctionOutputSchema = z.object({
   tripwireTriggered: z.boolean(),
@@ -1714,6 +1898,8 @@ export const SerializedRunState = z.object({
   currentStep: nextStepSchema.optional(),
   lastModelResponse: modelResponseSchema.optional(),
   generatedItems: z.array(itemSchema),
+  currentResponseGeneratedItemOwnership:
+    currentResponseGeneratedItemOwnershipSchema.optional(),
   pendingAgentToolRuns: z.record(z.string(), z.string()).optional().default({}),
   pendingAgentToolRunAliases: z
     .record(z.string(), z.string())
@@ -1721,6 +1907,7 @@ export const SerializedRunState = z.object({
     .default({}),
   lastProcessedResponse: serializedProcessedResponseSchema.optional(),
   currentTurnPersistedItemCount: z.number().int().min(0).optional(),
+  currentTurnSessionWriteCompactedItemCount: z.number().int().min(0).optional(),
   currentTurnDeferredSessionItemIndexes: z
     .array(z.number().int().min(0))
     .optional(),
@@ -1729,6 +1916,7 @@ export const SerializedRunState = z.object({
   currentTurnSessionInputItems: z.array(protocol.ModelItem).optional(),
   pendingSessionHistoryTransaction:
     pendingSessionHistoryTransactionSchema.optional(),
+  pendingSessionWrite: pendingSessionWriteSchema.optional(),
   completedToolInvocations: z
     .array(
       z.object({
@@ -1763,6 +1951,244 @@ export const SerializedRunState = z.object({
   trace: serializedTraceSchema.nullable(),
   sandbox: sandboxStateSchema.optional(),
 });
+
+function findUniqueContiguousIdentityStart(
+  items: readonly RunItem[],
+  sequence: readonly RunItem[],
+): number | undefined {
+  if (sequence.length === 0 || sequence.length > items.length) {
+    return undefined;
+  }
+  let match: number | undefined;
+  for (let start = 0; start <= items.length - sequence.length; start += 1) {
+    if (
+      !sequence.every((item, offset) => {
+        const candidate = items[start + offset];
+        if (candidate === item) {
+          return true;
+        }
+        try {
+          return (
+            candidate !== undefined &&
+            candidate.type === item.type &&
+            'rawItem' in candidate &&
+            'rawItem' in item &&
+            candidate.rawItem === item.rawItem
+          );
+        } catch {
+          return false;
+        }
+      })
+    ) {
+      continue;
+    }
+    if (match !== undefined) {
+      return undefined;
+    }
+    match = start;
+  }
+  return match;
+}
+
+function captureCurrentResponseGeneratedItemOwnership(
+  state: RunState<any, any>,
+): CurrentResponseGeneratedItemOwnership | undefined {
+  if (state._currentStep?.type !== 'next_step_interruption') {
+    return undefined;
+  }
+  const processedItems = state._lastProcessedResponse?.newItems ?? [];
+  const interruptions = state._currentStep.data.interruptions;
+  if (processedItems.length === 0 || interruptions.length === 0) {
+    return undefined;
+  }
+  const generatedItemStartIndex = findUniqueContiguousIdentityStart(
+    state._generatedItems,
+    processedItems,
+  );
+  if (generatedItemStartIndex === undefined) {
+    return undefined;
+  }
+  const processedEndIndex = generatedItemStartIndex + processedItems.length;
+  const interruptionGeneratedItemIndexes: number[] = [];
+  for (const interruption of interruptions) {
+    const matchingIndexes = state._generatedItems.flatMap((item, index) => {
+      if (index < processedEndIndex) {
+        return [];
+      }
+      if (item === interruption) {
+        return [index];
+      }
+      try {
+        if ('rawItem' in item && item.rawItem === interruption.rawItem) {
+          return [index];
+        }
+        // A partial live resume can recreate the remaining approval wrapper. In that case,
+        // use the existing canonical invocation identity, but only inside the already-proven
+        // terminal current-response range and only when it selects one candidate.
+        return item instanceof RunToolApprovalItem &&
+          item.agent === interruption.agent &&
+          getToolInvocationCallId(item.rawItem) ===
+            getToolInvocationCallId(interruption.rawItem) &&
+          getToolInvocationFingerprint(
+            item.functionToolStateKey ?? item.name ?? '',
+            item.rawItem,
+          ) ===
+            getToolInvocationFingerprint(
+              interruption.functionToolStateKey ?? interruption.name ?? '',
+              interruption.rawItem,
+            )
+          ? [index]
+          : [];
+      } catch {
+        return [];
+      }
+    });
+    if (
+      matchingIndexes.length !== 1 ||
+      matchingIndexes[0] < processedEndIndex
+    ) {
+      return undefined;
+    }
+    interruptionGeneratedItemIndexes.push(matchingIndexes[0]);
+  }
+  if (
+    interruptionGeneratedItemIndexes.some(
+      (index, offset) =>
+        offset > 0 && index <= interruptionGeneratedItemIndexes[offset - 1],
+    )
+  ) {
+    return undefined;
+  }
+  const lastModelResponseIndex = state._modelResponses.lastIndexOf(
+    state._lastTurnResponse!,
+  );
+  if (
+    state._lastTurnResponse === undefined ||
+    lastModelResponseIndex !== state._modelResponses.length - 1 ||
+    state._modelResponses.indexOf(state._lastTurnResponse) !==
+      lastModelResponseIndex
+  ) {
+    return undefined;
+  }
+  const toolOutputGuardrailResultStartIndex =
+    getCurrentResponseToolOutputGuardrailResultStart(state);
+  if (
+    toolOutputGuardrailResultStartIndex === undefined ||
+    toolOutputGuardrailResultStartIndex >
+      state._toolOutputGuardrailResults.length
+  ) {
+    return undefined;
+  }
+  return {
+    generatedItemStartIndex,
+    generatedItemEndIndexExclusive: state._generatedItems.length,
+    interruptionGeneratedItemIndexes,
+    toolOutputGuardrailResultStartIndex,
+  };
+}
+
+function serializedValuesEqual(left: unknown, right: unknown): boolean {
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return false;
+  }
+}
+
+function throwCurrentResponseOwnershipError(
+  reason = 'invalid boundary',
+): never {
+  throw new UserError(
+    `RunState current-response generated-item ownership has an ${reason}. Start a new run from safe input.`,
+  );
+}
+
+function validateCurrentResponseGeneratedItemOwnership(
+  stateJson: z.infer<typeof SerializedRunState>,
+  ownership: CurrentResponseGeneratedItemOwnership,
+): void {
+  // Validate only serialized values here, before tool rehydration or caller-owned context work.
+  // Deserialized object identity is restored only after the complete terminal boundary is proven.
+  const processedItems = stateJson.lastProcessedResponse?.newItems;
+  const serializedInterruptions =
+    stateJson.currentStep?.type === 'next_step_interruption' &&
+    Array.isArray(stateJson.currentStep.data?.interruptions)
+      ? stateJson.currentStep.data.interruptions
+      : undefined;
+  const generatedEnd = ownership.generatedItemEndIndexExclusive;
+  const processedEnd =
+    ownership.generatedItemStartIndex + (processedItems?.length ?? 0);
+  if (
+    !processedItems ||
+    processedItems.length === 0 ||
+    !serializedInterruptions ||
+    serializedInterruptions.length === 0 ||
+    !stateJson.lastModelResponse ||
+    stateJson.modelResponses.length === 0 ||
+    generatedEnd !== stateJson.generatedItems.length ||
+    ownership.generatedItemStartIndex >= generatedEnd ||
+    processedEnd > generatedEnd ||
+    ownership.interruptionGeneratedItemIndexes.length !==
+      serializedInterruptions.length ||
+    ownership.toolOutputGuardrailResultStartIndex >
+      stateJson.toolOutputGuardrailResults.length ||
+    !serializedValuesEqual(
+      stateJson.lastModelResponse,
+      stateJson.modelResponses.at(-1),
+    )
+  ) {
+    throwCurrentResponseOwnershipError();
+  }
+  for (const [offset, processedItem] of processedItems.entries()) {
+    if (
+      !serializedValuesEqual(
+        processedItem,
+        stateJson.generatedItems[ownership.generatedItemStartIndex + offset],
+      )
+    ) {
+      throwCurrentResponseOwnershipError();
+    }
+  }
+  const interruptionIndexes = new Set<number>();
+  for (const [
+    offset,
+    interruptionIndex,
+  ] of ownership.interruptionGeneratedItemIndexes.entries()) {
+    const parsedInterruption = itemSchema.safeParse(
+      serializedInterruptions[offset],
+    );
+    const mismatch = !serializedValuesEqual(
+      parsedInterruption.success ? parsedInterruption.data : undefined,
+      stateJson.generatedItems[interruptionIndex],
+    );
+    if (
+      !parsedInterruption.success ||
+      parsedInterruption.data.type !== 'tool_approval_item' ||
+      interruptionIndexes.has(interruptionIndex) ||
+      interruptionIndex < processedEnd ||
+      interruptionIndex >= generatedEnd ||
+      (offset > 0 &&
+        interruptionIndex <=
+          ownership.interruptionGeneratedItemIndexes[offset - 1]) ||
+      mismatch
+    ) {
+      throwCurrentResponseOwnershipError(
+        mismatch ? 'interruption content mismatch' : 'interruption index error',
+      );
+    }
+    interruptionIndexes.add(interruptionIndex);
+  }
+  const unownedApproval = stateJson.generatedItems
+    .slice(processedEnd, generatedEnd)
+    .some(
+      (item, offset) =>
+        item.type === 'tool_approval_item' &&
+        !interruptionIndexes.has(processedEnd + offset),
+    );
+  if (unownedApproval) {
+    throwCurrentResponseOwnershipError();
+  }
+}
 
 export type FinalOutputSource =
   'error_handler' | 'turn_resolution' | 'tool_result';
@@ -1987,6 +2413,10 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
    */
   public _currentTurnPersistedItemCount: number;
   /**
+   * Persisted-item count whose resumed-write recovery input compaction has settled.
+   */
+  public _currentTurnSessionWriteCompactedItemCount: number | undefined;
+  /**
    * Current-turn item indexes intentionally deferred when a blocked output persisted only a
    * replay-safe subset. A later accepted resume replaces the sparse suffix in original order.
    */
@@ -2030,6 +2460,15 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
    */
   public _pendingSessionHistoryTransaction:
     PendingSessionHistoryTransaction | undefined;
+  /**
+   * Ordinary Session append whose outcome must be reconciled before another resumed model call.
+   */
+  public _pendingSessionWrite: PendingSessionWrite | undefined;
+  /**
+   * Prevents two live resume attempts from executing or reconciling the same resumed Session
+   * append concurrently.
+   */
+  public _resumedSessionWriteInProgress: boolean;
   /**
    * Compaction marker and persisted suffix that an ordinary session must reconcile once after a
    * pre-1.16 snapshot is restored. The field remains serialized until reconciliation succeeds.
@@ -2118,6 +2557,7 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
     this._ambiguousToolInvocationCallIds = new Map();
     this._generatedItems = [];
     this._currentTurnPersistedItemCount = 0;
+    this._currentTurnSessionWriteCompactedItemCount = undefined;
     this._currentTurnDeferredSessionItemIndexes = new Set();
     this._currentTurnBlockedSessionStartIndex = undefined;
     this._currentTurnSessionHistoryTransactionSessionId = undefined;
@@ -2128,6 +2568,8 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
     this._serializedCurrentStep = undefined;
     this._sessionHistoryTransactionId = randomUUID();
     this._pendingSessionHistoryTransaction = undefined;
+    this._pendingSessionWrite = undefined;
+    this._resumedSessionWriteInProgress = false;
     this._pendingLegacyCompactionSessionItems = undefined;
     this._maxTurns = maxTurns;
     this._inputGuardrailResults = [];
@@ -2255,6 +2697,29 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
       if (!evidence) {
         return;
       }
+      // Preserve the execution-time owner when resuming older pending calls that
+      // predate call-item identity metadata. Observed invocations are runtime-only.
+      const toolName = getToolInvocationNameFromFingerprint(fingerprint);
+      for (const candidate of evidenceCandidates) {
+        if (
+          toolName !== undefined &&
+          candidate instanceof RunToolCallItem &&
+          candidate.functionToolStateKey === undefined &&
+          candidate.agent === agent &&
+          candidate.rawItem.type === 'function_call' &&
+          candidate.rawItem.callId === callId &&
+          !getToolCallNamespace(candidate.rawItem) &&
+          toolName ===
+            getFunctionToolLookupKey(
+              candidate.rawItem.name,
+              candidate.rawItem.name,
+            ) &&
+          getToolInvocationFingerprint(toolName, candidate.rawItem) ===
+            fingerprint
+        ) {
+          candidate.functionToolStateKey = toolName;
+        }
+      }
       getAgentInvocationMap(this._completedToolInvocations, agent).set(
         callId,
         fingerprint,
@@ -2317,6 +2782,43 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
    */
   _replaceGeneratedItems(generatedItems: RunItem[]): void {
     this._generatedItems = generatedItems;
+  }
+
+  /** @internal Captures an input view without retaining mutable filter-owned items. */
+  _captureHandoffInput(
+    originalInput: string | AgentInputItem[],
+    generatedItems: RunItem[],
+  ): NonNullable<PendingSessionWrite['handoffInput']> {
+    const identities = buildAgentIdentityMap(this.#startingAgent);
+    return structuredClone(
+      handoffInputSnapshotSchema.parse({
+        originalInput,
+        generatedItems: generatedItems.map((item) =>
+          serializeRunItem(item, identities.byAgent),
+        ),
+      }),
+    );
+  }
+
+  /** @internal Reuses ordinary RunState item reconstruction for the accepted input view. */
+  _deserializeHandoffInput(
+    input: NonNullable<PendingSessionWrite['handoffInput']>,
+  ): { originalInput: string | AgentInputItem[]; generatedItems: RunItem[] } {
+    const identities = buildAgentIdentityMap(this.#startingAgent);
+    return {
+      originalInput: structuredClone(input.originalInput),
+      generatedItems: input.generatedItems.map((item) =>
+        deserializeItem(item, identities.byIdentity),
+      ),
+    };
+  }
+
+  /** @internal Resolves discovery ownership within the complete starting Agent graph. */
+  _getToolSearchAgentName(agent: Agent<any, any>): string | undefined {
+    return getToolSearchAgentName(
+      agent,
+      buildAgentIdentityMap(this.#startingAgent).byAgent.keys(),
+    );
   }
 
   private getOrCreateToolSearchRuntimeToolState(
@@ -2426,6 +2928,7 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
    */
   public resetTurnPersistence(): void {
     this._currentTurnPersistedItemCount = 0;
+    this._currentTurnSessionWriteCompactedItemCount = undefined;
     this._currentTurnDeferredSessionItemIndexes.clear();
   }
 
@@ -2440,6 +2943,12 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
       0,
       this._currentTurnPersistedItemCount - count,
     );
+    if (
+      this._currentTurnSessionWriteCompactedItemCount !==
+      this._currentTurnPersistedItemCount
+    ) {
+      this._currentTurnSessionWriteCompactedItemCount = undefined;
+    }
   }
 
   /**
@@ -2769,6 +3278,8 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
 
     const includeTracingApiKey = options.includeTracingApiKey === true;
     const contextJson = this._context._toJSONForRunState(agentIdentity.byAgent);
+    const currentResponseGeneratedItemOwnership =
+      captureCurrentResponseGeneratedItemOwnership(this);
     const output = {
       $schemaVersion: CURRENT_SCHEMA_VERSION,
       currentTurn: this._currentTurn,
@@ -2833,6 +3344,7 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
       generatedItems: this._generatedItems.map(
         (item) => serializeRunItem(item, agentIdentity.byAgent) as any,
       ),
+      currentResponseGeneratedItemOwnership,
       pendingAgentToolRuns: Object.fromEntries(
         this._pendingAgentToolRuns.entries(),
       ),
@@ -2853,6 +3365,8 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
         agentIdentity.byAgent,
       ),
       currentTurnPersistedItemCount: this._currentTurnPersistedItemCount,
+      currentTurnSessionWriteCompactedItemCount:
+        this._currentTurnSessionWriteCompactedItemCount,
       currentTurnDeferredSessionItemIndexes:
         this._currentTurnDeferredSessionItemIndexes.size > 0
           ? [...this._currentTurnDeferredSessionItemIndexes].sort(
@@ -2870,7 +3384,8 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
           ? true
           : undefined,
       currentTurnSessionInputItems:
-        this._currentTurnSessionHistoryTransactionSessionId === undefined &&
+        (this._pendingSessionWrite !== undefined ||
+          this._currentTurnSessionHistoryTransactionSessionId === undefined) &&
         this._currentTurnSessionHistoryTransactionInputItems !== undefined &&
         this._currentTurnSessionHistoryTransactionInputItems.length > 0 &&
         hasBlockedOutputExecutionEffect(
@@ -2880,6 +3395,9 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
           ? this._currentTurnSessionHistoryTransactionInputItems
           : undefined,
       pendingSessionHistoryTransaction: this._pendingSessionHistoryTransaction,
+      pendingSessionWrite: this._pendingSessionWrite
+        ? structuredClone(this._pendingSessionWrite)
+        : undefined,
       pendingLegacyCompactionSessionItems:
         this._pendingLegacyCompactionSessionItems,
       lastProcessedResponse: this._lastProcessedResponse
@@ -2982,6 +3500,14 @@ async function buildRunStateFromString<
     jsonResult !== null &&
     typeof jsonResult === 'object' &&
     hasOwnProperty(jsonResult, 'pendingInput');
+  const hasPendingSessionWriteField =
+    jsonResult !== null &&
+    typeof jsonResult === 'object' &&
+    hasOwnProperty(jsonResult, 'pendingSessionWrite');
+  const hasSessionWriteCompactedItemCountField =
+    jsonResult !== null &&
+    typeof jsonResult === 'object' &&
+    hasOwnProperty(jsonResult, 'currentTurnSessionWriteCompactedItemCount');
   const stateJson = SerializedRunState.parse(jsonResult);
   assertSchemaVersionSupportsStructuredToolOutputs(
     currentSchemaVersion as SupportedSchemaVersion,
@@ -3011,15 +3537,27 @@ async function buildRunStateFromString<
     currentSchemaVersion as SupportedSchemaVersion,
     stateJson,
   );
+  assertSchemaVersionSupportsCurrentResponseGeneratedItemOwnership(
+    currentSchemaVersion as SupportedSchemaVersion,
+    stateJson,
+  );
+  assertSchemaVersionSupportsPendingSessionWrite(
+    currentSchemaVersion as SupportedSchemaVersion,
+    stateJson,
+    hasPendingSessionWriteField,
+    hasSessionWriteCompactedItemCountField,
+  );
   assertSchemaVersionSupportsPendingInput(
     currentSchemaVersion as SupportedSchemaVersion,
     stateJson,
     hasPendingInputField,
   );
-  const normalizedState = rehydrateLegacyCompactionRunItems(
-    currentSchemaVersion as SupportedSchemaVersion,
-    stateJson,
-  );
+  const normalizedState: ReturnType<typeof rehydrateLegacyCompactionRunItems> =
+    schemaVersionSupportsV116State(
+      currentSchemaVersion as SupportedSchemaVersion,
+    )
+      ? { stateJson }
+      : rehydrateLegacyCompactionRunItems(stateJson);
   const state = await buildRunStateFromJson(
     initialAgent,
     normalizedState.stateJson,
@@ -3309,6 +3847,452 @@ function assertSchemaVersionSupportsOutputGuardrailSessionPersistence(
   );
 }
 
+function assertSchemaVersionSupportsCurrentResponseGeneratedItemOwnership(
+  schemaVersion: SupportedSchemaVersion,
+  stateJson: z.infer<typeof SerializedRunState>,
+): void {
+  const ownership = stateJson.currentResponseGeneratedItemOwnership;
+  if (ownership === undefined) {
+    return;
+  }
+  if (!schemaVersionSupportsV120State(schemaVersion)) {
+    throw new UserError(
+      `Run state schema version ${schemaVersion} does not support current-response generated-item ownership. Please reserialize the run state with schema ${CURRENT_SCHEMA_VERSION}.`,
+    );
+  }
+  validateCurrentResponseGeneratedItemOwnership(stateJson, ownership);
+}
+
+function assertSchemaVersionSupportsPendingSessionWrite(
+  schemaVersion: SupportedSchemaVersion,
+  stateJson: z.infer<typeof SerializedRunState>,
+  hasPendingSessionWriteField: boolean,
+  hasSessionWriteCompactedItemCountField: boolean,
+): void {
+  if (!schemaVersionSupportsV120State(schemaVersion)) {
+    if (
+      !hasPendingSessionWriteField &&
+      !hasSessionWriteCompactedItemCountField
+    ) {
+      return;
+    }
+    throw new UserError(
+      `Run state schema version ${schemaVersion} does not support pending Session writes. Please reserialize the run state with schema ${CURRENT_SCHEMA_VERSION}.`,
+    );
+  }
+
+  const pending = stateJson.pendingSessionWrite;
+  const compactedItemCount =
+    stateJson.currentTurnSessionWriteCompactedItemCount;
+  const persistedItemCount = stateJson.currentTurnPersistedItemCount ?? 0;
+  if (
+    compactedItemCount !== undefined &&
+    (pending !== undefined ||
+      compactedItemCount !== persistedItemCount ||
+      (stateJson.currentStep?.type !== 'next_step_run_again' &&
+        stateJson.currentStep?.type !== 'next_step_interruption' &&
+        stateJson.currentStep?.type !== 'next_step_final_output'))
+  ) {
+    throw new UserError(
+      'RunState resumed Session write compaction marker is invalid.',
+    );
+  }
+  if (pending === undefined) {
+    return;
+  }
+  const alreadyPersistedCount = persistedItemCount;
+  const terminalFinalization = pending.terminalToolFinalization;
+  const terminalStep = stateJson.currentStep?.type === 'next_step_final_output';
+  const terminalFinalizationShapeIsInvalid = terminalFinalization
+    ? terminalFinalization.behavior === 'function'
+      ? terminalFinalization.selectedCallId !== undefined ||
+        terminalFinalization.selectedGeneratedItemIndex !== undefined
+      : terminalFinalization.selectedCallId === undefined ||
+        terminalFinalization.selectedGeneratedItemIndex === undefined
+    : terminalStep;
+  const pendingCompaction = pending.phase === 'compaction_pending';
+  const expectedPersistedItemCount = pendingCompaction
+    ? pending.persistedItemCount
+    : pending.alreadyPersistedCount;
+  if (
+    (stateJson.currentStep?.type !== 'next_step_run_again' &&
+      stateJson.currentStep?.type !== 'next_step_interruption' &&
+      stateJson.currentStep?.type !== 'next_step_final_output') ||
+    terminalStep !== (terminalFinalization !== undefined) ||
+    terminalFinalizationShapeIsInvalid ||
+    expectedPersistedItemCount !== alreadyPersistedCount ||
+    pending.persistedItemCount <= pending.alreadyPersistedCount ||
+    pending.persistedItemCount !== stateJson.generatedItems.length ||
+    stateJson.pendingSessionHistoryTransaction !== undefined ||
+    stateJson.pendingLegacyCompactionSessionItems !== undefined ||
+    (stateJson.currentTurnDeferredSessionItemIndexes?.length ?? 0) > 0 ||
+    stateJson.currentTurnBlockedSessionStartIndex !== undefined ||
+    (pendingCompaction &&
+      (stateJson.currentTurnExecutedWithSessionBinding !== undefined ||
+        stateJson.currentTurnSessionInputItems !== undefined)) ||
+    (stateJson.currentTurnSessionInputItems !== undefined &&
+      stateJson.currentTurnExecutedWithSessionBinding !== true) ||
+    stateJson.conversationId !== undefined ||
+    stateJson.previousResponseId !== undefined
+  ) {
+    throw new UserError('RunState pending Session write is invalid.');
+  }
+}
+
+export function assertPendingSessionWriteOwnership(
+  state: RunState<any, any>,
+  pending: PendingSessionWrite,
+  options: { allowUnhydratedTerminalToolStep?: boolean } = {},
+): void {
+  const pendingCompaction = pending.phase === 'compaction_pending';
+  const ownsTerminalToolFinalization =
+    state._currentStep?.type === 'next_step_final_output' &&
+    ownsPendingTerminalToolFinalization(state, pending, options);
+  if (
+    (state._currentStep?.type !== 'next_step_run_again' &&
+      state._currentStep?.type !== 'next_step_interruption' &&
+      !ownsTerminalToolFinalization) ||
+    state._currentTurnPersistedItemCount !==
+      (pendingCompaction
+        ? pending.persistedItemCount
+        : pending.alreadyPersistedCount) ||
+    pending.persistedItemCount <= pending.alreadyPersistedCount ||
+    pending.persistedItemCount !== state._generatedItems.length ||
+    state._currentTurnSessionWriteCompactedItemCount !== undefined ||
+    state._pendingSessionHistoryTransaction !== undefined ||
+    state._pendingLegacyCompactionSessionItems !== undefined ||
+    state._currentTurnDeferredSessionItemIndexes.size > 0 ||
+    state._currentTurnBlockedSessionStartIndex !== undefined ||
+    (pendingCompaction &&
+      (state._currentTurnSessionHistoryTransactionSessionId !== undefined ||
+        state._currentTurnSessionHistoryTransactionInputItems !== undefined)) ||
+    state._conversationId !== undefined ||
+    state._previousResponseId !== undefined
+  ) {
+    throw new UserError('RunState pending Session write is invalid.');
+  }
+
+  getPendingSessionWriteAppendItems(state, pending);
+  if (pending.handoffInput) {
+    if (
+      state._currentStep?.type !== 'next_step_run_again' ||
+      !state._noActiveAgentRun ||
+      state._currentTurnInProgress ||
+      !state._generatedItems.some(
+        (item) =>
+          item instanceof RunHandoffOutputItem &&
+          item.targetAgent === state._currentAgent,
+      )
+    ) {
+      throw new UserError('RunState pending handoff input is invalid.');
+    }
+    state._deserializeHandoffInput(pending.handoffInput);
+  }
+}
+
+function getPendingSessionWriteBehaviorKind(
+  behavior: ToolUseBehavior,
+):
+  | NonNullable<PendingSessionWrite['terminalToolFinalization']>['behavior']
+  | undefined {
+  if (behavior === 'stop_on_first_tool') {
+    return 'stop_on_first_tool';
+  }
+  if (typeof behavior === 'object') {
+    return 'stop_at_tool_names';
+  }
+  if (typeof behavior === 'function') {
+    return 'function';
+  }
+  return undefined;
+}
+
+/** @internal */
+export function assertPendingSessionCompactionTerminalAuthority(
+  state: RunState<any, any>,
+): void {
+  const currentStep = state._currentStep;
+  if (currentStep?.type !== 'next_step_final_output') {
+    return;
+  }
+
+  const behavior = state._currentAgent.toolUseBehavior;
+  const producer = pendingSessionWriteTerminalProducers.get(state);
+  if (
+    producer !== undefined &&
+    getPendingSessionWriteBehaviorKind(producer.behavior) !==
+      getPendingSessionWriteBehaviorKind(behavior)
+  ) {
+    throw new UserError(
+      'RunState pending Session compaction terminal output is invalid.',
+    );
+  }
+  if (typeof behavior !== 'function') {
+    if (!hasDeterministicTerminalToolOutputSource(state)) {
+      throw new UserError(
+        'RunState pending Session compaction terminal output is invalid.',
+      );
+    }
+    return;
+  }
+
+  const completedInvocations = state._completedToolInvocationEvidence.get(
+    state._currentAgent,
+  );
+  const validProducer =
+    producer !== undefined &&
+    producer.behavior === behavior &&
+    producer.finalOutput === currentStep.output &&
+    producer.selectedCallId === undefined &&
+    producer.resultItems.length > 0 &&
+    producer.resultItems.length === producer.resultCallIds.length &&
+    producer.resultItems.every((item, index) => {
+      const callId = producer.resultCallIds[index];
+      const generatedItemIndex = state._generatedItems.indexOf(item);
+      return (
+        callId !== undefined &&
+        generatedItemIndex >= 0 &&
+        generatedItemIndex < state._currentTurnPersistedItemCount &&
+        getCompletionOutputCallId(item, state._currentAgent) === callId &&
+        completedInvocations?.get(callId)?.items[1] === item
+      );
+    });
+  if (!validProducer) {
+    throw new UserError(
+      'RunState pending Session compaction terminal output is invalid.',
+    );
+  }
+}
+
+export function capturePendingSessionWriteTerminalFinalization(
+  state: RunState<any, any>,
+): PendingSessionWrite['terminalToolFinalization'] {
+  const producer = pendingSessionWriteTerminalProducers.get(state);
+  if (!producer || state._currentStep?.type !== 'next_step_final_output') {
+    return undefined;
+  }
+  const behavior = getPendingSessionWriteBehaviorKind(producer.behavior);
+  if (!behavior) {
+    return undefined;
+  }
+  const selectedResultIndex = producer.selectedCallId
+    ? producer.resultCallIds.indexOf(producer.selectedCallId)
+    : -1;
+  const selectedGeneratedItemIndex =
+    selectedResultIndex >= 0
+      ? state._generatedItems.indexOf(
+          producer.resultItems[selectedResultIndex]!,
+        )
+      : undefined;
+  if (
+    behavior !== 'function' &&
+    (selectedGeneratedItemIndex === undefined || selectedGeneratedItemIndex < 0)
+  ) {
+    return undefined;
+  }
+  return {
+    behavior,
+    selectedCallId: producer.selectedCallId,
+    selectedGeneratedItemIndex,
+    finalOutput: producer.finalOutput,
+  };
+}
+
+type PendingDeclarativeTerminalCandidate = {
+  callId: string;
+  completionEvidence: ToolInvocationCompletionEvidence;
+  outputItem: RunToolCallOutputItem;
+};
+
+function getPendingDeclarativeTerminalCandidate(
+  state: RunState<any, any>,
+  item: RunItem,
+  completedInvocations:
+    Map<string, ToolInvocationCompletionEvidence> | undefined,
+): PendingDeclarativeTerminalCandidate | undefined {
+  if (
+    !(item instanceof RunToolCallOutputItem) ||
+    item.agent !== state._currentAgent ||
+    item.rawItem.type !== 'function_call_result' ||
+    item.rawItem.status === 'incomplete' ||
+    getCanonicalToolCaller(item.rawItem).type === 'program'
+  ) {
+    return undefined;
+  }
+  const callId = getCompletionOutputCallId(item, state._currentAgent);
+  const completionEvidence = callId
+    ? completedInvocations?.get(callId)
+    : undefined;
+  if (!callId || !completionEvidence || completionEvidence.items[1] !== item) {
+    return undefined;
+  }
+  return { callId, completionEvidence, outputItem: item };
+}
+
+function selectPendingDeclarativeTerminalCandidate(
+  behavior: ToolUseBehavior,
+  candidates: readonly PendingDeclarativeTerminalCandidate[],
+): PendingDeclarativeTerminalCandidate | undefined {
+  if (behavior === 'stop_on_first_tool') {
+    return candidates[0];
+  }
+  if (typeof behavior !== 'object') {
+    return undefined;
+  }
+  return candidates.find(({ completionEvidence }) => {
+    const callItem = completionEvidence.items[0];
+    if (
+      (!(callItem instanceof RunToolCallItem) &&
+        !(callItem instanceof RunToolApprovalItem)) ||
+      callItem.rawItem.type !== 'function_call'
+    ) {
+      return false;
+    }
+    const invocationName = getToolInvocationNameFromFingerprint(
+      completionEvidence.fingerprint,
+    );
+    const qualifiedName = invocationName
+      ? getFunctionToolLegacyStateKeyFromStateKey(invocationName)
+      : undefined;
+    const callName = getToolCallName(callItem.rawItem);
+    return behavior.stopAtToolNames.some(
+      (toolName: string) => toolName === callName || toolName === qualifiedName,
+    );
+  });
+}
+
+function ownsPendingTerminalToolFinalization(
+  state: RunState<any, any>,
+  pending: PendingSessionWrite,
+  options: { allowUnhydratedTerminalToolStep?: boolean },
+): boolean {
+  const provenance = pending.terminalToolFinalization;
+  const currentStep = state._currentStep;
+  if (
+    !provenance ||
+    (provenance.behavior === 'function' &&
+      options.allowUnhydratedTerminalToolStep === true) ||
+    currentStep?.type !== 'next_step_final_output' ||
+    currentStep.output !== provenance.finalOutput ||
+    getPendingSessionWriteBehaviorKind(state._currentAgent.toolUseBehavior) !==
+      provenance.behavior ||
+    (options.allowUnhydratedTerminalToolStep !== true &&
+      !hasTerminalToolOutputSource(state))
+  ) {
+    return false;
+  }
+
+  const completedInvocations = state._completedToolInvocationEvidence.get(
+    state._currentAgent,
+  );
+  const pendingGeneratedItems = state._generatedItems.slice(
+    pending.alreadyPersistedCount,
+    pending.persistedItemCount,
+  );
+  if (
+    pendingGeneratedItems.some((item) => {
+      const callId = getCompletionOutputCallId(item, state._currentAgent);
+      const completionEvidence = callId
+        ? completedInvocations?.get(callId)
+        : undefined;
+      return (
+        completionEvidence !== undefined && completionEvidence.items[1] !== item
+      );
+    })
+  ) {
+    return false;
+  }
+  const liveProducer =
+    options.allowUnhydratedTerminalToolStep === true
+      ? undefined
+      : pendingSessionWriteTerminalProducers.get(state);
+  if (provenance.behavior === 'function') {
+    return Boolean(
+      liveProducer &&
+      liveProducer.behavior === state._currentAgent.toolUseBehavior &&
+      liveProducer.finalOutput === provenance.finalOutput &&
+      liveProducer.selectedCallId === undefined &&
+      liveProducer.resultItems.length > 0 &&
+      liveProducer.resultItems.every((item, index) => {
+        const generatedItemIndex = state._generatedItems.indexOf(item);
+        const callId = liveProducer.resultCallIds[index];
+        return (
+          callId !== undefined &&
+          generatedItemIndex >= pending.alreadyPersistedCount &&
+          generatedItemIndex < pending.persistedItemCount &&
+          completedInvocations?.has(callId)
+        );
+      }),
+    );
+  }
+
+  const selectedCallId = provenance.selectedCallId;
+  const selectedGeneratedItemIndex = provenance.selectedGeneratedItemIndex;
+  if (
+    !selectedCallId ||
+    selectedGeneratedItemIndex === undefined ||
+    selectedGeneratedItemIndex < pending.alreadyPersistedCount ||
+    selectedGeneratedItemIndex >= pending.persistedItemCount
+  ) {
+    return false;
+  }
+  const selectedOutput = state._generatedItems[selectedGeneratedItemIndex];
+  const completionEvidence = completedInvocations?.get(selectedCallId);
+  if (
+    !(selectedOutput instanceof RunToolCallOutputItem) ||
+    getCompletionOutputCallId(selectedOutput, state._currentAgent) !==
+      selectedCallId ||
+    !completionEvidence ||
+    toSmartString(selectedOutput.output) !== provenance.finalOutput
+  ) {
+    return false;
+  }
+  const currentBehavior = state._currentAgent.toolUseBehavior;
+  if (
+    liveProducer &&
+    liveProducer.finalOutput === provenance.finalOutput &&
+    liveProducer.selectedCallId === selectedCallId
+  ) {
+    const liveCandidates = liveProducer.resultItems.map((item, index) => {
+      const candidate = getPendingDeclarativeTerminalCandidate(
+        state,
+        item,
+        completedInvocations,
+      );
+      const generatedItemIndex = state._generatedItems.indexOf(item);
+      return candidate &&
+        liveProducer.resultCallIds[index] === candidate.callId &&
+        generatedItemIndex >= pending.alreadyPersistedCount &&
+        generatedItemIndex < pending.persistedItemCount
+        ? candidate
+        : undefined;
+    });
+    if (liveCandidates.every((candidate) => candidate !== undefined)) {
+      return (
+        selectPendingDeclarativeTerminalCandidate(
+          currentBehavior,
+          liveCandidates,
+        )?.outputItem === selectedOutput
+      );
+    }
+  }
+
+  const restoredCandidates = pendingGeneratedItems.flatMap((item) => {
+    const candidate = getPendingDeclarativeTerminalCandidate(
+      state,
+      item,
+      completedInvocations,
+    );
+    return candidate ? [candidate] : [];
+  });
+  return (
+    selectPendingDeclarativeTerminalCandidate(
+      currentBehavior,
+      restoredCandidates,
+    )?.outputItem === selectedOutput
+  );
+}
+
 function assertSchemaVersionSupportsPendingInput(
   schemaVersion: SupportedSchemaVersion,
   stateJson: z.infer<typeof SerializedRunState>,
@@ -3404,7 +4388,8 @@ function validateOutputGuardrailSessionPersistenceState(
   if (
     deferredIndexes.length > 0 ||
     stateJson.currentTurnBlockedSessionStartIndex !== undefined ||
-    stateJson.currentTurnExecutedWithSessionBinding === true ||
+    (stateJson.currentTurnExecutedWithSessionBinding === true &&
+      stateJson.pendingSessionWrite === undefined) ||
     stateJson.pendingSessionHistoryTransaction !== undefined
   ) {
     throw new UserError(
@@ -3449,732 +4434,6 @@ function containsCompactionRunItems(
   items: z.infer<typeof itemSchema>[] | undefined,
 ): boolean {
   return Boolean(items?.some((item) => item.type === 'compaction_item'));
-}
-
-function getCompactionSourceResponses(
-  stateJson: z.infer<typeof SerializedRunState>,
-): z.infer<typeof modelResponseSchema>[] {
-  return stateJson.modelResponses.length > 0
-    ? stateJson.modelResponses
-    : stateJson.lastModelResponse
-      ? [stateJson.lastModelResponse]
-      : [];
-}
-
-function findLatestCompactionSource(
-  stateJson: z.infer<typeof SerializedRunState>,
-):
-  | {
-      sourceResponses: z.infer<typeof modelResponseSchema>[];
-      responseIndex: number;
-      itemIndex: number;
-      item: protocol.CompactionItem;
-    }
-  | undefined {
-  const sourceResponses = getCompactionSourceResponses(stateJson);
-  for (
-    let responseIndex = sourceResponses.length - 1;
-    responseIndex >= 0;
-    responseIndex -= 1
-  ) {
-    const output = sourceResponses[responseIndex].output;
-    for (let itemIndex = output.length - 1; itemIndex >= 0; itemIndex -= 1) {
-      const item = output[itemIndex];
-      if (item.type === 'compaction') {
-        return { sourceResponses, responseIndex, itemIndex, item };
-      }
-    }
-  }
-  return undefined;
-}
-
-/**
- * Older writers kept raw compaction output but dropped its RunItem wrapper. Restore the latest
- * marker before resuming because it carries the context required for the next model window.
- */
-type LegacyCompactionRehydration = {
-  stateJson: z.infer<typeof SerializedRunState>;
-  sessionReconciliation?: {
-    generatedInsertionIndex: number;
-    previousPersistedItemCount: number;
-  };
-};
-
-function rehydrateLegacyCompactionRunItems(
-  schemaVersion: SupportedSchemaVersion,
-  stateJson: z.infer<typeof SerializedRunState>,
-): LegacyCompactionRehydration {
-  if (schemaVersionSupportsV116State(schemaVersion)) {
-    return { stateJson };
-  }
-
-  const latestCompaction = findLatestCompactionSource(stateJson);
-  if (!latestCompaction) {
-    return { stateJson };
-  }
-
-  const {
-    sourceResponses,
-    responseIndex: sourceResponseIndex,
-    itemIndex: compactionIndex,
-    item: compactionItem,
-  } = latestCompaction;
-  const sourceResponse = sourceResponses[sourceResponseIndex];
-  const isLatestSourceResponse =
-    sourceResponseIndex === sourceResponses.length - 1;
-  const processedItems = isLatestSourceResponse
-    ? stateJson.lastProcessedResponse?.newItems
-    : undefined;
-  const optionalLatestFunctionCallIndices =
-    getOmittedLegacyHandoffFunctionCallIndices(
-      sourceResponses.at(-1)?.output ?? [],
-      stateJson.lastProcessedResponse,
-    );
-  const processedInsertion = processedItems
-    ? findLegacyCompactionInsertionIndex(
-        processedItems,
-        sourceResponse.output,
-        compactionIndex,
-        optionalLatestFunctionCallIndices,
-      )
-    : undefined;
-  let generatedInsertionAgent: SerializedAgentReference | undefined;
-  let generatedInsertionIndex: number;
-  if (!isLatestSourceResponse) {
-    const followingResponseBoundary = stateJson.lastProcessedResponse
-      ? findFollowingLegacyResponsesBoundary(
-          stateJson.generatedItems,
-          stateJson.lastProcessedResponse.newItems,
-          sourceResponses
-            .slice(sourceResponseIndex + 1)
-            .map((response) => response.output),
-          optionalLatestFunctionCallIndices,
-        )
-      : undefined;
-    if (!followingResponseBoundary) {
-      throwLegacyCompactionOrderingError();
-    }
-    const historicalInsertion = findHistoricalLegacyCompactionInsertion(
-      stateJson.generatedItems.slice(0, followingResponseBoundary.itemIndex),
-      sourceResponse.output,
-      compactionIndex,
-      followingResponseBoundary,
-      sourceResponseIndex > 0,
-    );
-    generatedInsertionIndex = historicalInsertion.itemIndex;
-    generatedInsertionAgent = historicalInsertion.agent;
-  } else if (processedItems !== undefined) {
-    const segmentStart = findTrailingProcessedSegmentStart(
-      stateJson.generatedItems,
-      processedItems,
-    );
-    if (segmentStart === undefined) {
-      throwLegacyCompactionOrderingError();
-    }
-    const generatedInsertion = findLegacyCompactionInsertionIndex(
-      stateJson.generatedItems.slice(segmentStart),
-      sourceResponse.output,
-      compactionIndex,
-      optionalLatestFunctionCallIndices,
-    );
-    generatedInsertionIndex = segmentStart + generatedInsertion.itemIndex;
-    generatedInsertionAgent = generatedInsertion.agent;
-  } else {
-    const generatedInsertion = findLegacyCompactionInsertionIndex(
-      stateJson.generatedItems,
-      sourceResponse.output,
-      compactionIndex,
-    );
-    generatedInsertionIndex = generatedInsertion.itemIndex;
-    generatedInsertionAgent = generatedInsertion.agent;
-  }
-
-  const serializedCompactionAgent =
-    processedInsertion?.agent ??
-    generatedInsertionAgent ??
-    stateJson.currentAgent;
-  if (
-    processedInsertion?.agent &&
-    generatedInsertionAgent &&
-    getCanonicalLegacyCompactionKey(processedInsertion.agent) !==
-      getCanonicalLegacyCompactionKey(generatedInsertionAgent)
-  ) {
-    throwLegacyCompactionOrderingError();
-  }
-
-  const serializedCompactionItem = {
-    type: 'compaction_item' as const,
-    rawItem: compactionItem,
-    agent: serializedCompactionAgent,
-  };
-
-  const previousPersistedItemCount =
-    stateJson.currentTurnPersistedItemCount ?? 0;
-  return {
-    stateJson: {
-      ...stateJson,
-      generatedItems: [
-        ...stateJson.generatedItems.slice(0, generatedInsertionIndex),
-        serializedCompactionItem,
-        ...stateJson.generatedItems.slice(generatedInsertionIndex),
-      ],
-      ...(processedItems
-        ? {
-            lastProcessedResponse: {
-              ...stateJson.lastProcessedResponse!,
-              newItems: [
-                ...processedItems.slice(0, processedInsertion!.itemIndex),
-                serializedCompactionItem,
-                ...processedItems.slice(processedInsertion!.itemIndex),
-              ],
-            },
-          }
-        : {}),
-    },
-    ...(generatedInsertionIndex < previousPersistedItemCount
-      ? {
-          sessionReconciliation: {
-            generatedInsertionIndex,
-            previousPersistedItemCount,
-          },
-        }
-      : {}),
-  };
-}
-
-function findHistoricalLegacyCompactionInsertion(
-  items: z.infer<typeof itemSchema>[],
-  sourceOutput: protocol.OutputModelItem[],
-  compactionIndex: number,
-  followingResponseBoundary: {
-    itemIndex: number;
-    agent: SerializedAgentReference;
-  },
-  allowEarlierResponseAnchors: boolean,
-): { itemIndex: number; agent: SerializedAgentReference } {
-  const providerAnchors = getLegacyProviderOutputAnchors(items, sourceOutput);
-  const representedSourceItems = getRepresentedLegacySourceItems(
-    sourceOutput,
-    compactionIndex,
-    providerAnchors,
-  );
-  const requiredSourceItems = getRequiredLegacySourceItems(
-    sourceOutput,
-    compactionIndex,
-  );
-  assertRequiredLegacySourceItemsRepresented(
-    requiredSourceItems,
-    representedSourceItems,
-  );
-  if (representedSourceItems.length === 0) {
-    if (!allowEarlierResponseAnchors && providerAnchors.length > 0) {
-      throwLegacyCompactionOrderingError();
-    }
-    return followingResponseBoundary;
-  }
-
-  const matchingStarts: number[] = [];
-  for (
-    let start = 0;
-    start <= providerAnchors.length - representedSourceItems.length;
-    start += 1
-  ) {
-    if (
-      representedSourceItems.every(
-        (sourceItem, offset) =>
-          providerAnchors[start + offset]?.key === sourceItem.key,
-      )
-    ) {
-      matchingStarts.push(start);
-    }
-  }
-  if (matchingStarts.length !== 1) {
-    throwLegacyCompactionOrderingError();
-  }
-
-  const matchedAnchors = providerAnchors.slice(
-    matchingStarts[0],
-    matchingStarts[0] + representedSourceItems.length,
-  );
-  const agent = matchedAnchors[0].agent;
-  const agentKey = getCanonicalLegacyCompactionKey(agent);
-  if (
-    matchedAnchors.some(
-      (anchor) => getCanonicalLegacyCompactionKey(anchor.agent) !== agentKey,
-    )
-  ) {
-    throwLegacyCompactionOrderingError();
-  }
-
-  const followingSourceIndex = representedSourceItems.findIndex(
-    (item) => item.sourceIndex > compactionIndex,
-  );
-  if (followingSourceIndex >= 0) {
-    return {
-      itemIndex: matchedAnchors[followingSourceIndex].itemIndex,
-      agent,
-    };
-  }
-
-  const previousAnchor = matchedAnchors[matchedAnchors.length - 1];
-  let itemIndex = previousAnchor.itemIndex + 1;
-  while (
-    items[itemIndex]?.type === 'tool_approval_item' &&
-    getCanonicalLegacyCompactionKey(items[itemIndex].rawItem) ===
-      previousAnchor.key
-  ) {
-    itemIndex += 1;
-  }
-  return { itemIndex, agent };
-}
-
-function findFollowingLegacyResponseBoundary(
-  generatedItems: z.infer<typeof itemSchema>[],
-  processedItems: z.infer<typeof itemSchema>[],
-  sourceOutput: protocol.OutputModelItem[],
-  optionalFunctionCallIndices: ReadonlySet<number> = new Set(),
-): { itemIndex: number; agent: SerializedAgentReference } | undefined {
-  const itemIndex = findTrailingProcessedSegmentStart(
-    generatedItems,
-    processedItems,
-  );
-  if (itemIndex === undefined) {
-    throwLegacyCompactionOrderingError();
-  }
-  if (
-    getLegacyProviderOutputAnchors(
-      generatedItems.slice(itemIndex + processedItems.length),
-      sourceOutput,
-    ).length > 0
-  ) {
-    throwLegacyCompactionOrderingError();
-  }
-
-  const providerAnchors = getLegacyProviderOutputAnchors(
-    processedItems,
-    sourceOutput,
-  );
-  const representedSourceItems = getRepresentedLegacySourceItems(
-    sourceOutput,
-    -1,
-    providerAnchors,
-    optionalFunctionCallIndices,
-  );
-  assertRequiredLegacySourceItemsRepresented(
-    getRequiredLegacySourceItems(sourceOutput, -1, optionalFunctionCallIndices),
-    representedSourceItems,
-  );
-  if (
-    providerAnchors.length === 0 ||
-    providerAnchors.length !== representedSourceItems.length ||
-    providerAnchors.some(
-      (anchor, index) => anchor.key !== representedSourceItems[index]?.key,
-    )
-  ) {
-    return undefined;
-  }
-
-  const agent = providerAnchors[0].agent;
-  const agentKey = getCanonicalLegacyCompactionKey(agent);
-  if (
-    providerAnchors.some(
-      (anchor) => getCanonicalLegacyCompactionKey(anchor.agent) !== agentKey,
-    )
-  ) {
-    throwLegacyCompactionOrderingError();
-  }
-  return { itemIndex, agent };
-}
-
-function findFollowingLegacyResponsesBoundary(
-  generatedItems: z.infer<typeof itemSchema>[],
-  processedItems: z.infer<typeof itemSchema>[],
-  sourceOutputs: protocol.OutputModelItem[][],
-  optionalLatestFunctionCallIndices: ReadonlySet<number>,
-): { itemIndex: number; agent: SerializedAgentReference } | undefined {
-  const latestSourceOutput = sourceOutputs.at(-1);
-  if (!latestSourceOutput) {
-    return undefined;
-  }
-
-  let boundary = findFollowingLegacyResponseBoundary(
-    generatedItems,
-    processedItems,
-    latestSourceOutput,
-    optionalLatestFunctionCallIndices,
-  );
-  if (!boundary) {
-    return undefined;
-  }
-
-  for (let index = sourceOutputs.length - 2; index >= 0; index -= 1) {
-    boundary = findPrecedingLegacyResponseBoundary(
-      generatedItems,
-      boundary.itemIndex,
-      sourceOutputs[index],
-    );
-  }
-  return boundary;
-}
-
-function findPrecedingLegacyResponseBoundary(
-  generatedItems: z.infer<typeof itemSchema>[],
-  followingBoundaryIndex: number,
-  sourceOutput: protocol.OutputModelItem[],
-): { itemIndex: number; agent: SerializedAgentReference } {
-  const precedingItems = generatedItems.slice(0, followingBoundaryIndex);
-  const providerAnchors = getLegacyProviderOutputAnchors(
-    precedingItems,
-    sourceOutput,
-  );
-  const representedSourceItems = getRepresentedLegacySourceItems(
-    sourceOutput,
-    -1,
-    providerAnchors,
-  );
-  assertRequiredLegacySourceItemsRepresented(
-    getRequiredLegacySourceItems(sourceOutput, -1),
-    representedSourceItems,
-  );
-  if (representedSourceItems.length === 0) {
-    throwLegacyCompactionOrderingError();
-  }
-
-  const matchingStarts: number[] = [];
-  for (
-    let start = 0;
-    start <= providerAnchors.length - representedSourceItems.length;
-    start += 1
-  ) {
-    if (
-      representedSourceItems.every(
-        (sourceItem, offset) =>
-          providerAnchors[start + offset]?.key === sourceItem.key,
-      )
-    ) {
-      matchingStarts.push(start);
-    }
-  }
-  if (matchingStarts.length !== 1) {
-    throwLegacyCompactionOrderingError();
-  }
-
-  const matchingStart = matchingStarts[0];
-  const matchedAnchors = providerAnchors.slice(
-    matchingStart,
-    matchingStart + representedSourceItems.length,
-  );
-  const trailingAnchors = providerAnchors.slice(
-    matchingStart + representedSourceItems.length,
-  );
-  if (
-    trailingAnchors.some(
-      (anchor) =>
-        precedingItems[anchor.itemIndex]?.type !== 'tool_call_output_item',
-    )
-  ) {
-    throwLegacyCompactionOrderingError();
-  }
-
-  const agent = matchedAnchors[0].agent;
-  const agentKey = getCanonicalLegacyCompactionKey(agent);
-  if (
-    matchedAnchors.some(
-      (anchor) => getCanonicalLegacyCompactionKey(anchor.agent) !== agentKey,
-    )
-  ) {
-    throwLegacyCompactionOrderingError();
-  }
-  return { itemIndex: matchedAnchors[0].itemIndex, agent };
-}
-
-function isLegacyProviderOutputRunItem(
-  item: z.infer<typeof itemSchema>,
-): item is z.infer<typeof itemSchema> & { agent: SerializedAgentReference } {
-  return (
-    item.type === 'message_output_item' ||
-    item.type === 'tool_search_call_item' ||
-    item.type === 'tool_search_output_item' ||
-    item.type === 'tool_call_item' ||
-    (item.type === 'tool_call_output_item' &&
-      (item.rawItem.type === 'program_output' ||
-        item.rawItem.type === 'shell_call_output')) ||
-    item.type === 'reasoning_item' ||
-    item.type === 'handoff_call_item'
-  );
-}
-
-function getLegacyProviderOutputAnchors(
-  items: z.infer<typeof itemSchema>[],
-  sourceOutput: protocol.OutputModelItem[],
-): Array<{
-  key: string;
-  itemIndex: number;
-  agent: SerializedAgentReference;
-}> {
-  const sourceOutputKeys = new Set(
-    sourceOutput.map((item) => getLegacyProviderOutputKey(item)),
-  );
-  return items.flatMap((item, itemIndex) => {
-    if (!isLegacyProviderOutputRunItem(item)) {
-      return [];
-    }
-    const key = getLegacyProviderOutputKey(item.rawItem);
-    if (
-      (item.type === 'tool_search_output_item' ||
-        (item.type === 'tool_call_output_item' &&
-          (item.rawItem.type === 'program_output' ||
-            item.rawItem.type === 'shell_call_output'))) &&
-      !sourceOutputKeys.has(key)
-    ) {
-      return [];
-    }
-    return [{ key, itemIndex, agent: item.agent }];
-  });
-}
-
-function getRepresentedLegacySourceItems(
-  sourceOutput: protocol.OutputModelItem[],
-  compactionIndex: number,
-  providerAnchors: Array<{ key: string }>,
-  optionalFunctionCallIndices: ReadonlySet<number> = new Set(),
-): Array<{ key: string; sourceIndex: number }> {
-  if (optionalFunctionCallIndices.size > 0) {
-    let providerAnchorIndex = 0;
-    return sourceOutput.flatMap((item, sourceIndex) => {
-      if (
-        sourceIndex === compactionIndex ||
-        optionalFunctionCallIndices.has(sourceIndex)
-      ) {
-        return [];
-      }
-      const key = getLegacyProviderOutputKey(item);
-      if (providerAnchors[providerAnchorIndex]?.key !== key) {
-        return [];
-      }
-      providerAnchorIndex += 1;
-      return [{ key, sourceIndex }];
-    });
-  }
-
-  const providerKeys = new Set(providerAnchors.map((anchor) => anchor.key));
-  return sourceOutput.flatMap((item, sourceIndex) => {
-    if (sourceIndex === compactionIndex) {
-      return [];
-    }
-    const key = getLegacyProviderOutputKey(item);
-    return providerKeys.has(key) ? [{ key, sourceIndex }] : [];
-  });
-}
-
-function getRequiredLegacySourceItems(
-  sourceOutput: protocol.OutputModelItem[],
-  compactionIndex: number,
-  optionalFunctionCallIndices: ReadonlySet<number> = new Set(),
-): Array<{ key: string; sourceIndex: number }> {
-  return sourceOutput.flatMap((item, sourceIndex) => {
-    const isOmittedHandoff =
-      item.type === 'function_call' &&
-      optionalFunctionCallIndices.has(sourceIndex);
-    if (
-      sourceIndex === compactionIndex ||
-      item.type === 'compaction' ||
-      isOmittedHandoff ||
-      item.type === 'function_call_result' ||
-      item.type === 'apply_patch_call_output' ||
-      item.type === 'unknown'
-    ) {
-      return [];
-    }
-    return [{ key: getLegacyProviderOutputKey(item), sourceIndex }];
-  });
-}
-
-function getOmittedLegacyHandoffFunctionCallIndices(
-  sourceOutput: protocol.OutputModelItem[],
-  processedResponse:
-    z.infer<typeof serializedProcessedResponseSchema> | undefined,
-): ReadonlySet<number> {
-  const matchedIndices: number[] = [];
-  let sourceStartIndex = 0;
-  for (const serializedHandoff of processedResponse?.handoffs ?? []) {
-    const parsedToolCall = protocol.FunctionCallItem.safeParse(
-      serializedHandoff.toolCall,
-    );
-    if (!parsedToolCall.success) {
-      return new Set();
-    }
-    const key = getLegacyProviderOutputKey(parsedToolCall.data);
-    const sourceIndex = sourceOutput.findIndex(
-      (item, index) =>
-        index >= sourceStartIndex &&
-        item.type === 'function_call' &&
-        getLegacyProviderOutputKey(item) === key,
-    );
-    if (sourceIndex < 0) {
-      return new Set();
-    }
-    matchedIndices.push(sourceIndex);
-    sourceStartIndex = sourceIndex + 1;
-  }
-  return new Set(matchedIndices.slice(1));
-}
-
-function assertRequiredLegacySourceItemsRepresented(
-  requiredItems: Array<{ key: string; sourceIndex: number }>,
-  representedItems: Array<{ key: string; sourceIndex: number }>,
-): void {
-  if (!isLegacySourceSubsequenceRepresented(requiredItems, representedItems)) {
-    throwLegacyCompactionOrderingError();
-  }
-}
-
-function isLegacySourceSubsequenceRepresented(
-  requiredItems: Array<{ key: string; sourceIndex: number }>,
-  representedItems: Array<{ key: string; sourceIndex: number }>,
-): boolean {
-  let representedIndex = 0;
-  for (const requiredItem of requiredItems) {
-    while (
-      representedIndex < representedItems.length &&
-      representedItems[representedIndex].sourceIndex < requiredItem.sourceIndex
-    ) {
-      representedIndex += 1;
-    }
-    if (
-      representedItems[representedIndex]?.sourceIndex !==
-        requiredItem.sourceIndex ||
-      representedItems[representedIndex]?.key !== requiredItem.key
-    ) {
-      return false;
-    }
-    representedIndex += 1;
-  }
-  return true;
-}
-
-function getLegacyProviderOutputKey(item: protocol.ModelItem): string {
-  if (item.type !== 'function_call') {
-    return getCanonicalLegacyCompactionKey(item);
-  }
-
-  const namespace = getToolCallNamespace(item);
-  if (!namespace) {
-    return getCanonicalLegacyCompactionKey(item);
-  }
-
-  const normalizedItem = { ...item, name: `${namespace}.${item.name}` };
-  delete normalizedItem.namespace;
-  return getCanonicalLegacyCompactionKey(normalizedItem);
-}
-
-function findLegacyCompactionInsertionIndex(
-  items: z.infer<typeof itemSchema>[],
-  sourceOutput: protocol.OutputModelItem[],
-  compactionIndex: number,
-  optionalFunctionCallIndices: ReadonlySet<number> = new Set(),
-): { itemIndex: number; agent?: SerializedAgentReference } {
-  const providerAnchors = getLegacyProviderOutputAnchors(items, sourceOutput);
-  const representedSourceItems = getRepresentedLegacySourceItems(
-    sourceOutput,
-    compactionIndex,
-    providerAnchors,
-    optionalFunctionCallIndices,
-  );
-  assertRequiredLegacySourceItemsRepresented(
-    getRequiredLegacySourceItems(
-      sourceOutput,
-      compactionIndex,
-      optionalFunctionCallIndices,
-    ),
-    representedSourceItems,
-  );
-
-  if (
-    providerAnchors.length !== representedSourceItems.length ||
-    providerAnchors.some(
-      (anchor, index) => anchor.key !== representedSourceItems[index]?.key,
-    )
-  ) {
-    throwLegacyCompactionOrderingError();
-  }
-
-  if (representedSourceItems.length === 0) {
-    if (items.length !== 0) {
-      throwLegacyCompactionOrderingError();
-    }
-    return { itemIndex: 0 };
-  }
-
-  const agent = providerAnchors[0].agent;
-  const agentKey = getCanonicalLegacyCompactionKey(agent);
-  if (
-    providerAnchors.some(
-      (anchor) => getCanonicalLegacyCompactionKey(anchor.agent) !== agentKey,
-    )
-  ) {
-    throwLegacyCompactionOrderingError();
-  }
-
-  const retainedBeforeCompaction = representedSourceItems.filter(
-    (item) => item.sourceIndex < compactionIndex,
-  ).length;
-  const followingAnchor = providerAnchors[retainedBeforeCompaction];
-  if (followingAnchor) {
-    if (retainedBeforeCompaction === 0 && followingAnchor.itemIndex !== 0) {
-      throwLegacyCompactionOrderingError();
-    }
-    return { itemIndex: followingAnchor.itemIndex, agent };
-  }
-  return { itemIndex: items.length, agent };
-}
-
-function findTrailingProcessedSegmentStart(
-  generatedItems: z.infer<typeof itemSchema>[],
-  processedItems: z.infer<typeof itemSchema>[],
-): number | undefined {
-  for (
-    let start = generatedItems.length - processedItems.length;
-    start >= 0;
-    start -= 1
-  ) {
-    const matches = processedItems.every((processedItem, offset) => {
-      const generatedItem = generatedItems[start + offset];
-      return (
-        getCanonicalLegacyCompactionKey(generatedItem) ===
-        getCanonicalLegacyCompactionKey(processedItem)
-      );
-    });
-    if (matches) {
-      return start;
-    }
-  }
-  return undefined;
-}
-
-function throwLegacyCompactionOrderingError(): never {
-  throw new UserError(
-    'Run state cannot safely restore a legacy compaction item because its provider order is ambiguous.',
-  );
-}
-
-function getCanonicalLegacyCompactionKey(value: unknown): string {
-  return JSON.stringify(sortLegacyCompactionValue(value));
-}
-
-function sortLegacyCompactionValue(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(sortLegacyCompactionValue);
-  }
-  if (typeof value !== 'object' || value === null) {
-    return value;
-  }
-  const record = value as Record<string, unknown>;
-  return Object.fromEntries(
-    Object.keys(record)
-      .sort()
-      .map((key) => [key, sortLegacyCompactionValue(record[key])]),
-  );
 }
 
 function containsProgrammaticToolCallingState(
@@ -5369,6 +5628,45 @@ async function rehydrateToolSearchRuntimeTools<
   return capabilitySnapshotsByAgent;
 }
 
+function restoreCurrentResponseProcessedOwnership(
+  state: RunState<any, any>,
+  stateJson: z.infer<typeof SerializedRunState>,
+): void {
+  const ownership = stateJson.currentResponseGeneratedItemOwnership;
+  if (!ownership || !state._lastProcessedResponse) {
+    return;
+  }
+  const processedItemCount =
+    stateJson.lastProcessedResponse?.newItems.length ?? 0;
+  state._lastProcessedResponse.newItems = state._generatedItems.slice(
+    ownership.generatedItemStartIndex,
+    ownership.generatedItemStartIndex + processedItemCount,
+  );
+  state._lastTurnResponse = state._modelResponses.at(-1);
+  restoreCurrentResponseToolOutputGuardrailResultStart(
+    state,
+    ownership.toolOutputGuardrailResultStartIndex,
+  );
+}
+
+function restoreCurrentResponseInterruptionOwnership(
+  stateJson: z.infer<typeof SerializedRunState>,
+  generatedItems: readonly RunItem[],
+  interruptions: RunToolApprovalItem[],
+): RunToolApprovalItem[] {
+  const ownership = stateJson.currentResponseGeneratedItemOwnership;
+  if (!ownership) {
+    return interruptions;
+  }
+  return ownership.interruptionGeneratedItemIndexes.map((index) => {
+    const interruption = generatedItems[index];
+    if (!(interruption instanceof RunToolApprovalItem)) {
+      throwCurrentResponseOwnershipError();
+    }
+    return interruption;
+  });
+}
+
 async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
   initialAgent: TAgent,
   stateJson: z.infer<typeof SerializedRunState>,
@@ -5607,6 +5905,10 @@ async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
   state._generatedItems = generatedItems;
   state._currentTurnPersistedItemCount =
     stateJson.currentTurnPersistedItemCount ?? 0;
+  state._currentTurnSessionWriteCompactedItemCount =
+    schemaVersionSupportsV120State(schemaVersion)
+      ? stateJson.currentTurnSessionWriteCompactedItemCount
+      : undefined;
   const supportsOutputGuardrailSessionPersistence =
     schemaVersionSupportsV117State(schemaVersion);
   const deferredSessionItemIndexes = supportsOutputGuardrailSessionPersistence
@@ -5616,8 +5918,16 @@ async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
     deferredSessionItemIndexes,
   );
   state._currentTurnBlockedSessionStartIndex = undefined;
-  state._currentTurnSessionHistoryTransactionSessionId = undefined;
-  state._currentTurnSessionReasoningItemIdPolicy = undefined;
+  const restoredPendingSessionBinding =
+    stateJson.currentTurnExecutedWithSessionBinding === true &&
+    stateJson.pendingSessionWrite !== undefined
+      ? stateJson.pendingSessionWrite.sessionId
+      : undefined;
+  state._currentTurnSessionHistoryTransactionSessionId =
+    restoredPendingSessionBinding;
+  state._currentTurnSessionReasoningItemIdPolicy = restoredPendingSessionBinding
+    ? stateJson.pendingSessionWrite?.reasoningItemIdPolicy
+    : undefined;
   state._currentTurnSessionHistoryTransactionInputItems =
     schemaVersionSupportsV117State(schemaVersion)
       ? stateJson.currentTurnSessionInputItems
@@ -5626,8 +5936,26 @@ async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
     undefined;
   state._sessionHistoryTransactionId = randomUUID();
   state._pendingSessionHistoryTransaction = undefined;
+  state._pendingSessionWrite = stateJson.pendingSessionWrite
+    ? structuredClone(stateJson.pendingSessionWrite)
+    : undefined;
+  state._resumedSessionWriteInProgress = false;
   state._pendingLegacyCompactionSessionItems =
     stateJson.pendingLegacyCompactionSessionItems;
+  if (
+    state._pendingSessionWrite?.phase === 'compaction_pending' &&
+    state._currentStep?.type === 'next_step_final_output' &&
+    typeof state._currentAgent.toolUseBehavior === 'function'
+  ) {
+    throw new UserError(
+      'RunState pending Session compaction terminal output is invalid.',
+    );
+  }
+  if (state._pendingSessionWrite) {
+    assertPendingSessionWriteOwnership(state, state._pendingSessionWrite, {
+      allowUnhydratedTerminalToolStep: true,
+    });
+  }
   state._sandbox = stateJson.sandbox
     ? sanitizeSerializedSandboxState(
         stateJson.sandbox as SerializedSandboxState,
@@ -5661,6 +5989,7 @@ async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
         },
       )
     : undefined;
+  restoreCurrentResponseProcessedOwnership(state, stateJson);
   restorePendingAgentToolRunAliases(
     state,
     stateJson.pendingAgentToolRunAliases ?? {},
@@ -5674,10 +6003,14 @@ async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
       ) as TAgent,
     };
   } else if (stateJson.currentStep?.type === 'next_step_interruption') {
-    const interruptions = deserializeInterruptions(
-      stateJson.currentStep.data?.interruptions,
-      agentMap,
-      state._currentAgent,
+    const interruptions = restoreCurrentResponseInterruptionOwnership(
+      stateJson,
+      generatedItems,
+      deserializeInterruptions(
+        stateJson.currentStep.data?.interruptions,
+        agentMap,
+        state._currentAgent,
+      ),
     );
     rebindInterruptionFunctionToolStateKeys(
       interruptions,
@@ -5786,6 +6119,9 @@ async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
     state._context = contextOverride;
   }
   state._serializedCurrentStep = state._currentStep;
+  if (hasPendingApprovedToolInputCompaction(state)) {
+    assertPendingSessionCompactionTerminalAuthority(state);
+  }
   return state;
 }
 
@@ -6078,6 +6414,7 @@ export function deserializeItem(
       return new RunToolCallItem(
         serializedItem.rawItem,
         resolveSerializedAgent(serializedItem.agent, agentMap),
+        serializedItem.functionToolStateKey,
       );
     case 'tool_call_output_item':
       return new RunToolCallOutputItem(

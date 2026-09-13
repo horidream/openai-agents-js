@@ -1,6 +1,139 @@
 ---
 title: テスト
 description: Cookbook and API cheat sheet for deterministic Agent, sandbox, and Realtime tests
+canonicalHeadingIds:
+  - depth: 2
+    id: 'find-the-recipe-you-need'
+    aliases:
+      - '必要なレシピ'
+  - depth: 2
+    id: 'imports'
+    aliases:
+      - 'インポート'
+  - depth: 2
+    id: 'agent-workflow-recipes'
+    aliases:
+      - 'エージェントワークフローのレシピ'
+  - depth: 3
+    id: 'return-a-fixed-response'
+    aliases:
+      - '固定レスポンスの返却'
+  - depth: 3
+    id: 'test-a-tool-workflow'
+    aliases:
+      - 'ツールワークフローのテスト'
+  - depth: 3
+    id: 'derive-a-response-from-the-request'
+    aliases:
+      - 'リクエストからのレスポンス導出'
+  - depth: 3
+    id: 'inspect-model-calls'
+    aliases:
+      - 'モデル呼び出しの確認'
+  - depth: 3
+    id: 'test-streaming'
+    aliases:
+      - 'ストリーミングのテスト'
+  - depth: 3
+    id: 'inject-model-failures'
+    aliases:
+      - 'モデル失敗の注入'
+  - depth: 3
+    id: 'detect-workflow-drift'
+    aliases:
+      - 'ワークフロードリフトの検出'
+  - depth: 2
+    id: 'sandbox-agent-recipes'
+    aliases:
+      - 'サンドボックスエージェントのレシピ'
+  - depth: 3
+    id: 'test-a-sandbox-agent-workflow'
+    aliases:
+      - 'サンドボックスエージェントワークフローのテスト'
+  - depth: 3
+    id: 'configure-sandbox-steps'
+    aliases:
+      - 'サンドボックスステップの設定'
+  - depth: 2
+    id: 'voice-agent-and-session-recipes'
+    aliases:
+      - 'realtime-agent-and-session-recipes'
+      - 'realtime-エージェントとセッションのレシピ'
+      - '音声エージェントとセッションのレシピ'
+  - depth: 3
+    id: 'test-a-voice-agent-tool-workflow'
+    aliases:
+      - 'test-a-realtime-agent-tool-workflow'
+      - 'realtime-エージェントのツールワークフローのテスト'
+      - '音声エージェントのツールワークフローのテスト'
+  - depth: 3
+    id: 'test-a-realtime-session'
+    aliases:
+      - 'realtime-セッションのテスト'
+  - depth: 3
+    id: 'test-interruption'
+    aliases:
+      - '割り込みのテスト'
+  - depth: 3
+    id: 'inject-a-realtime-failure'
+    aliases:
+      - 'realtime-失敗の注入'
+  - depth: 3
+    id: 'test-a-remote-disconnect'
+    aliases:
+      - 'リモート切断のテスト'
+  - depth: 3
+    id: 'inspect-realtime-calls'
+    aliases:
+      - 'realtime-呼び出しの確認'
+  - depth: 3
+    id: 'verify-completion-and-cleanup'
+    aliases:
+      - '完了とクリーンアップの検証'
+  - depth: 2
+    id: 'api-cheat-sheet'
+    aliases:
+      - 'api-早見表'
+  - depth: 3
+    id: 'model-step-factories'
+    aliases:
+      - 'モデルステップファクトリー'
+  - depth: 3
+    id: 'common-output-helpers'
+    aliases:
+      - '一般的な出力ヘルパー'
+  - depth: 3
+    id: 'sandbox-session-controls'
+    aliases:
+      - 'サンドボックスセッションの制御'
+  - depth: 3
+    id: 'realtime-controls'
+    aliases:
+      - 'realtime-の制御'
+  - depth: 2
+    id: 'choose-the-correct-boundary'
+    aliases:
+      - '正しい境界の選択'
+  - depth: 2
+    id: 'final-checklist'
+    aliases:
+      - '最終チェックリスト'
+  - depth: 2
+    id: 'related-guides'
+    aliases:
+      - '関連ガイド'
+  - depth: 2
+    id: 'scope-and-current-limitations'
+    aliases:
+      - '適用範囲と現在の制限事項'
+  - depth: 3
+    id: 'deliberately-outside-the-testing-module'
+    aliases:
+      - 'テストモジュールの意図的な対象外'
+  - depth: 3
+    id: 'not-currently-provided'
+    aliases:
+      - '現在提供されていない機能'
 ---
 
 import { Aside, Code } from '@astrojs/starlight/components';
@@ -40,7 +173,7 @@ SDK は、エージェントワークフロー、サンドボックスセッシ�
 | サンドボックスを起動せずに `SandboxAgent` をテストする | `scriptedSandboxSession()` と `ScriptedModel` | [Test a sandbox agent workflow](#test-a-sandbox-agent-workflow) |
 | サンドボックス呼び出しの照合または結果の導出を行う | サンドボックスステップの `match` または `respond` | [Configure sandbox steps](#configure-sandbox-steps) |
 | サンドボックス操作の失敗を注入する | サンドボックスステップの `error` | [Configure sandbox steps](#configure-sandbox-steps) |
-| `RealtimeAgent` の関数ツールをテストする | `function_call` を発行し、`sendFunctionCallOutput` を期待する | [Test a Realtime agent tool workflow](#test-a-realtime-agent-tool-workflow) |
+| `RealtimeAgent` の関数ツールをテストする | `function_call` を発行し、`sendFunctionCallOutput` を期待する | [音声エージェントのツールワークフローをテスト](#test-a-realtime-agent-tool-workflow) |
 | Realtime 操作を順番に照合する | `runScenario()` と `expectCall()` | [Test a Realtime session](#test-a-realtime-session) |
 | 受信 Realtime イベントを発行する | シナリオ内の `emit()` | [Test a Realtime session](#test-a-realtime-session) |
 | 割り込みリクエストと通知をテストする | `expectCall('interrupt')` と `emit('audio_interrupted')` | [Test interruption](#test-interruption) |
@@ -215,16 +348,16 @@ modelError(error, ({ attempt }) => ({ suggested: attempt === 1 }))
 | `UnconsumedSandboxStepsError` | `remainingSteps`, `pendingMethods` | すべてのステップを使用する前にワークフローが終了した |
 | `InvalidScriptedSandboxStepError` | `reason`, `inputIndex`, `method?` | ステップの形式が不正であるか、サポートされていないメソッドが指定されている |
 
-## Realtime エージェントとセッションのレシピ
+## 音声エージェントとセッションのレシピ
 
-### Realtime エージェントのツールワークフローのテスト
+### 音声エージェントのツールワークフローのテスト
 
 実際の関数ツールを `RealtimeAgent` にアタッチし、スクリプト化されたトランスポートから正規化された `function_call` を発行します。`RealtimeSession` はそのエージェントからツールを解決し、SDK ツールパイプラインを通じて検証および実行して、`sendFunctionCallOutput` を介して結果を返します。
 
 <Code
   lang="typescript"
   code={realtimeAgentToolExample}
-  title="Realtime エージェントの関数ツールのテスト"
+  title="音声エージェントの関数ツールのテスト"
 />
 
 ツールとそのビジネスロジックは `RealtimeAgent` に属するため、これはエージェントテストです。スクリプト化された `function_call` は、そのツールを使用するというモデルの判断を表します。実際のモデルがエージェントの指示に従うことや、ツールを選択することを証明するものではありません。モデルの判断品質は、評価または統合テストで検証してください。
@@ -393,7 +526,7 @@ WebRTC または WebSocket 接続を開かずに、`RealtimeSession` の動作�
 - [エージェントの実行](/openai-agents-js/ja/guides/running-agents)では、`ScriptedModel` が実行する実行ループについて説明しています。
 - [モデル](/openai-agents-js/ja/guides/models)では、`Model` 境界とプロバイダーアダプターについて説明しています。
 - [クイックスタート](/openai-agents-js/ja/guides/sandbox-agents)では、サンドボックスの機能、セッション、プロバイダーのライフサイクルについて説明しています。
-- [リアルタイムエージェントの概要](/openai-agents-js/ja/guides/voice-agents)では、`RealtimeSession` を紹介しています。
+- [音声エージェントの概要](/openai-agents-js/ja/guides/voice-agents)では、`RealtimeSession` を紹介しています。
 - [リアルタイムトランスポート](/openai-agents-js/ja/guides/voice-agents/transport)では、本番環境向けトランスポートとトランスポートイベントについて説明しています。
 
 ## 適用範囲と現在の制限事項

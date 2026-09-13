@@ -3,4 +3,4 @@
 '@openai/agents-openai': patch
 ---
 
-fix: strip output-only created_by metadata at replay boundaries
+chore: migrate tracing test mocks to Vitest 5.

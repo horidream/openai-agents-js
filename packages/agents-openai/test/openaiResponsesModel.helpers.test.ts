@@ -6,8 +6,19 @@ import {
   getInputItems,
   convertToOutputItem,
 } from '../src/openaiResponsesModel';
+import {
+  getInputItems as converterGetInputItems,
+  convertToOutputItem as converterConvertToOutputItem,
+} from '../src/openaiResponsesConverter';
 import { UserError } from '@openai/agents-core';
 import logger from '../src/logger';
+
+describe('Responses item conversion exports', () => {
+  it('preserves helper identity through the model module', () => {
+    expect(getInputItems).toBe(converterGetInputItems);
+    expect(convertToOutputItem).toBe(converterConvertToOutputItem);
+  });
+});
 
 describe('getToolChoice', () => {
   it('returns default choices', () => {
@@ -628,6 +639,22 @@ describe('convertTool', () => {
 });
 
 describe('getInputItems', () => {
+  it('keeps SDK tool-search ownership out of provider input and output conversion', () => {
+    const raw = {
+      type: 'tool_search_output' as const,
+      id: 'search-output',
+      execution: 'server' as const,
+      status: 'completed',
+      tools: [],
+    };
+    const owned = { ...raw, toolSearchAgentName: 'Owner' };
+    expect(getInputItems([owned])).toEqual(getInputItems([raw]));
+    expect(owned.toolSearchAgentName).toBe('Owner');
+    expect(
+      convertToOutputItem(getInputItems([owned]) as any)[0],
+    ).not.toHaveProperty('toolSearchAgentName');
+  });
+
   it('replays caller linkage on MCP approval requests and responses', () => {
     expect(
       getInputItems([
@@ -2447,6 +2474,28 @@ describe('convertToOutputItem', () => {
       caller: { type: 'program', callerId: 'call_prog_1' },
     });
     expect(output.providerData).not.toHaveProperty('caller');
+  });
+
+  it('preserves empty hosted MCP outputs', () => {
+    const [output] = convertToOutputItem([
+      {
+        type: 'mcp_call',
+        id: 'mcp_1',
+        name: 'lookup',
+        arguments: '{}',
+        server_label: 'server',
+        status: 'completed',
+        output: '',
+      },
+    ] as any);
+
+    expect(output).toMatchObject({
+      type: 'hosted_tool_call',
+      id: 'mcp_1',
+      name: 'mcp_call',
+      output: '',
+    });
+    expect(output.providerData).not.toHaveProperty('output');
   });
 
   it('converts Programmatic Tool Calling items and caller linkage', () => {

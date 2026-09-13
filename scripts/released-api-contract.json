@@ -281,5 +281,67 @@
       "export": "RunloopSandboxClient",
       "properties": ["platform"]
     }
+  ],
+  "selectedPublicTypeAliases": [
+    {
+      "package": "@openai/agents-core",
+      "subpath": ".",
+      "export": "OutputGuardrailBlockedMessageFormatter",
+      "kind": "callable"
+    },
+    {
+      "package": "@openai/agents",
+      "subpath": ".",
+      "export": "OutputGuardrailBlockedMessageFormatter",
+      "kind": "callable"
+    }
+  ],
+  "selectedPublicObjectProperties": [
+    {
+      "package": "@openai/agents-openai",
+      "subpath": ".",
+      "export": "webSearchTool",
+      "parameter": 0,
+      "property": "imageSettings",
+      "optional": true,
+      "readonly": false,
+      "fields": [
+        {
+          "name": "maxResults",
+          "type": "number",
+          "optional": true,
+          "readonly": false
+        },
+        {
+          "name": "caption",
+          "type": "boolean",
+          "optional": true,
+          "readonly": false
+        }
+      ]
+    },
+    {
+      "package": "@openai/agents",
+      "subpath": ".",
+      "export": "webSearchTool",
+      "parameter": 0,
+      "property": "imageSettings",
+      "optional": true,
+      "readonly": false,
+      "fields": [
+        {
+          "name": "maxResults",
+          "type": "number",
+          "optional": true,
+          "readonly": false
+        },
+        {
+          "name": "caption",
+          "type": "boolean",
+          "optional": true,
+          "readonly": false
+        }
+      ]
+    }
   ]
 }

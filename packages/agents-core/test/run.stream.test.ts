@@ -543,7 +543,7 @@ describe('Runner.run (streaming)', () => {
     expect(replaceHistoryWithCompaction).not.toHaveBeenCalled();
   });
 
-  it('treats prior tool_search outputs in input history as loaded deferred tools', async () => {
+  it('treats attributed tool_search outputs in input history as loaded deferred tools', async () => {
     const getShippingEta = tool({
       name: 'get_shipping_eta',
       description: 'Look up a shipping ETA.',
@@ -587,6 +587,7 @@ describe('Runner.run (streaming)', () => {
       user('Load shipping tools first.'),
       {
         type: 'tool_search_output',
+        toolSearchAgentName: 'StreamingShippingAgent',
         status: 'completed',
         tools: [
           {
@@ -1891,9 +1892,11 @@ describe('Runner.run (streaming)', () => {
     expect(resumed.finalOutput).toBe('cancelled');
     expect(guardrail.execute).toHaveBeenCalledTimes(1);
     expect(saveResultSpy).toHaveBeenCalledTimes(2);
-    expect(saveResultSpy.mock.calls[1]?.[2]).toEqual({
-      compactionMode: 'input',
-    });
+    expect(saveResultSpy.mock.calls[1]?.[2]).toEqual(
+      expect.objectContaining({
+        compactionMode: 'input',
+      }),
+    );
     expect(guardrail.execute.mock.invocationCallOrder[0]).toBeLessThan(
       saveResultSpy.mock.invocationCallOrder[1]!,
     );

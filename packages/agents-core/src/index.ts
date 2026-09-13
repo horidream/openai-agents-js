@@ -200,6 +200,8 @@ export type {
   CallModelInputFilterArgs,
   ToolErrorFormatter,
   ToolErrorFormatterArgs,
+  OutputGuardrailBlockedMessageArgs,
+  OutputGuardrailBlockedMessageFormatter,
   ToolExecutionConfig,
   ToolNameCollisionPolicy,
   ToolNotFoundBehavior,
@@ -342,10 +344,12 @@ export type {
   SessionHistoryTransactionAwareSession,
   OpenAIResponsesCompactionArgs,
   OpenAIResponsesCompactionAwareSession,
+  OpenAIResponsesCompactionOwnershipAwareSession,
   OpenAIResponsesCompactionResult,
 } from './memory/session';
 export {
   isOpenAIResponsesCompactionAwareSession,
+  isOpenAIResponsesCompactionOwnershipAwareSession,
   isRunContextAwareSession,
   isSessionHistoryRewriteAwareSession,
   isSessionHistoryTransactionAwareSession,

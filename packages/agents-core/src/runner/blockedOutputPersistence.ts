@@ -3,6 +3,7 @@ import type { OutputGuardrailResult } from '../guardrail';
 import {
   RunHandoffOutputItem,
   RunItem,
+  RunToolApprovalItem,
   RunToolCallItem,
   RunToolCallOutputItem,
   RunToolSearchCallItem,
@@ -32,9 +33,12 @@ import {
 import type { RunState } from '../runState';
 import type { Session } from '../memory/session';
 import { Usage } from '../usage';
+import { toSmartString } from '../utils/smartString';
 import {
+  getSerializedOutputGuardrailResults,
   sanitizeBlockedOutputGuardrailResults,
   sanitizeBlockedToolOutputGuardrailResults,
+  replaceSanitizedOutputGuardrailMessages,
 } from './guardrails';
 import { invalidateOutputItemNormalization } from './items';
 import {
@@ -43,11 +47,9 @@ import {
   getToolResultCorrelationKey,
 } from './toolResultCorrelation';
 import { addLoadedToolNamesFromToolSearchOutput } from './toolSearch';
+import { OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT } from './outputGuardrailBlockedMessage';
 
 type BlockedPairKind = 'tool' | 'handoff';
-
-export const OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT =
-  'Output withheld by an output guardrail.';
 
 const currentResponseToolOutputGuardrailResultStarts = new WeakMap<
   RunState<any, any>,
@@ -64,6 +66,19 @@ export function captureCurrentResponseToolOutputGuardrailResultStart(
       state._toolOutputGuardrailResults.length,
     );
   }
+}
+
+export function getCurrentResponseToolOutputGuardrailResultStart(
+  state: RunState<any, any>,
+): number | undefined {
+  return currentResponseToolOutputGuardrailResultStarts.get(state);
+}
+
+export function restoreCurrentResponseToolOutputGuardrailResultStart(
+  state: RunState<any, any>,
+  startIndex: number,
+): void {
+  currentResponseToolOutputGuardrailResultStarts.set(state, startIndex);
 }
 
 function currentCompletedToolRuns(state: RunState<any, any>) {
@@ -111,6 +126,58 @@ function currentTerminalToolRuns(state: RunState<any, any>) {
   return completedRuns;
 }
 
+function currentDeclarativeTerminalToolOutput(
+  state: RunState<any, any>,
+): string | undefined {
+  const behavior = state._currentAgent.toolUseBehavior;
+  if (
+    behavior === 'run_llm_again' ||
+    typeof behavior === 'function' ||
+    state._currentStep?.type !== 'next_step_final_output'
+  ) {
+    return undefined;
+  }
+  const completedRuns = currentTerminalToolRuns(state);
+  const selectedRun =
+    behavior === 'stop_on_first_tool'
+      ? completedRuns[0]
+      : completedRuns.find((run) =>
+          behavior.stopAtToolNames.some((toolName: string) =>
+            matchesFunctionToolName(run.tool, toolName),
+          ),
+        );
+  const callId = selectedRun?.toolCall.callId;
+  const outputItem = callId
+    ? state._completedToolInvocationEvidence
+        .get(state._currentAgent)
+        ?.get(callId)?.items[1]
+    : undefined;
+  return outputItem instanceof RunToolCallOutputItem
+    ? toSmartString(outputItem.output)
+    : undefined;
+}
+
+export function hasPersistedToolOutput(state: RunState<any, any>): boolean {
+  return state._generatedItems
+    .slice(0, state._currentTurnPersistedItemCount)
+    .some((item) => item.type === 'tool_call_output_item');
+}
+
+export function hasPendingApprovedToolInputCompaction(
+  state: RunState<any, any>,
+): boolean {
+  return state._pendingSessionWrite?.phase === 'compaction_pending';
+}
+
+export function hasDeterministicTerminalToolOutputSource(
+  state: RunState<any, any>,
+): boolean {
+  return (
+    state._currentStep?.type === 'next_step_final_output' &&
+    currentDeclarativeTerminalToolOutput(state) === state._currentStep.output
+  );
+}
+
 export function hasTerminalToolOutputSource(
   state: RunState<any, any>,
 ): boolean {
@@ -133,15 +200,19 @@ export function sanitizeBlockedTerminalToolOutput(
   >,
   tripwire?: OutputGuardrailTripwireTriggered<any, any>,
   ownedOutputGuardrailResults?: ReadonlySet<OutputGuardrailResult<any, any>>,
-): boolean {
+  resolveBlockedMessage?: (guardrailName: string) => Promise<string>,
+  signal?: AbortSignal,
+  onBlockedOutput?: () => void,
+): false | string | Promise<false | string> {
   if (
     !hasTerminalToolOutputSource(state) ||
     !completedOutputGuardrailTripwireResult
   ) {
     return false;
   }
+  onBlockedOutput?.();
   redactBlockedResponseToolOutputs(state);
-  sanitizeBlockedOutputGuardrailResults(
+  const sanitizedOutputGuardrailResults = sanitizeBlockedOutputGuardrailResults(
     state,
     outputGuardrailResultStart,
     OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT,
@@ -154,7 +225,98 @@ export function sanitizeBlockedTerminalToolOutput(
     currentResponseToolOutputGuardrailResultStarts.get(state) ?? 0,
     OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT,
   );
-  return true;
+  if (!resolveBlockedMessage) {
+    return OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT;
+  }
+  const blockedOutputGuardrailResult = completedOutputGuardrailTripwireResult;
+  let guardrailName = 'output_guardrail';
+  try {
+    const candidate = blockedOutputGuardrailResult.guardrail.name;
+    if (typeof candidate === 'string' && candidate.length > 0) {
+      guardrailName = candidate;
+    }
+  } catch {
+    // Keep the safe fallback name when caller-owned metadata is unreadable.
+  }
+  signal?.throwIfAborted();
+  return awaitBlockedMessageWithAbort(
+    resolveBlockedMessage(guardrailName),
+    signal,
+  )
+    .then((blockedMessage) => {
+      signal?.throwIfAborted();
+      if (
+        typeof blockedMessage !== 'string' ||
+        blockedMessage.length === 0 ||
+        blockedMessage === OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT
+      ) {
+        return OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT;
+      }
+      redactBlockedResponseToolOutputs(state, blockedMessage);
+      replaceSanitizedOutputGuardrailMessages(
+        state,
+        sanitizedOutputGuardrailResults,
+        blockedMessage,
+        tripwire,
+      );
+      return blockedMessage;
+    })
+    .catch(() => {
+      signal?.throwIfAborted();
+      return OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT;
+    });
+}
+
+function awaitBlockedMessageWithAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (!signal) {
+    return promise;
+  }
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      signal.removeEventListener('abort', onAbort);
+    };
+    const onAbort = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      try {
+        signal.throwIfAborted();
+      } catch (error) {
+        reject(error);
+      }
+    };
+
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    promise.then(
+      (value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        reject(error);
+      },
+    );
+  });
 }
 
 export function shouldDeferInterruptedSessionItems(
@@ -190,17 +352,32 @@ export function assertResumedSessionOutputGuardrailSafety(
     state,
     hasOutputGuardrail,
   );
+  let restoredSelection: CurrentRunItemSelection | undefined;
   if (state._serializedCurrentStep !== undefined && shouldDefer) {
     const responseOutput = getResponseOutput(currentResponse(state));
+    restoredSelection = responseOutput
+      ? currentRunItemSelection(state, responseOutput)
+      : undefined;
     if (
-      session !== undefined ||
-      state._toolOutputGuardrailResults.length > 0 ||
       !responseOutput ||
       responseOutput.some((item) => item.type !== 'function_call') ||
-      !currentRunItemSelection(state, responseOutput).proven
+      !restoredSelection?.proven ||
+      getCurrentResponseToolOutputGuardrailResultStart(state) === undefined
     ) {
+      const reasons = [
+        !responseOutput ? 'missing response output' : undefined,
+        responseOutput?.some((item) => item.type !== 'function_call')
+          ? 'non-function response item'
+          : undefined,
+        !restoredSelection?.proven
+          ? 'unproven generated-item range'
+          : undefined,
+        getCurrentResponseToolOutputGuardrailResultStart(state) === undefined
+          ? 'missing guardrail-result boundary'
+          : undefined,
+      ].filter((reason): reason is string => reason !== undefined);
       throw new UserError(
-        'Cannot resume this serialized output-bearing approval checkpoint because current-response provenance was not preserved. Start a new run from safe input.',
+        `Cannot resume this serialized output-bearing approval checkpoint because current-response provenance was not preserved (${reasons.join(', ')}). Start a new run from safe input.`,
       );
     }
   }
@@ -218,12 +395,14 @@ export function assertResumedSessionOutputGuardrailSafety(
       (run) => run.toolCall.callId,
     ),
   );
-  const currentStart = state._generatedItems.findIndex(
-    (item) =>
-      item instanceof RunToolCallItem &&
-      item.rawItem.type === 'function_call' &&
-      currentCallIds.has(item.rawItem.callId),
-  );
+  const currentStart = restoredSelection
+    ? state._generatedItems.length - restoredSelection.primary.length
+    : state._generatedItems.findIndex(
+        (item) =>
+          item instanceof RunToolCallItem &&
+          item.rawItem.type === 'function_call' &&
+          currentCallIds.has(item.rawItem.callId),
+      );
   const firstOutputIndex = state._generatedItems.findIndex(
     (item, index) =>
       index >= currentStart && item instanceof RunToolCallOutputItem,
@@ -1003,6 +1182,7 @@ function buildCanonicalFunctionCall(rawItem: AgentInputItem): FunctionCallItem {
 
 export function buildBlockedToolOutputRawItem(
   rawItem: AgentInputItem,
+  blockedMessage = OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT,
 ): FunctionCallResultItem {
   const parsed = FunctionCallResultItemSchema.parse(rawItem);
   return FunctionCallResultItemSchema.parse({
@@ -1010,7 +1190,7 @@ export function buildBlockedToolOutputRawItem(
     name: parsed.name,
     ...optionalField('namespace', parsed.namespace),
     callId: parsed.callId,
-    output: OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT,
+    output: blockedMessage,
     ...optionalField('id', parsed.id),
     ...optionalField('status', parsed.status),
   });
@@ -1176,10 +1356,88 @@ function boundedCurrentFunctionResponseStart(
   return start;
 }
 
+function restoredCurrentRunItemSelection(
+  state: RunState<any, any>,
+  responseOutput: AgentInputItem[],
+): CurrentRunItemSelection | undefined {
+  if (
+    state._serializedCurrentStep !== state._currentStep ||
+    state._currentStep?.type !== 'next_step_interruption'
+  ) {
+    return undefined;
+  }
+  const generated = state._generatedItems;
+  const processed = state._lastProcessedResponse?.newItems ?? [];
+  // A valid schema 1.20 restore relinks these wrappers. Do not fall back to structural
+  // equality for an approval checkpoint whose serialized ownership was absent or invalid.
+  const responseKeys = responseOutput.map(functionCallKey);
+  if (
+    getCurrentResponseToolOutputGuardrailResultStart(state) === undefined ||
+    processed.length === 0 ||
+    processed.length !== responseKeys.length ||
+    responseKeys.some((key) => key === undefined) ||
+    processed.some(
+      (item, index) =>
+        !(item instanceof RunToolCallItem) ||
+        item.rawItem.type !== 'function_call' ||
+        functionCallKey(item.rawItem) !== responseKeys[index],
+    )
+  ) {
+    const fallbackStart = Math.min(
+      state._currentTurnPersistedItemCount,
+      generated.length,
+    );
+    const fallback = generated.slice(fallbackStart);
+    return { primary: fallback, aliases: fallback, proven: false };
+  }
+  const matchingStarts: number[] = [];
+  for (
+    let start = 0;
+    start <= generated.length - processed.length;
+    start += 1
+  ) {
+    if (processed.every((item, offset) => generated[start + offset] === item)) {
+      matchingStarts.push(start);
+    }
+  }
+  const start = matchingStarts.length === 1 ? matchingStarts[0] : undefined;
+  const processedEnd =
+    start === undefined ? undefined : start + processed.length;
+  const interruptionIndexes = state._currentStep.data.interruptions.map(
+    (interruption: RunToolApprovalItem) =>
+      generated.flatMap((item, index) =>
+        item === interruption ? [index] : [],
+      ),
+  );
+  if (
+    start === undefined ||
+    interruptionIndexes.some(
+      (indexes: number[]) =>
+        indexes.length !== 1 || indexes[0] < (processedEnd ?? Infinity),
+    )
+  ) {
+    const fallbackStart = Math.min(
+      state._currentTurnPersistedItemCount,
+      generated.length,
+    );
+    const fallback = generated.slice(fallbackStart);
+    return { primary: fallback, aliases: fallback, proven: false };
+  }
+  const primary = generated.slice(start);
+  return { primary, aliases: primary, proven: true };
+}
+
 function currentRunItemSelection(
   state: RunState<any, any>,
   responseOutput: AgentInputItem[],
 ): CurrentRunItemSelection {
+  const restoredSelection = restoredCurrentRunItemSelection(
+    state,
+    responseOutput,
+  );
+  if (restoredSelection) {
+    return restoredSelection;
+  }
   const generated = state._generatedItems.slice();
   const responseObjects = new Set(responseOutput);
   const processed = state._lastProcessedResponse?.newItems ?? [];
@@ -1256,64 +1514,6 @@ function currentRunItemSelection(
     return { primary, aliases, proven: true };
   }
 
-  if (
-    state._currentStep?.type === 'next_step_interruption' &&
-    processed.length > 0 &&
-    processed.length === responseOutput.length &&
-    processed.length * 2 <= generated.length &&
-    processed.every(
-      (item, index) =>
-        item instanceof RunToolCallItem &&
-        item.rawItem.type === 'function_call' &&
-        functionCallKey(item.rawItem) ===
-          functionCallKey(responseOutput[index]!),
-    )
-  ) {
-    const interruptionCount = state._currentStep.data.interruptions.length;
-    const currentSuffix = generated.slice(-processed.length * 2);
-    const callItems = currentSuffix.slice(0, processed.length);
-    const outcomeItems = currentSuffix.slice(processed.length);
-    const responseKeys = new Set(responseOutput.map(functionCallKey));
-    const outcomeKeys = new Set<string>();
-    let approvalCount = 0;
-    const outcomesAreBounded = outcomeItems.every((item) => {
-      if (item.type === 'tool_approval_item') {
-        if (!('rawItem' in item) || item.rawItem.type !== 'function_call') {
-          return false;
-        }
-        approvalCount += 1;
-        const key = functionCallKey(item.rawItem);
-        if (!key || !responseKeys.has(key) || outcomeKeys.has(key))
-          return false;
-        outcomeKeys.add(key);
-        return true;
-      }
-      if (
-        !(item instanceof RunToolCallOutputItem) ||
-        item.rawItem.type !== 'function_call_result'
-      ) {
-        return false;
-      }
-      const key = functionResultKey(item.rawItem);
-      if (!key || !responseKeys.has(key) || outcomeKeys.has(key)) return false;
-      outcomeKeys.add(key);
-      return true;
-    });
-    if (
-      responseKeys.size === responseOutput.length &&
-      outcomeKeys.size === responseOutput.length &&
-      approvalCount === interruptionCount &&
-      outcomesAreBounded &&
-      functionRunItemSequenceIsPrefix(callItems, processed)
-    ) {
-      return {
-        primary: currentSuffix,
-        aliases: [...currentSuffix, ...processed],
-        proven: true,
-      };
-    }
-  }
-
   if (state._currentTurnBlockedSessionStartIndex !== undefined) {
     const blockedStart = Math.min(
       state._currentTurnBlockedSessionStartIndex,
@@ -1344,6 +1544,7 @@ function buildCurrentFunctionPairPlan(
   state: RunState<any, any>,
   responseOutput: AgentInputItem[],
   selection: CurrentRunItemSelection,
+  blockedMessage = OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT,
 ): CurrentFunctionPairPlan | undefined {
   if (!selection.proven) return undefined;
 
@@ -1379,6 +1580,7 @@ function buildCurrentFunctionPairPlan(
           new RunToolCallItem(
             buildCanonicalFunctionCall(item.rawItem),
             item.agent,
+            item.functionToolStateKey,
           ),
         );
         continue;
@@ -1393,9 +1595,9 @@ function buildCurrentFunctionPairPlan(
         resultIndexes.set(key, index);
         sanitizedItems.push(
           new RunToolCallOutputItem(
-            buildBlockedToolOutputRawItem(item.rawItem),
+            buildBlockedToolOutputRawItem(item.rawItem, blockedMessage),
             item.agent,
-            OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT,
+            blockedMessage,
             undefined,
             item.executionStatus,
           ),
@@ -1455,7 +1657,11 @@ function buildCurrentFunctionPairPlan(
         ) {
           replacements.set(
             item,
-            new RunToolCallItem(replacement.rawItem, item.agent),
+            new RunToolCallItem(
+              replacement.rawItem,
+              item.agent,
+              replacement.functionToolStateKey,
+            ),
           );
         } else if (
           replacement instanceof RunToolCallOutputItem &&
@@ -1466,7 +1672,7 @@ function buildCurrentFunctionPairPlan(
             new RunToolCallOutputItem(
               replacement.rawItem,
               item.agent,
-              OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT,
+              blockedMessage,
               undefined,
               replacement.executionStatus,
             ),
@@ -1604,6 +1810,7 @@ function replaceCurrentResponse(
     !replacedResponse &&
     state._serializedCurrentStep !== undefined &&
     state._serializedCurrentStep === state._currentStep &&
+    state._currentStep?.type === 'next_step_final_output' &&
     state._modelResponses.length > 0
   ) {
     const archivedResponse = state._modelResponses.at(-1);
@@ -1623,9 +1830,12 @@ function replaceCurrentResponse(
     state._lastTurnResponse = replacement;
 }
 
-function markBlockedState(state: RunState<any, any>): void {
+function markBlockedState(
+  state: RunState<any, any>,
+  blockedMessage: string,
+): void {
   if (state._currentStep?.type === 'next_step_final_output') {
-    state._currentStep.output = OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT;
+    state._currentStep.output = blockedMessage;
   }
   invalidateOutputItemNormalization(state._generatedItems);
   if (state._lastProcessedResponse) {
@@ -1636,13 +1846,19 @@ function markBlockedState(state: RunState<any, any>): void {
 /** Replaces a rejected function response with allowlisted replay-safe values. */
 export function redactBlockedResponseToolOutputs(
   state: RunState<any, any>,
+  blockedMessage = OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT,
 ): boolean {
   const response = currentResponse(state);
   const responseOutput = getResponseOutput(response);
   const selection = currentRunItemSelection(state, responseOutput ?? []);
   const plan =
     response && responseOutput
-      ? buildCurrentFunctionPairPlan(state, responseOutput, selection)
+      ? buildCurrentFunctionPairPlan(
+          state,
+          responseOutput,
+          selection,
+          blockedMessage,
+        )
       : undefined;
 
   if (!plan) {
@@ -1650,7 +1866,7 @@ export function redactBlockedResponseToolOutputs(
     for (const item of selection.aliases) replacements.set(item, undefined);
     replaceRunItems(state, replacements, responseOutput, []);
     if (response) replaceCurrentResponse(state, response, []);
-    markBlockedState(state);
+    markBlockedState(state, blockedMessage);
     return selection.aliases.length > 0 || response !== undefined;
   }
 
@@ -1661,7 +1877,7 @@ export function redactBlockedResponseToolOutputs(
     plan.responseOutput,
   );
   replaceCurrentResponse(state, response!, plan.responseOutput);
-  markBlockedState(state);
+  markBlockedState(state, blockedMessage);
   return plan.replacements.size > 0 || plan.responseOutput.length > 0;
 }
 
@@ -1671,20 +1887,134 @@ export function getBlockedOutputSessionSnapshotRunItems(
   const responseOutput = getResponseOutput(currentResponse(state));
   if (!responseOutput) return [];
   const selection = currentRunItemSelection(state, responseOutput);
-  const plan = buildCurrentFunctionPairPlan(state, responseOutput, selection);
+  const blockedMessage =
+    state._currentStep?.type === 'next_step_final_output' &&
+    typeof state._currentStep.output === 'string' &&
+    state._currentStep.output.length > 0
+      ? state._currentStep.output
+      : OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT;
+  const plan = buildCurrentFunctionPairPlan(
+    state,
+    responseOutput,
+    selection,
+    blockedMessage,
+  );
   return plan?.sanitizedItems ?? [];
 }
 
 export function isCanonicalBlockedOutputPayload(item: AgentInputItem): boolean {
+  return isCanonicalBlockedOutputPayloadForMessage(
+    item,
+    OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT,
+  );
+}
+
+function isCanonicalBlockedOutputPayloadForMessage(
+  item: AgentInputItem,
+  blockedMessage: string,
+): boolean {
   if (item?.type !== 'function_call_result') return false;
   try {
     return (
       JSON.stringify(item) ===
-      JSON.stringify(buildBlockedToolOutputRawItem(item))
+      JSON.stringify(buildBlockedToolOutputRawItem(item, blockedMessage))
     );
   } catch {
     return false;
   }
+}
+
+/** Returns a custom blocked message only when the restored response owns its canonical payload. */
+function getCanonicalSerializedOutputGuardrailBlockedMessage(
+  state: RunState<any, any>,
+): string | undefined {
+  if (
+    state._serializedCurrentStep !== state._currentStep ||
+    state._currentStep?.type !== 'next_step_final_output' ||
+    typeof state._currentStep.output !== 'string' ||
+    state._currentStep.output.length === 0 ||
+    state._currentStep.output === OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT
+  ) {
+    return undefined;
+  }
+
+  const blockedMessage = state._currentStep.output;
+  const responseOutput = getResponseOutput(currentResponse(state));
+  if (!responseOutput) return undefined;
+  const selection = currentRunItemSelection(state, responseOutput);
+  const plan = buildCurrentFunctionPairPlan(
+    state,
+    responseOutput,
+    selection,
+    blockedMessage,
+  );
+  if (
+    !plan ||
+    JSON.stringify(responseOutput) !== JSON.stringify(plan.responseOutput)
+  ) {
+    return undefined;
+  }
+
+  for (const [item, canonicalItem] of plan.replacements) {
+    if (
+      item instanceof RunToolCallItem &&
+      canonicalItem instanceof RunToolCallItem
+    ) {
+      if (
+        JSON.stringify(item.rawItem) !== JSON.stringify(canonicalItem.rawItem)
+      ) {
+        return undefined;
+      }
+      continue;
+    }
+    if (
+      item instanceof RunToolCallOutputItem &&
+      canonicalItem instanceof RunToolCallOutputItem
+    ) {
+      if (
+        item.output !== blockedMessage ||
+        item.customData !== undefined ||
+        !isCanonicalBlockedOutputPayloadForMessage(item.rawItem, blockedMessage)
+      ) {
+        return undefined;
+      }
+      continue;
+    }
+    return undefined;
+  }
+
+  return blockedMessage;
+}
+
+/** Neutralizes a canonical restored placeholder without trusting serialized guardrail identity. */
+export function normalizeSerializedOutputGuardrailBlockedMessage(
+  state: RunState<any, any>,
+): void {
+  const blockedMessage =
+    getCanonicalSerializedOutputGuardrailBlockedMessage(state);
+  if (
+    !blockedMessage ||
+    !state._outputGuardrailResults.some(
+      (result) =>
+        result.agent === state._currentAgent &&
+        result.agentOutput === blockedMessage &&
+        result.output.tripwireTriggered === true &&
+        result.output.outputInfo === undefined,
+    )
+  ) {
+    return;
+  }
+  const ownedResults = getSerializedOutputGuardrailResults(
+    state,
+    blockedMessage,
+  );
+  // A saved verdict only identifies data to neutralize; current guards must rerun.
+  redactBlockedResponseToolOutputs(state);
+  replaceSanitizedOutputGuardrailMessages(
+    state,
+    ownedResults,
+    OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT,
+  );
 }
 
 export function hasOutputBearingApprovalCheckpoint(

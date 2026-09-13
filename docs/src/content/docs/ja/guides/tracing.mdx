@@ -1,6 +1,52 @@
 ---
 title: トレーシング
 description: Learn how to trace your agent runs
+canonicalHeadingIds:
+  - depth: 2
+    id: 'export-loop-lifecycle'
+    aliases:
+      - 'エクスポートループのライフサイクル'
+  - depth: 2
+    id: 'traces-and-spans'
+    aliases:
+      - 'トレースとスパン'
+  - depth: 2
+    id: 'default-tracing'
+    aliases:
+      - 'デフォルトのトレーシング'
+  - depth: 3
+    id: 'voice-agent-tracing'
+    aliases:
+      - 'realtime-agent-tracing'
+      - '音声エージェントのトレーシング'
+  - depth: 2
+    id: 'higher-level-traces'
+    aliases:
+      - '上位レベルのトレース'
+  - depth: 2
+    id: 'creating-traces'
+    aliases:
+      - 'トレースの作成'
+  - depth: 2
+    id: 'creating-spans'
+    aliases:
+      - 'スパンの作成'
+  - depth: 2
+    id: 'sensitive-data'
+    aliases:
+      - '機密データ'
+  - depth: 2
+    id: 'openai-tracing-exporter'
+    aliases:
+      - 'openai-トレーシングエクスポーター'
+  - depth: 2
+    id: 'custom-tracing-processors'
+    aliases:
+      - 'カスタムトレーシングプロセッサー'
+  - depth: 2
+    id: 'external-tracing-processors-list'
+    aliases:
+      - '外部トレーシングプロセッサーの一覧'
 ---
 
 import { Aside, Code } from '@astrojs/starlight/components';
@@ -71,11 +117,11 @@ Agents SDK にはトレーシングが組み込まれており、エージェン
 
 さらに、[カスタムトレーシングプロセッサー](#custom-tracing-processors)を設定し、トレースを別の送信先へ送信できます。これは、送信先の置き換えまたは追加として利用できます。
 
-### リアルタイムエージェントのトレーシング
+### 音声エージェントのトレーシング
 
 デフォルトの OpenAI Realtime API で `RealtimeAgent` と `RealtimeSession` を使用している場合、`RealtimeSession` で `tracingDisabled: true` を設定するか、環境変数 `OPENAI_AGENTS_DISABLE_TRACING` を使用して無効にしない限り、Realtime API 側で自動的にトレーシングが行われます。
 
-詳細については、[リアルタイムエージェントの概要](/openai-agents-js/ja/guides/voice-agents)を参照してください。
+詳細については、[音声エージェントの概要](/openai-agents-js/ja/guides/voice-agents)を参照してください。
 
 ## 上位レベルのトレース
 
