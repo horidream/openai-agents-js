@@ -29,7 +29,13 @@ export function base64ToArrayBuffer(base64: string) {
  * @returns {string}
  */
 export function arrayBufferToBase64(arrayBuffer: ArrayBuffer) {
-  const binaryString = String.fromCharCode(...new Uint8Array(arrayBuffer));
+  const bytes = new Uint8Array(arrayBuffer);
+  const chunkSize = 0x8000;
+  let binaryString = '';
+  // Bound the argument count so large audio buffers do not exceed engine limits.
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binaryString += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
   return btoa(binaryString);
 }
 
@@ -306,6 +312,12 @@ export function updateRealtimeHistory(
       }
       return item;
     });
+  } else if ((event as any).previousItemId === null) {
+    // The server reported no predecessor, so the item belongs at the front --
+    // this is how a `previous_item_id: 'root'` create comes back. An event that
+    // simply omits the field falls through to the append below: absent is not
+    // the same claim as first.
+    return [newEvent, ...history];
   } else if ((event as any).previousItemId) {
     // Insert after previousItemId if found, else at end
     const prevIndex = history.findIndex(
