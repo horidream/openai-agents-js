@@ -186,8 +186,12 @@ import {
  *   on approval resume. Normalized values and comparison evidence are never serialized.
  *   Also preserves original local MCP recipients. Historical function calls without
  *   recipient provenance may be rejected or retained as completed, but cannot execute.
+ *   Records completion of initial input guardrails. Started snapshots without this
+ *   evidence require a fresh run rather than resuming unvalidated input.
+ * - 1.22: Records hosted MCP namespace discovery provenance. Older namespace-only
+ *   search outputs require rediscovery; explicit MCP descriptors remain usable.
  */
-export const CURRENT_SCHEMA_VERSION = '1.21' as const;
+export const CURRENT_SCHEMA_VERSION = '1.22' as const;
 export const SUPPORTED_SCHEMA_VERSIONS = [
   '1.0',
   '1.1',
@@ -210,6 +214,7 @@ export const SUPPORTED_SCHEMA_VERSIONS = [
   '1.18',
   '1.19',
   '1.20',
+  '1.21',
   CURRENT_SCHEMA_VERSION,
 ] as const;
 type SupportedSchemaVersion = (typeof SUPPORTED_SCHEMA_VERSIONS)[number];
@@ -234,7 +239,11 @@ function schemaVersionSupportsV119State(
 function schemaVersionSupportsV120State(
   schemaVersion: SupportedSchemaVersion,
 ): boolean {
-  return schemaVersion === '1.20' || schemaVersion === CURRENT_SCHEMA_VERSION;
+  return (
+    schemaVersion === '1.20' ||
+    schemaVersion === '1.21' ||
+    schemaVersion === CURRENT_SCHEMA_VERSION
+  );
 }
 
 function schemaVersionSupportsV116State(
@@ -1905,6 +1914,7 @@ export const SerializedRunState = z.object({
   currentAgentSpan: SerializedSpan.nullable().optional(),
   noActiveAgentRun: z.boolean(),
   inputGuardrailResults: z.array(inputGuardrailResultSchema),
+  initialInputGuardrailsCompleted: z.boolean().optional(),
   outputGuardrailResults: z.array(outputGuardrailResultSchema),
   toolInputGuardrailResults: z
     .array(toolInputGuardrailResultSchema)
@@ -2329,6 +2339,8 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
    * Whether the current turn has already been counted (useful when resuming mid-turn).
    */
   public _currentTurnInProgress = false;
+  /** Whether the complete initial input guardrail batch passed, including an empty batch. */
+  public _initialInputGuardrailsCompleted = false;
   /**
    * The agent currently handling the conversation.
    */
@@ -3366,6 +3378,7 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
       noActiveAgentRun: this._noActiveAgentRun,
       currentTurnInProgress: this._currentTurnInProgress,
       inputGuardrailResults: this._inputGuardrailResults,
+      initialInputGuardrailsCompleted: this._initialInputGuardrailsCompleted,
       outputGuardrailResults: this._outputGuardrailResults.map((r) => ({
         ...r,
         agent: serializeAgentReference(r.agent, agentIdentity.byAgent),
@@ -5847,6 +5860,8 @@ async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
   state._currentAgent = currentAgent as TAgent;
   state._currentTurn = stateJson.currentTurn;
   state._currentTurnInProgress = stateJson.currentTurnInProgress ?? false;
+  state._initialInputGuardrailsCompleted =
+    stateJson.initialInputGuardrailsCompleted ?? false;
   state._conversationId = stateJson.conversationId ?? undefined;
   state._previousResponseId = stateJson.previousResponseId ?? undefined;
   state._reasoningItemIdPolicy = stateJson.reasoningItemIdPolicy ?? undefined;

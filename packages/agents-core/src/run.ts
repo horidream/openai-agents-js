@@ -119,6 +119,7 @@ import {
   hasPersistedToolOutput,
   hasTerminalToolOutputSource,
   sanitizeBlockedTerminalToolOutput,
+  redactCancelledResponseToolOutputs,
   shouldDeferInterruptedSessionItems,
 } from './runner/blockedOutputPersistence';
 import {
@@ -729,6 +730,16 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
   ): Promise<
     RunResult<TContext, TAgent> | StreamedRunResult<TContext, TAgent>
   > {
+    if (
+      input instanceof RunState &&
+      (input._currentTurn > 0 || input._pendingInput.length > 0) &&
+      !input._initialInputGuardrailsCompleted
+    ) {
+      throw new UserError(
+        'Cannot resume this checkpoint because completion of initial input guardrails is unverified. Start a fresh run with the original input and context.',
+        input,
+      );
+    }
     this.#validateModelTimeoutForAgent(
       input instanceof RunState ? input._currentAgent : agent,
     );
@@ -1398,6 +1409,7 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
       setRunStateUsageRecorder(state, recordUsage);
       let completedResult: RunResult<TContext, TAgent> | undefined;
       let persistenceCheckpoint: RunResult<TContext, TAgent> | undefined;
+      let cancelledOutputRedacted = false;
       const resumedStateHasPersistedToolOutput =
         isResumedState && hasPersistedToolOutput(state);
       let approvedToolCheckpointCompacted =
@@ -1782,14 +1794,11 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
                 continuingInterruptedTurn = value;
               },
             });
-            if (
-              !shouldContinue ||
-              interruptedOutcome.nextStep.type === 'next_step_handoff'
-            ) {
-              finishRunnerSpan(currentTurnSpan);
-              setRunStateTurnSpanParent(state, undefined);
-              currentTurnSpan = undefined;
-            }
+            // Approval resolution belongs to the previous turn; any next model call
+            // starts a new counted turn with its own span and usage.
+            finishRunnerSpan(currentTurnSpan);
+            setRunStateTurnSpanParent(state, undefined);
+            currentTurnSpan = undefined;
             if (shouldReturn) {
               // we are still in an interruption, so we need to avoid an infinite loop
               return completeResult(new RunResult<TContext, TAgent>(state));
@@ -2151,7 +2160,23 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
               resetTurnPersistence: !isResumedState,
             });
             if (options.signal?.aborted) {
-              persistenceCheckpoint = new RunResult<TContext, TAgent>(state);
+              const guardedFinalOutput =
+                turnResult.nextStep.type === 'next_step_final_output' &&
+                this.#agentHasOutputGuardrail(state._currentAgent);
+              if (guardedFinalOutput && !isResumedState) {
+                // Ordinary callers cannot recover the runner-owned state from
+                // the original abort reason. Keep a replay-safe completion
+                // record without publishing the unchecked tool output.
+                redactCancelledResponseToolOutputs(
+                  state,
+                  'Tool output discarded because the run was cancelled before output validation.',
+                );
+                cancelledOutputRedacted = true;
+              }
+              if (!guardedFinalOutput || cancelledOutputRedacted) {
+                persistenceCheckpoint = new RunResult<TContext, TAgent>(state);
+              }
+              // Caller-owned RunState retains the candidate for validation on resume.
             }
             options.signal?.throwIfAborted();
             if (turnResult.nextStep.type !== 'next_step_final_output') {
@@ -2279,7 +2304,12 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
           const resultToPersist = completedResult ?? persistenceCheckpoint;
           if (resultToPersist && !completedResultPersisted) {
             try {
-              await persistNonStreamingResult(resultToPersist);
+              await persistNonStreamingResult(
+                resultToPersist,
+                // The current response is already redacted; append the full
+                // suffix so earlier completed turns remain replayable.
+                cancelledOutputRedacted ? { runCompaction: false } : undefined,
+              );
             } catch (error) {
               setRunnerSpanError(
                 taskSpan,
@@ -2818,14 +2848,11 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
               continuingInterruptedTurn = value;
             },
           });
-          if (
-            !shouldContinue ||
-            interruptedOutcome.nextStep.type === 'next_step_handoff'
-          ) {
-            finishRunnerSpan(currentTurnSpan);
-            setRunStateTurnSpanParent(result.state, undefined);
-            currentTurnSpan = undefined;
-          }
+          // Approval resolution belongs to the previous turn; any next model call
+          // starts a new counted turn with its own span and usage.
+          finishRunnerSpan(currentTurnSpan);
+          setRunStateTurnSpanParent(result.state, undefined);
+          currentTurnSpan = undefined;
           if (shouldReturn) {
             // we are still in an interruption, so we need to avoid an infinite loop
             return;
@@ -3717,9 +3744,15 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
 
     const hasExplicitAgentModelSettings =
       executionAgent.hasExplicitModelSettings();
+    // Store is caller-owned even when reasoning/text settings are implicit defaults.
     const agentModelSettings = hasExplicitAgentModelSettings
       ? executionAgent.modelSettings
-      : undefined;
+      : Object.prototype.hasOwnProperty.call(
+            executionAgent.modelSettings,
+            'store',
+          )
+        ? { store: executionAgent.modelSettings.store }
+        : undefined;
     // Only adapters that honor prompt model selection can replace the default model.
     const promptOwnsModel =
       model.supportsPromptModelSelection === true &&

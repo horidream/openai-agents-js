@@ -66,6 +66,8 @@ import {
   createBuiltInClientToolSearchOutput,
   executeCustomClientToolSearch,
   getClientToolSearchHelper,
+  toolSearchOutputLoadsHostedMcpTool,
+  recordHostedMcpDiscovery,
   registerRuntimeToolSearchTools,
 } from './toolSearch';
 import { ensureToolCallerAllowed } from './toolCaller';
@@ -128,7 +130,7 @@ function ensureHostedToolCallAllowed<TContext>(
   output: protocol.HostedToolCallItem,
   tools: Tool<TContext>[],
   mcpToolMap: Map<string, HostedMCPTool>,
-  loadedToolNames: Set<string>,
+  loadedState: LoadedDeferredToolState,
   agent: Agent<any, any>,
 ): void {
   const providerType = output.providerData?.type;
@@ -184,7 +186,16 @@ function ensureHostedToolCallAllowed<TContext>(
   }
   if (
     mcpTool.providerData.defer_loading !== true ||
-    loadedToolNames.has(serverLabel)
+    [
+      ...loadedState.keyedToolSearchOutputsByKey.values(),
+      ...loadedState.anonymousToolSearchOutputs,
+    ].some((searchOutput) =>
+      toolSearchOutputLoadsHostedMcpTool(
+        searchOutput,
+        serverLabel,
+        output.providerData?.name,
+      ),
+    )
   ) {
     return;
   }
@@ -802,16 +813,20 @@ export function processModelResponse<TContext>(
         hasGeneratedClientToolSearchOutputs = true;
       }
     } else if (output.type === 'tool_search_output') {
+      const recordedOutput = recordHostedMcpDiscovery(output, [
+        ...agent.tools,
+        ...tools,
+      ]);
       items.push(
         new RunToolSearchOutputItem(
           attributeToolSearchOutput(
-            output,
+            recordedOutput,
             processingOptions.toolSearchAgentName,
           ),
           agent,
         ),
       );
-      recordLoadedToolSearchOutput(loadedDeferredToolState, output);
+      recordLoadedToolSearchOutput(loadedDeferredToolState, recordedOutput);
       addHostedMcpToolsFromToolSearchOutput(output, mcpToolMap, {
         preserveExistingServerLabels: originalMcpServerLabels,
       });
@@ -831,7 +846,7 @@ export function processModelResponse<TContext>(
         output,
         tools,
         mcpToolMap,
-        loadedDeferredToolState.loadedToolNames,
+        loadedDeferredToolState,
         agent,
       );
       items.push(new RunToolCallItem(output, agent));
@@ -1222,16 +1237,20 @@ export async function processModelResponseAsync<TContext>(
         hasGeneratedClientToolSearchOutputs = true;
       }
     } else if (output.type === 'tool_search_output') {
+      const recordedOutput = recordHostedMcpDiscovery(output, [
+        ...agent.tools,
+        ...availableTools,
+      ]);
       items.push(
         new RunToolSearchOutputItem(
           attributeToolSearchOutput(
-            output,
+            recordedOutput,
             processingOptions.toolSearchAgentName,
           ),
           agent,
         ),
       );
-      recordLoadedToolSearchOutput(loadedDeferredToolState, output);
+      recordLoadedToolSearchOutput(loadedDeferredToolState, recordedOutput);
       addHostedMcpToolsFromToolSearchOutput(output, mcpToolMap, {
         preserveExistingServerLabels: originalMcpServerLabels,
       });
@@ -1251,7 +1270,7 @@ export async function processModelResponseAsync<TContext>(
         output,
         availableTools,
         mcpToolMap,
-        loadedDeferredToolState.loadedToolNames,
+        loadedDeferredToolState,
         agent,
       );
       items.push(new RunToolCallItem(output, agent));

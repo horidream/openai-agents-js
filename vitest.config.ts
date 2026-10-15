@@ -98,6 +98,7 @@ function createProjects(reviewTestProfile: boolean) {
         maxConcurrency: 4,
         include: [
           'helpers/tests/consoleGuard.test.ts',
+          'integration-tests/_helpers/setup.test.ts',
           'integration-tests/cloudflare-workers/worker.test.ts',
           'helpers/vitest/codeChangeVerificationPolicy.test.ts',
           'helpers/vitest/reviewTestProfile.test.ts',
@@ -112,11 +113,27 @@ function createProjects(reviewTestProfile: boolean) {
           'examples/realtime-twilio-sip/server.test.ts',
           'examples/realtime-twilio/server.test.ts',
           'examples/tools/local-shell.test.ts',
+          'examples/tools/apply-patch.test.ts',
+          'examples/tools/computer-use-hitl.test.ts',
           'examples/live/**/*.test.{ts,mjs}',
         ],
       },
     },
     ...packageProjects,
+    {
+      root: resolve(rootDir, 'examples/ai-sdk-ui'),
+      resolve: {
+        alias: {
+          ...testAliases,
+          '@': resolve(rootDir, 'examples/ai-sdk-ui/src'),
+        },
+      },
+      test: {
+        ...baseTestConfig,
+        name: 'ai-sdk-ui-example',
+        include: ['test/**/*.test.ts'],
+      },
+    },
     financialResearchExampleProject,
     realtimeReactNativeExampleProject,
   ];

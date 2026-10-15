@@ -2,7 +2,7 @@
   "name": "@openai/agents-realtime",
   "repository": "https://github.com/openai/openai-agents-js",
   "homepage": "https://openai.github.io/openai-agents-js/",
-  "version": "0.18.0",
+  "version": "0.20.0",
   "description": "The OpenAI Agents SDK is a lightweight yet powerful framework for building multi-agent workflows. This package contains the logic for building realtime voice agents on the server or in the browser.",
   "author": "OpenAI <support@openai.com>",
   "main": "dist/index.js",
@@ -84,9 +84,8 @@
   },
   "dependencies": {
     "@openai/agents-core": "workspace:*",
-    "@types/ws": "^8.18.1",
-    "debug": "^4.4.3",
-    "ws": "^8.21.3"
+    "@types/ws": "^8.18.2",
+    "ws": "^8.22.0"
   },
   "keywords": [
     "openai",
@@ -99,9 +98,8 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
-    "@types/debug": "^4.1.13",
-    "vite": "^6.4.3",
-    "zod": "^4.2.0"
+    "vite": "^8.3.2",
+    "zod": "^4.3.5"
   },
   "files": [
     "dist"

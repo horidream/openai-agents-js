@@ -213,6 +213,7 @@ function createResumableState<TAgent extends Agent<any, any>>(
 ) {
   const state = new RunState(new RunContext(), 'initial', agent, maxTurns);
   state._currentTurn = 1;
+  state._initialInputGuardrailsCompleted = true;
   state._currentStep = { type: 'next_step_run_again' };
   return state;
 }
@@ -419,7 +420,7 @@ describe('RunState pending input', () => {
     });
     const session = new MemorySession();
 
-    const first = await run(agent, 'initial', { session, maxTurns: 1 });
+    const first = await run(agent, 'initial', { session, maxTurns: 2 });
     const approval = first.interruptions[0];
     expect(approval).toBeDefined();
     expect(first.state._currentTurn).toBe(1);

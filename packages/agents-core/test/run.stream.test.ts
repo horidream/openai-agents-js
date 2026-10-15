@@ -2657,7 +2657,7 @@ describe('Runner.run (streaming)', () => {
     }
   });
 
-  it('does not advance the turn for streaming runs resuming an interruption without persisted items', async () => {
+  it('counts the streamed model call after resolving an interruption', async () => {
     const approvalTool = tool({
       name: 'get_weather',
       description: 'Gets weather for a city.',
@@ -2696,7 +2696,7 @@ describe('Runner.run (streaming)', () => {
     });
 
     let result = await run(agent, 'Stream weather?', {
-      maxTurns: 1,
+      maxTurns: 2,
       stream: true,
     });
 
@@ -2711,7 +2711,7 @@ describe('Runner.run (streaming)', () => {
 
     result.state.approve(result.interruptions[0]);
 
-    result = await run(agent, result.state, { maxTurns: 1, stream: true });
+    result = await run(agent, result.state, { maxTurns: 2, stream: true });
 
     for await (const _event of result.toStream()) {
       // Consume stream.
@@ -2719,7 +2719,7 @@ describe('Runner.run (streaming)', () => {
     await result.completed;
 
     expect(result.finalOutput).toBe('Stream done.');
-    expect(result.state._currentTurn).toBe(1);
+    expect(result.state._currentTurn).toBe(2);
   });
 
   it('emits run item events in the order items are generated', async () => {
@@ -4131,15 +4131,10 @@ describe('Runner.run (streaming)', () => {
     const restored = await RunState.fromString(agent, result.state.toString());
     expect(restored._currentTurn).toBe(1);
 
-    const resumed = await runner.run(agent, restored, {
-      stream: true,
-      maxTurns: 1,
-    });
-    await expect(resumed.completed).rejects.toBeInstanceOf(
-      MaxTurnsExceededError,
-    );
-    expect(resumed.currentTurn).toBe(1);
-    expect(resumed.state._currentTurn).toBe(1);
+    await expect(
+      runner.run(agent, restored, { stream: true, maxTurns: 1 }),
+    ).rejects.toThrow(/fresh run/i);
+    expect(restored._currentTurn).toBe(1);
     expect(model.calls).toHaveLength(1);
   });
 
@@ -4254,6 +4249,7 @@ describe('Runner.run (streaming)', () => {
     });
     const state = new RunState(new RunContext(), 'input', agent, 1);
     state._currentTurn = 1;
+    state._initialInputGuardrailsCompleted = true;
     state._currentTurnInProgress = true;
     state._currentStep = {
       type: 'next_step_final_output',
@@ -4784,6 +4780,7 @@ describe('StreamedRunResult.currentTurn (streamed runs)', () => {
     });
     const state = new RunState(new RunContext(), 'x', agent, 1);
     state._currentTurn = 1;
+    state._initialInputGuardrailsCompleted = true;
     state._currentTurnInProgress = true;
     const restored = await RunState.fromString(agent, state.toString());
 

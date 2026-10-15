@@ -1776,7 +1776,23 @@ async function withToolFunctionSpan<T>(
   }
 
   return withFunctionSpan(
-    async (span) => fn(span),
+    async (span) => {
+      try {
+        return await fn(span);
+      } catch (error) {
+        // Escaping callbacks must not fall through to generic error capture.
+        if (!runner.config.traceIncludeSensitiveData && span.error === null) {
+          span.setError({
+            message: 'Error running tool',
+            data: {
+              tool_name: toolName,
+              error: REDACTED_TOOL_ERROR_MESSAGE,
+            },
+          });
+        }
+        throw error;
+      }
+    },
     {
       data: {
         name: toolName,
@@ -2561,6 +2577,15 @@ export async function executeComputerActions(
           if (isSiblingCancellationSignal(signal)) {
             return buildStartedCancellationItem();
           }
+          if (!runner.config.traceIncludeSensitiveData) {
+            span?.setError({
+              message: 'Error running tool',
+              data: {
+                tool_name: COMPUTER_TRACE_NAME,
+                error: REDACTED_TOOL_ERROR_MESSAGE,
+              },
+            });
+          }
           throw error;
         }
         if (signal?.aborted) {
@@ -3099,6 +3124,11 @@ async function resolveSafetyCheckAcknowledgements(options: {
 }): Promise<ComputerSafetyCheck[] | false | undefined> {
   const { runContext, toolCall, pendingSafetyChecks, onSafetyCheck } = options;
   if (!onSafetyCheck) {
+    logger.warn(
+      'Computer call has pending safety checks, but no onSafetyCheck handler is configured. ' +
+        'The action will proceed without acknowledging the checks. ' +
+        'Configure computerTool({ onSafetyCheck }) to review or reject them.',
+    );
     return undefined;
   }
   const result = await onSafetyCheck({

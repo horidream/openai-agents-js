@@ -81,11 +81,13 @@ import {
   UnixLocalSandboxSession,
   type UnixLocalSandboxSessionState,
 } from './unixLocal';
+import { permissionsForSandboxEntry } from '../permissions';
 import {
   assertLocalWorkspaceManifestMetadataSupported,
   joinSandboxLogicalPath,
   materializeLocalWorkspaceManifest,
   materializeLocalWorkspaceManifestMounts,
+  restoreLocalWorkspaceManifestStickyPermissions,
   pathExists,
 } from './shared/localWorkspace';
 import {
@@ -127,6 +129,7 @@ import {
   serializeLocalSnapshotSpec,
 } from './shared/localSnapshots';
 import { spawnInPseudoTerminal } from './shared/pty';
+import { preparedFileIO } from './shared/unixLocalFiles';
 import {
   formatSandboxProcessError,
   runSandboxProcess,
@@ -222,7 +225,8 @@ export class DockerSandboxSession extends UnixLocalSandboxSession<DockerSandboxS
     defaultShell?: string;
     archiveLimits?: SandboxArchiveLimits | null;
   }) {
-    super({ ...args, fileIOProtection: 'off' });
+    // Container file APIs do not use a host file worker.
+    super({ ...args, [preparedFileIO]: null });
     this.mountedPathGrants = args.state.manifest.extraPathGrants.map(
       (grant) => ({ ...grant }),
     );
@@ -1602,6 +1606,10 @@ export class DockerSandboxClient implements SandboxClient<
           state.workspaceRootPath,
           { archiveLimits },
         );
+        await restoreLocalWorkspaceManifestStickyPermissions(
+          restoredState.manifest,
+          restoredState.workspaceRootPath,
+        );
         await this.cleanupDockerResources(state);
         return await this.restartContainer(
           restoredState,
@@ -1651,6 +1659,10 @@ export class DockerSandboxClient implements SandboxClient<
         },
         workspaceRootPath,
         { archiveLimits },
+      );
+      await restoreLocalWorkspaceManifestStickyPermissions(
+        restoredState.manifest,
+        workspaceRootPath,
       );
       return await this.restartContainer(
         restoredState,
@@ -2577,7 +2589,10 @@ async function prepareDockerWorkspaceRoot(
   if (manifest.users.length === 0 && manifest.groups.length === 0) {
     return;
   }
-  await chmod(workspaceRootPath, 0o755);
+  const sticky = permissionsForSandboxEntry(
+    manifest.entries['']?.permissions,
+  ).sticky;
+  await chmod(workspaceRootPath, 0o755 | (sticky ? 0o1000 : 0));
 }
 
 async function provisionDockerAccounts(

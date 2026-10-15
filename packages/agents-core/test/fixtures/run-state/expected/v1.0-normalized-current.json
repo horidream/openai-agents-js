@@ -1,5 +1,5 @@
 {
-  "$schemaVersion": "1.21",
+  "$schemaVersion": "1.22",
   "currentTurn": 0,
   "currentAgent": {
     "name": "HistoricalAgent"
@@ -25,6 +25,7 @@
   "maxTurns": 3,
   "noActiveAgentRun": true,
   "inputGuardrailResults": [],
+  "initialInputGuardrailsCompleted": false,
   "outputGuardrailResults": [],
   "toolInputGuardrailResults": [],
   "toolOutputGuardrailResults": [],

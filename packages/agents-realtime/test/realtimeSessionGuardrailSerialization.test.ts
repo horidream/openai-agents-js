@@ -50,7 +50,12 @@ describe('RealtimeSession guardrail outputInfo serialization', () => {
     const guardrailTripped = waitForEvent<any[]>(session, 'guardrail_tripped');
     transport.emit('turn_done', {
       response: {
-        output: [fakeModelMessage('bad output')],
+        output: [
+          {
+            ...fakeModelMessage('bad output'),
+            content: [{ type: 'output_audio', transcript: 'bad output' }],
+          },
+        ],
         usage: new Usage(),
       },
     } as any);
