@@ -1,13 +1,8 @@
-import {
-  DEFAULT_REQUEST_TIMEOUT_MSEC,
-  ProtocolError,
-  ProtocolErrorCode,
-  SdkError,
-  SdkErrorCode,
-  type CacheableRequestOptions,
-  type Client,
-  type RequestOptions,
-  type Transport,
+import type {
+  CacheableRequestOptions,
+  Client,
+  RequestOptions,
+  Transport,
 } from '@modelcontextprotocol/client';
 
 import {
@@ -58,6 +53,15 @@ npm install @modelcontextprotocol/client
   );
   throw error;
 }
+
+// The MCP SDK is an optional dependency, so this module must not import its
+// runtime values eagerly. Load it when a server connects or reports an error.
+function loadMcpClientModule(): Promise<MCPClientModule> {
+  return import('@modelcontextprotocol/client').catch(failedToImport);
+}
+
+// Matches the MCP SDK's DEFAULT_REQUEST_TIMEOUT_MSEC without loading the SDK.
+const DEFAULT_REQUEST_TIMEOUT_MSEC = 60_000;
 
 function attachParsedCallToolResultMetadata(
   result: CallToolResult,
@@ -168,6 +172,7 @@ async function listMcpTools(
       });
       return { tools: response.tools as MCPTool[] };
     } catch (error) {
+      const { SdkError, SdkErrorCode } = await loadMcpClientModule();
       if (
         error instanceof SdkError &&
         error.code === SdkErrorCode.ListPaginationExceeded
@@ -187,13 +192,17 @@ function getNegotiatedModernCapabilities(client: Client) {
     : undefined;
 }
 
-function getListedToolForCall(tools: readonly MCPTool[], toolName: string) {
+async function getListedToolForCall(
+  tools: readonly MCPTool[],
+  toolName: string,
+) {
   const tool = tools.find((tool) => tool.name === toolName) as
     | (MCPTool & {
         execution?: { taskSupport?: 'forbidden' | 'optional' | 'required' };
       })
     | undefined;
   if (tool?.execution?.taskSupport === 'required') {
+    const { ProtocolError, ProtocolErrorCode } = await loadMcpClientModule();
     throw new ProtocolError(
       ProtocolErrorCode.InvalidRequest,
       `Tool "${toolName}" requires task-based execution. Use client.experimental.tasks.callToolStream() instead.`,
@@ -451,9 +460,7 @@ export class NodeMCPServerStdio extends BaseMCPServerStdio {
         await import('@modelcontextprotocol/client/stdio').catch(
           failedToImport,
         );
-      const { Client } = await import('@modelcontextprotocol/client').catch(
-        failedToImport,
-      );
+      const { Client } = await loadMcpClientModule();
       this.transport = new StdioClientTransport({
         command: this.params.command,
         args: this.params.args,
@@ -553,13 +560,13 @@ export class NodeMCPServerStdio extends BaseMCPServerStdio {
     };
     const response = await callWithMCPRequestSignal(
       options?.signal,
-      (requestSignal) =>
+      async (requestSignal) =>
         session.callTool(params, {
           ...buildRequestOptions(this.clientSessionTimeoutSeconds, {
             timeout: this.timeout,
             signal: requestSignal,
           }),
-          toolDefinition: getListedToolForCall(this._toolsList, toolName),
+          toolDefinition: await getListedToolForCall(this._toolsList, toolName),
         }),
     );
     const result = attachParsedCallToolResultMetadata(
@@ -690,11 +697,7 @@ export class NodeMCPServerSSE extends BaseMCPServerSSE {
     this._cacheDirty = true;
     this._toolsList = [];
     try {
-      const { SSEClientTransport } =
-        await import('@modelcontextprotocol/client').catch(failedToImport);
-      const { Client } = await import('@modelcontextprotocol/client').catch(
-        failedToImport,
-      );
+      const { SSEClientTransport, Client } = await loadMcpClientModule();
       this.transport = new SSEClientTransport(new URL(this.params.url), {
         authProvider: this.params.authProvider,
         requestInit: this.params.requestInit,
@@ -798,13 +801,16 @@ export class NodeMCPServerSSE extends BaseMCPServerSSE {
       this.params.url,
       'SSE tool call',
       () =>
-        callWithMCPRequestSignal(options?.signal, (requestSignal) =>
+        callWithMCPRequestSignal(options?.signal, async (requestSignal) =>
           session.callTool(params, {
             ...buildRequestOptions(this.clientSessionTimeoutSeconds, {
               timeout: this.timeout,
               signal: requestSignal,
             }),
-            toolDefinition: getListedToolForCall(this._toolsList, toolName),
+            toolDefinition: await getListedToolForCall(
+              this._toolsList,
+              toolName,
+            ),
           }),
         ),
       options?.signal,
@@ -956,9 +962,7 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
     clientModule: MCPClientModule;
     transportModule: MCPClientModule;
   }> {
-    const clientModule = await import('@modelcontextprotocol/client').catch(
-      failedToImport,
-    );
+    const clientModule = await loadMcpClientModule();
 
     return { clientModule, transportModule: clientModule };
   }
@@ -1222,13 +1226,13 @@ export class NodeMCPServerStreamableHttp extends BaseMCPServerStreamableHttp {
     };
     const response = await callWithMCPRequestSignal(
       options?.signal,
-      (requestSignal) =>
+      async (requestSignal) =>
         client.callTool(params, {
           ...buildRequestOptions(this.clientSessionTimeoutSeconds, {
             timeout: this.timeout,
             signal: requestSignal,
           }),
-          toolDefinition: getListedToolForCall(this._toolsList, toolName),
+          toolDefinition: await getListedToolForCall(this._toolsList, toolName),
         }),
     );
     return attachParsedCallToolResultMetadata(response as CallToolResult);
