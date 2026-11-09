@@ -4,6 +4,7 @@ import { isMount, type Entry, type Mount, type TypedMount } from './entries';
 import {
   cloneManifest,
   Environment,
+  isEnvValueReference,
   manifestAcknowledgesInContainerMountCredentialExposure,
   Manifest,
   MOUNT_CREDENTIAL_EXPOSURE_POLICY_KEYS,
@@ -76,7 +77,6 @@ const INSIDE_SANDBOX_STRATEGIES = new Set([
   'in_container',
   'e2b_cloud_bucket',
   'daytona_cloud_bucket',
-  'runloop_cloud_bucket',
   'vercel_cloud_bucket',
   'blaxel_cloud_bucket',
 ]);
@@ -85,7 +85,6 @@ const ENVIRONMENT_CREDENTIAL_STRATEGIES = new Set([
   'in_container',
   'e2b_cloud_bucket',
   'daytona_cloud_bucket',
-  'runloop_cloud_bucket',
   'vercel_cloud_bucket',
 ]);
 
@@ -110,7 +109,6 @@ const RCLONE_STRATEGY_TYPES = [
   'in_container',
   'e2b_cloud_bucket',
   'daytona_cloud_bucket',
-  'runloop_cloud_bucket',
 ] as const;
 
 const IN_CONTAINER_MOUNT_CREDENTIAL_CAPABILITIES: readonly InContainerMountCredentialCapability[] =
@@ -724,8 +722,7 @@ function resolvedInContainerMountPatternType(
   const strategyType = mountStrategyType(entry);
   if (
     strategyType === 'e2b_cloud_bucket' ||
-    strategyType === 'daytona_cloud_bucket' ||
-    strategyType === 'runloop_cloud_bucket'
+    strategyType === 'daytona_cloud_bucket'
   ) {
     return 'rclone';
   }
@@ -906,6 +903,7 @@ function validateExplicitMountCredentialPairs(entry: Mount | TypedMount): void {
 function validateMountCredentialEnvironmentPairs(
   entry: Mount | TypedMount,
   environment: Record<string, string>,
+  unresolvedEnvironmentNames: ReadonlySet<string> = new Set(),
 ): void {
   if (
     entry.type === 's3_mount' ||
@@ -920,15 +918,23 @@ function validateMountCredentialEnvironmentPairs(
       const secretAccessKey = optionalCredentialString(
         environment.AWS_SECRET_ACCESS_KEY,
       );
-      validateCredentialPair({
-        accessKeyId,
-        secretAccessKey,
-        message:
-          'S3 mount environment credentials require both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY when either is provided.',
-        details: { mountType: entry.type },
-        code: 'mount_config_invalid',
-      });
+      const accessPairIsUnresolved =
+        unresolvedEnvironmentNames.has('AWS_ACCESS_KEY_ID') ||
+        unresolvedEnvironmentNames.has('AWS_SECRET_ACCESS_KEY');
+      if (!accessPairIsUnresolved) {
+        validateCredentialPair({
+          accessKeyId,
+          secretAccessKey,
+          message:
+            'S3 mount environment credentials require both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY when either is provided.',
+          details: { mountType: entry.type },
+          code: 'mount_config_invalid',
+        });
+      }
       if (
+        !accessPairIsUnresolved &&
+        !unresolvedEnvironmentNames.has('AWS_SESSION_TOKEN') &&
+        !unresolvedEnvironmentNames.has('AWS_SECURITY_TOKEN') &&
         (optionalCredentialString(environment.AWS_SESSION_TOKEN) !==
           undefined ||
           optionalCredentialString(environment.AWS_SECURITY_TOKEN) !==
@@ -960,15 +966,23 @@ function validateMountCredentialEnvironmentPairs(
     const secretAccessKey = optionalCredentialString(
       environment[`${prefix}_SECRET_ACCESS_KEY`],
     );
-    validateCredentialPair({
-      accessKeyId,
-      secretAccessKey,
-      message:
-        'Rclone remote environment credentials require both ACCESS_KEY_ID and SECRET_ACCESS_KEY when either is provided.',
-      details: { mountType: entry.type, remote: prefix },
-      code: 'mount_config_invalid',
-    });
+    const accessPairIsUnresolved =
+      unresolvedEnvironmentNames.has(`${prefix}_ACCESS_KEY_ID`) ||
+      unresolvedEnvironmentNames.has(`${prefix}_SECRET_ACCESS_KEY`);
+    if (!accessPairIsUnresolved) {
+      validateCredentialPair({
+        accessKeyId,
+        secretAccessKey,
+        message:
+          'Rclone remote environment credentials require both ACCESS_KEY_ID and SECRET_ACCESS_KEY when either is provided.',
+        details: { mountType: entry.type, remote: prefix },
+        code: 'mount_config_invalid',
+      });
+    }
     if (
+      !accessPairIsUnresolved &&
+      !unresolvedEnvironmentNames.has(`${prefix}_SESSION_TOKEN`) &&
+      !unresolvedEnvironmentNames.has(`${prefix}_SECURITY_TOKEN`) &&
       (optionalCredentialString(environment[`${prefix}_SESSION_TOKEN`]) !==
         undefined ||
         optionalCredentialString(environment[`${prefix}_SECURITY_TOKEN`]) !==
@@ -1011,15 +1025,35 @@ function implicitWorkloadIdentityCredentialFields(
 export function validateMountEnvironmentCredentialBoundaries(
   manifest: Manifest,
   environment: Record<string, string>,
+  options: { preserveDeferredValuePresence?: boolean } = {},
 ): void {
-  const effectiveEnvironment = mountEffectiveEnvironment(manifest, environment);
+  const unresolvedEnvironmentNames = new Set(
+    options.preserveDeferredValuePresence
+      ? Object.entries(manifest.environment)
+          .filter(
+            ([name, value]) =>
+              !Object.prototype.hasOwnProperty.call(environment, name) &&
+              (isEnvValueReference(value) || value.resolver !== undefined),
+          )
+          .map(([name]) => name)
+      : [],
+  );
+  const effectiveEnvironment = mountEffectiveEnvironment(
+    manifest,
+    environment,
+    unresolvedEnvironmentNames,
+  );
   const candidate = cloneManifest(manifest);
   for (const { entry, mountPath } of candidate.mountTargets()) {
     const credentialEnvironment = mountCredentialEnvironmentForEntry(
       entry,
       effectiveEnvironment,
     );
-    validateMountCredentialEnvironmentPairs(entry, credentialEnvironment);
+    validateMountCredentialEnvironmentPairs(
+      entry,
+      credentialEnvironment,
+      unresolvedEnvironmentNames,
+    );
     if (Object.keys(credentialEnvironment).length === 0) {
       continue;
     }
@@ -1179,12 +1213,15 @@ export function sanitizeMountCredentialEnvironmentForPersistence(state: {
 function mountEffectiveEnvironment(
   manifest: Manifest,
   environment: Record<string, string>,
+  unresolvedEnvironmentNames: ReadonlySet<string> = new Set(),
 ): Record<string, string> {
   return {
     ...Object.fromEntries(
       Object.entries(manifest.environment).map(([name, value]) => [
         name,
-        value.value,
+        unresolvedEnvironmentNames.has(name)
+          ? '__openai_unresolved_environment_reference__'
+          : value.value,
       ]),
     ),
     ...environment,
@@ -2152,8 +2189,7 @@ function mountUsesRcloneEnvironment(entry: Mount | TypedMount): boolean {
   }
   if (
     strategyType === 'e2b_cloud_bucket' ||
-    strategyType === 'daytona_cloud_bucket' ||
-    strategyType === 'runloop_cloud_bucket'
+    strategyType === 'daytona_cloud_bucket'
   ) {
     return true;
   }

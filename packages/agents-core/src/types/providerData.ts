@@ -1,3 +1,4 @@
+import type OpenAI from 'openai';
 import { HostedMCPApprovalFunction } from '../tool';
 import { UnknownContext } from './aliases';
 
@@ -40,34 +41,25 @@ export type HostedMCPTool<Context = UnknownContext> = {
       }
   );
 
-export type HostedMCPListTools = {
-  id: string;
-  server_label: string;
-  tools: {
-    input_schema: unknown;
-    name: string;
-    annotations?: unknown | null;
-    description?: string | null;
-  }[];
-  error?: string | null;
-};
+export type HostedMCPListTools = Pick<
+  OpenAI.Responses.ResponseInputItem.McpListTools,
+  'id' | 'server_label' | 'tools' | 'error'
+>;
 export type HostedMCPCall = {
   id: string;
   arguments: string;
   name: string;
   server_label: string;
   connector_id?: string;
-  error?: string | null;
+  error?: string | OpenAI.Responses.McpToolCallError | null;
   // excluding this large data field
   // output?: string | null;
 };
 
-export type HostedMCPApprovalRequest = {
-  id: string;
-  name: string;
-  arguments: string;
-  server_label: string;
-};
+export type HostedMCPApprovalRequest = Pick<
+  OpenAI.Responses.ResponseInputItem.McpApprovalRequest,
+  'id' | 'name' | 'arguments' | 'server_label'
+>;
 
 export type HostedMCPApprovalResponse = {
   id?: string;
